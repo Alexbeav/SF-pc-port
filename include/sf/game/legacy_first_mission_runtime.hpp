@@ -238,6 +238,8 @@ public:
   }
 
   void setHostPadState(const LegacyHostPadState &state) noexcept;
+  void setHostAimLocomotion(bool active, double move,
+                            double strafe) noexcept;
   [[nodiscard]] bool
   applyHostAimLocomotion(const LegacyHostPlayerState &state) noexcept;
   void setHostAimRay(std::optional<LegacyHostAimRay> ray) noexcept;

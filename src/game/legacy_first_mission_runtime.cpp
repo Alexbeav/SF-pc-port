@@ -71,8 +71,8 @@ legacyPadStateFromPlayerInput(const PlayerInput &input) noexcept {
     // fixed. Feed only held directional axes here. Relative mouse motion is
     // intentionally absent; it stays on the high-resolution host look/ray
     // path and therefore cannot saturate or quantize the retail PAD.
-    state.left_x = padAxis(input.turn);
-    state.left_y = padAxis(-input.move);
+    state.left_x = padAxis(input.aim_sight_yaw);
+    state.left_y = padAxis(-input.aim_sight_pitch);
   } else {
     state.left_x = padAxis(input.turn);
     state.left_y = padAxis(-input.move * movement_scale);
@@ -86,8 +86,9 @@ legacyPadStateFromPlayerInput(const PlayerInput &input) noexcept {
   // Mouse wheel/middle-button weapon commands are native UI semantics, not
   // physical PSX buttons. GameplaySession routes them into FUN_800405f4,
   // while real L2/R2 remain lossless in chase and manual aim.
-  press(input.strafe < 0.0, l2);
-  press(input.strafe > 0.0, r2);
+  const auto corner_strafe = input.aim ? input.aim_corner_strafe : input.strafe;
+  press(corner_strafe < 0.0, l2);
+  press(corner_strafe > 0.0, r2);
   press(input.aim, l1);
   // R1 owns retail auto-lock and can rotate the sight independently. Keep
   // it available in chase mode, but never let it fight direct L1 aim.
@@ -226,13 +227,20 @@ void LegacyFirstMissionRuntime::setHostPadState(
   host_pad_state_ = state;
 }
 
+void LegacyFirstMissionRuntime::setHostAimLocomotion(bool active, double move,
+                                                     double strafe) noexcept {
+  if (vm_) {
+    vm_->setHostAimLocomotion(active, move, strafe);
+  }
+}
+
 bool LegacyFirstMissionRuntime::applyHostAimLocomotion(
     const LegacyHostPlayerState &state) noexcept {
   if (!ready_ || finished_ || faulted_ || !vm_) {
     return false;
   }
   try {
-    if (vm_->writeHostPlayerState(state)) {
+    if (vm_->writeHostPlayerPose(state)) {
       return true;
     }
   } catch (...) {

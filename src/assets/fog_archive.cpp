@@ -12,8 +12,8 @@ namespace sf::assets {
 namespace {
 
 constexpr std::size_t header_size = 16;
-constexpr std::size_t entry_size = 24;
-constexpr std::size_t name_size = 16;
+constexpr std::size_t sf1_name_size = 16;
+constexpr std::size_t sf2_name_size = 20;
 
 std::uint32_t readLe32(std::span<const std::byte> bytes, std::size_t offset) {
     if (offset > bytes.size() || bytes.size() - offset < sizeof(std::uint32_t)) {
@@ -33,7 +33,8 @@ std::string normalize(std::string_view name) {
     return result;
 }
 
-std::string readName(std::span<const std::byte> bytes, std::size_t offset) {
+std::string readName(std::span<const std::byte> bytes, std::size_t offset,
+                     std::size_t name_size) {
     std::string result;
     result.reserve(name_size);
     for (std::size_t index = 0; index < name_size; ++index) {
@@ -83,6 +84,29 @@ FogArchive FogArchive::parse(std::vector<std::byte> bytes) {
          !pal_truncated_tail)) {
         throw core::Error{core::ErrorCode::invalid_format, "FOG declared size is invalid"};
     }
+    const auto first_extent_is_plausible = [&](std::size_t candidate_name_size) {
+        const auto start_sector =
+            readLe32(view, header_size + candidate_name_size);
+        const auto sector_count = readLe32(
+            view, header_size + candidate_name_size + sizeof(std::uint32_t));
+        if (start_sector == 0U && sector_count == 0U) {
+            return true;
+        }
+        return start_sector >= 1U && sector_count > 0U &&
+               static_cast<std::uint64_t>(start_sector) + sector_count <=
+                   available_sector_count;
+    };
+    // SF1 and SF2 share the same flag word. SF2 widened table names from 16
+    // to 20 bytes, which makes an SF1 interpretation read 0xCD padding as
+    // the first extent. Select the widened layout only when the original
+    // layout is impossible and the widened extent is physically valid.
+    const auto standard_layout =
+        first_extent_is_plausible(sf1_name_size);
+    const auto extended_layout =
+        first_extent_is_plausible(sf2_name_size);
+    const auto name_size =
+        !standard_layout && extended_layout ? sf2_name_size : sf1_name_size;
+    const auto entry_size = name_size + 2U * sizeof(std::uint32_t);
 
     std::vector<FogEntry> entries;
     std::unordered_set<std::string> names;
@@ -94,7 +118,7 @@ FogArchive FogArchive::parse(std::vector<std::byte> bytes) {
             break;
         }
 
-        auto name = readName(view, offset);
+        auto name = readName(view, offset, name_size);
         const auto start_sector = readLe32(view, offset + name_size);
         const auto sector_count = readLe32(view, offset + name_size + sizeof(std::uint32_t));
         // Retail PAL tables leave optional banks as a named start marker with

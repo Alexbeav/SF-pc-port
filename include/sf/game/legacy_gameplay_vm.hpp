@@ -959,6 +959,7 @@ public:
   void bindSyphonFilterUsaV11HostAimRayHook(
       const LegacyHostAimRayProfile &profile =
           syphonFilterUsaV11HostAimRayProfile());
+  void bindSyphonFilterUsaV11AimLocomotionHooks();
   void bindSyphonFilterUsaV11EnemyCloseAimHook(
       const LegacyEnemyCloseAimProfile &profile =
           syphonFilterUsaV11EnemyCloseAimProfile());
@@ -970,6 +971,8 @@ public:
           syphonFilterUsaV11GameplayTextHookProfile());
   void clearWeaponEvents() noexcept { weapon_events_.clear(); }
   void clearUiMessages() noexcept { ui_messages_.clear(); }
+  void setHostAimLocomotion(bool active, double move,
+                            double strafe) noexcept;
   [[nodiscard]] std::span<const LegacyWeaponEventBridgeState>
   weaponEvents() const noexcept {
     return weapon_events_;
@@ -1017,6 +1020,10 @@ public:
   // Development probes use the following writers to compare isolated retail
   // functions. They are deliberately absent from LegacyFirstMissionRuntime.
   [[nodiscard]] bool writeHostPlayerState(
+      const LegacyHostPlayerState &state,
+      const LegacyNativeMissionBridgeProfile &profile =
+          syphonFilterUsaV11NativeMissionBridgeProfile()) noexcept;
+  [[nodiscard]] bool writeHostPlayerPose(
       const LegacyHostPlayerState &state,
       const LegacyNativeMissionBridgeProfile &profile =
           syphonFilterUsaV11NativeMissionBridgeProfile()) noexcept;
@@ -1208,6 +1215,9 @@ private:
   std::array<std::uint32_t, LegacyGameplayVmSnapshot::interrupt_callback_count>
       interrupt_callbacks_{};
   std::optional<LegacyHostAimRay> host_aim_ray_;
+  bool host_aim_locomotion_active_{};
+  std::int32_t host_aim_move_{};
+  std::int32_t host_aim_strafe_{};
   std::vector<LegacyWeaponEventBridgeState> weapon_events_;
   mutable std::vector<LegacyGameplayVmSnapshot::AttachedTextSource>
       attached_text_sources_;

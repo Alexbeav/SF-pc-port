@@ -240,9 +240,8 @@ void PlayerController::update(const PlayerInput &input,
   if (manual_aim && !was_manual_aim) {
     aim_heading_ = state_.yaw;
   }
-  // First-person aim receives one already-composed look stream (lossless
-  // relative mouse plus the retail directional rate). Locomotion remains
-  // disabled until the first chase-camera update after aim is released.
+  // First-person aim receives one already-composed look stream. Modern PC
+  // locomotion remains available while aim owns its independent heading.
   const auto turn = manual_aim ? 0.0 : std::clamp(input.turn, -1.0, 1.0);
   const auto look_turn = std::clamp(
       input.look_yaw / static_cast<double>(turn_units_per_update), -1.0, 1.0);
@@ -262,7 +261,7 @@ void PlayerController::update(const PlayerInput &input,
         static_cast<std::int64_t>(std::lround(input.look_yaw)));
   }
 
-  const auto movement_allowed = !movement_locked && !manual_aim;
+  const auto movement_allowed = !movement_locked;
   const auto move = movement_allowed ? std::clamp(input.move, -1.0, 1.0) : 0.0;
   const auto strafe =
       movement_allowed ? std::clamp(input.strafe, -1.0, 1.0) : 0.0;

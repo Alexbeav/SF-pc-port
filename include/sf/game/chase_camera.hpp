@@ -63,6 +63,12 @@ struct FirstPersonCameraConfiguration {
     const CameraState& camera,
     double horizontal_offset,
     double vertical_offset) noexcept;
+// Applies an aftermarket chase-camera pitch without disturbing the authored
+// eye position or projection. Positive pitch looks upward in the game's
+// positive-Y-down world convention.
+[[nodiscard]] CameraState applyChaseCameraPitch(
+    CameraState camera,
+    double pitch) noexcept;
 
 class ChaseCamera final {
 public:

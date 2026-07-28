@@ -16,6 +16,17 @@ constexpr core::Sha256Digest syphon_filter_us_v11_exe{
     std::byte{0xcf}, std::byte{0xe4}, std::byte{0xab}, std::byte{0x4e},
 };
 
+constexpr core::Sha256Digest syphon_filter_2_us_exe{
+    std::byte{0x75}, std::byte{0xa3}, std::byte{0x60}, std::byte{0xbf},
+    std::byte{0x74}, std::byte{0x65}, std::byte{0xdf}, std::byte{0xde},
+    std::byte{0xc8}, std::byte{0x5c}, std::byte{0x14}, std::byte{0xf9},
+    std::byte{0xba}, std::byte{0x93}, std::byte{0x86}, std::byte{0x2a},
+    std::byte{0xae}, std::byte{0x25}, std::byte{0x31}, std::byte{0xb4},
+    std::byte{0x8d}, std::byte{0x83}, std::byte{0xfd}, std::byte{0x8d},
+    std::byte{0x82}, std::byte{0xba}, std::byte{0x8c}, std::byte{0x9f},
+    std::byte{0xff}, std::byte{0xa1}, std::byte{0x3d}, std::byte{0x33},
+};
+
 constexpr std::array games{
     SupportedGame{
         "Syphon Filter",
@@ -25,6 +36,24 @@ constexpr std::array games{
         "SCUS94240",
         "SCUS_942.40",
         syphon_filter_us_v11_exe,
+    },
+    SupportedGame{
+        "Syphon Filter 2 (Disc 1)",
+        "USA / NTSC-U",
+        "1.0",
+        "SCUS-94451",
+        "SCUS94451",
+        "SCUS_944.51",
+        syphon_filter_2_us_exe,
+    },
+    SupportedGame{
+        "Syphon Filter 2 (Disc 2)",
+        "USA / NTSC-U",
+        "1.0",
+        "SCUS-94492",
+        "SCUS94492",
+        "SCUS_944.92",
+        syphon_filter_2_us_exe,
     },
 };
 

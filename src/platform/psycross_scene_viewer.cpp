@@ -13024,12 +13024,14 @@ SceneViewerResult PsyCrossSceneViewer::run(
   double audio_accumulator_seconds = 0.0;
   game::GameplayInput latched_gameplay_input{};
   sf::platform::PlayerLookLatch latched_player_look;
+  sf::platform::PlayerLookLatch latched_chase_look;
   sf::platform::PlayerLookDisplayIntegrator display_player_look;
   sf::platform::PlayerAimFireLatch latched_aim_for_fire;
   sf::platform::PlayerLookSample presentation_look_correction{};
   const auto clear_latched_gameplay_input = [&] {
     latched_gameplay_input = {};
     latched_player_look.reset();
+    latched_chase_look.reset();
     display_player_look.reset();
     latched_aim_for_fire.reset();
     presentation_look_correction = {};
@@ -13043,6 +13045,9 @@ SceneViewerResult PsyCrossSceneViewer::run(
     latched_gameplay_input.run = input.run;
     latched_gameplay_input.aim = input.aim;
     latched_gameplay_input.strafe = input.strafe;
+    latched_gameplay_input.aim_sight_yaw = input.aim_sight_yaw;
+    latched_gameplay_input.aim_sight_pitch = input.aim_sight_pitch;
+    latched_gameplay_input.aim_corner_strafe = input.aim_corner_strafe;
     latched_gameplay_input.fire_held = input.fire_held;
     latched_gameplay_input.target_lock_held = input.target_lock_held;
     latched_gameplay_input.next_weapon =
@@ -13551,8 +13556,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
         bound_actions[KeyboardMouseAction::interact];
     const auto interact_pressed = input_settle_seconds <= 0.0 &&
                                   interact_down && !interact_was_down;
-    const auto manual_aim_down = bound_actions[KeyboardMouseAction::aim];
-    mouse_capture.set(!paused && manual_aim_down);
+    mouse_capture.set(!paused);
     int mouse_delta_x{};
     int mouse_delta_y{};
     SDL_GetRelativeMouseState(&mouse_delta_x, &mouse_delta_y);
@@ -14016,31 +14020,53 @@ SceneViewerResult PsyCrossSceneViewer::run(
     const auto manual_aim = mapped_input.aim.held;
     const auto first_person_input =
         sf::platform::firstPersonAimInput(mapped_input);
+    const auto pc_aim_move =
+        static_cast<double>(raw_player_input.pc.move_forward) -
+        static_cast<double>(raw_player_input.pc.move_backward);
+    const auto pc_aim_strafe =
+        static_cast<double>(raw_player_input.pc.strafe_right) -
+        static_cast<double>(raw_player_input.pc.strafe_left);
+    const auto aim_corner_strafe = std::clamp(
+        static_cast<double>(raw_player_input.pc.turn_right) -
+            static_cast<double>(raw_player_input.pc.turn_left) +
+            static_cast<double>(raw_player_input.controller.strafe_right) -
+            static_cast<double>(raw_player_input.controller.strafe_left),
+        -1.0, 1.0);
+    const auto controller_aim_look = sf::platform::PlayerLookSample{
+        raw_player_input.controller.left_x *
+            sf::platform::retail_first_person_yaw_units_per_tick,
+        raw_player_input.controller.left_y *
+            sf::platform::retail_first_person_pitch_units_per_tick,
+    };
     auto sampled_input = game::GameplayInput{
         // In chase these are locomotion axes. Under L1 the guest interprets
         // the same exact PS1 channels as vertical/horizontal sight motion and
         // keeps Gabe's root fixed.
-        .move = movement_armed ? mapped_input.move_forward : 0.0,
-        .turn = movement_armed ? mapped_input.turn : 0.0,
+        .move = movement_armed
+                    ? manual_aim ? pc_aim_move : mapped_input.move_forward
+                    : 0.0,
+        .turn = movement_armed && !manual_aim ? mapped_input.turn : 0.0,
         .run = movement_armed && mapped_input.run.held,
         .aim = manual_aim,
         .next_weapon = mapped_input.next_weapon.pressed,
         .previous_weapon = mapped_input.previous_weapon.pressed,
         .quick_weapon = mapped_input.quick_weapon.pressed,
-        // Q/E or physical L2/R2 retain the original manual-aim corner strafe.
-        .strafe = movement_armed ? (manual_aim ? first_person_input.strafe
-                                               : mapped_input.move_strafe)
-                                 : 0.0,
+        // A/D is modern strafe movement in either camera mode. Q/E or
+        // physical L2/R2 retain the original manual-aim corner lean.
+        .strafe = movement_armed
+                      ? manual_aim ? pc_aim_strafe : mapped_input.move_strafe
+                      : 0.0,
+        .aim_sight_yaw = manual_aim ? raw_player_input.controller.left_x : 0.0,
+        .aim_sight_pitch =
+            manual_aim ? raw_player_input.controller.left_y : 0.0,
+        .aim_corner_strafe =
+            manual_aim ? aim_corner_strafe : 0.0,
         // Directional look is a held rate and is safe on every catch-up tick.
         // Relative mouse motion is accumulated separately below and consumed
         // exactly once.
-        .look_yaw = manual_aim
-                        ? first_person_input.directional_look_per_guest_tick.yaw
-                        : 0.0,
+        .look_yaw = manual_aim ? controller_aim_look.yaw : 0.0,
         .look_pitch =
-            manual_aim
-                ? -first_person_input.directional_look_per_guest_tick.pitch
-                : 0.0,
+            manual_aim ? -controller_aim_look.pitch : 0.0,
         .fire_pressed = mapped_input.fire.pressed,
         .fire_held = mapped_input.fire.held,
         // These are physical retail PAD buttons, not native one-shot
@@ -14061,11 +14087,16 @@ SceneViewerResult PsyCrossSceneViewer::run(
       relative_look.mouse_look_yaw = first_person_input.mouse_look.yaw;
       relative_look.mouse_look_pitch = first_person_input.mouse_look.pitch;
       latched_player_look.latch(relative_look);
+      latched_chase_look.reset();
     } else if (!latched_aim_for_fire.pending()) {
       // If an aimed fire edge is pending, retain the look sample paired with
       // that edge instead of replacing it with post-RMB-release controller
       // state before the guest consumes the shot.
       latched_player_look.reset();
+      sf::platform::PlayerInput relative_look;
+      relative_look.mouse_look_yaw = mapped_input.mouse_look_yaw;
+      relative_look.mouse_look_pitch = mapped_input.mouse_look_pitch;
+      latched_chase_look.latch(relative_look);
     }
     latch_gameplay_input(sampled_input);
     simulation_accumulator_seconds =
@@ -14087,9 +14118,25 @@ SceneViewerResult PsyCrossSceneViewer::run(
         consumed_look = nativeManualAimLook(relative);
         simulation_input.look_yaw += consumed_look.yaw;
         simulation_input.look_pitch -= consumed_look.pitch;
+      } else {
+        const auto relative = simulation_updates_this_frame == 0U
+                                  ? latched_chase_look.consumeForGuestTick()
+                                  : sf::platform::PlayerLookSample{};
+        // Chase yaw uses retail's ordinary turn axis so its locomotion,
+        // animation and collision basis cannot diverge from Gabe's heading.
+        // Third-person pitch has its own gentler scale; first-person aim keeps
+        // the accepted high-gain profile above.
+        simulation_input.turn = std::clamp(
+            simulation_input.turn +
+                relative.yaw /
+                    static_cast<double>(
+                        game::PlayerController::turn_units_per_update),
+            -1.0, 1.0);
+        simulation_input.look_pitch += relative.pitch * 0.35;
       }
       latched_gameplay_input = {};
       latched_player_look.reset();
+      latched_chase_look.reset();
       display_player_look.reset();
       std::swap(previous_render_presentation, current_render_presentation);
       gameplay.update(simulation_input);
@@ -14164,7 +14211,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
           simulation_updates_this_frame == 0U
               ? first_person_input.mouse_look
               : sf::platform::PlayerLookSample{},
-          first_person_input.directional_look_per_guest_tick,
+          controller_aim_look,
           simulation_updates_this_frame == 0U ? elapsed_seconds
                                               : simulation_accumulator_seconds,
           retail_simulation_step_seconds);

@@ -3704,6 +3704,29 @@ bool GameplaySession::legacyWeaponMenuReady() const noexcept {
          mission->weapon_menu_input_ready;
 }
 
+void GameplaySession::stageNativeChaseFreelook(const GameplayInput &input) {
+  if (input.aim || !playerAlive() || !legacyMissionAuthoritative() ||
+      !legacy_first_mission_->openingFinished()) {
+    if (input.aim) {
+      host_free_look_active_ = false;
+      host_free_look_pitch_ = 0.0;
+    }
+    return;
+  }
+  const auto *bridge = legacy_first_mission_->bridge();
+  if (bridge == nullptr || !bridge->player.resident ||
+      bridge->player.control_locked || bridge->camera.scripted ||
+      bridge->camera.locked) {
+    host_free_look_active_ = false;
+    host_free_look_pitch_ = 0.0;
+    return;
+  }
+
+  host_free_look_active_ = true;
+  host_free_look_pitch_ =
+      std::clamp(host_free_look_pitch_ + input.look_pitch, -512.0, 512.0);
+}
+
 void GameplaySession::stageNativeFirstPersonAim(const GameplayInput &input) {
   // Always consume the host release edge first. A retail camera/control lock
   // may appear on that same update; it must not leave the native controller
@@ -3774,7 +3797,7 @@ void GameplaySession::stageNativeFirstPersonAim(const GameplayInput &input) {
 
 void GameplaySession::stageLegacyHostState(const GameplayInput &input) {
   host_manual_aim_ = input.aim;
-  host_manual_aim_strafe_ = input.aim ? input.strafe : 0.0;
+  host_manual_aim_strafe_ = input.aim ? input.aim_corner_strafe : 0.0;
   if (!input.aim) {
     legacy_manual_aim_neutral_camera_.reset();
     legacy_manual_aim_neutral_player_root_ = {};
@@ -3789,6 +3812,9 @@ void GameplaySession::stageLegacyHostState(const GameplayInput &input) {
       aim_bridge != nullptr && aim_bridge->player.resident &&
       !aim_bridge->player.control_locked && !aim_bridge->camera.scripted &&
       !aim_bridge->camera.locked;
+  legacy_first_mission_->setHostAimLocomotion(
+      retail_aim_requested, retail_aim_requested ? input.move : 0.0,
+      retail_aim_requested ? input.strafe : 0.0);
   if (retail_aim_requested != retail_host_aim_active_) {
     if (!legacy_first_mission_->applyHostFirstPersonAim(retail_aim_requested)) {
       legacy_runtime_faulted_ = true;
@@ -5634,6 +5660,7 @@ void GameplaySession::update(const GameplayInput &input) {
   }
 
   const auto guest_weapon_before_update = hud_.inventory().current();
+  stageNativeChaseFreelook(input);
   stageNativeFirstPersonAim(input);
   stageLegacyHostState(input);
   const auto native_cinematic =
@@ -6093,7 +6120,7 @@ CameraState GameplaySession::camera() const noexcept {
       }
       return native;
     }
-    return CameraState{
+    auto native_chase = CameraState{
         static_cast<double>(camera.eye.x),
         static_cast<double>(camera.eye.y),
         static_cast<double>(camera.eye.z),
@@ -6102,6 +6129,12 @@ CameraState GameplaySession::camera() const noexcept {
         static_cast<double>(camera.target.z),
         camera.projectionForDisplayWidth(384),
     };
+    if (host_free_look_active_ && !bridge.player.control_locked &&
+        !camera.scripted && !camera.locked) {
+      native_chase =
+          applyChaseCameraPitch(native_chase, host_free_look_pitch_);
+    }
+    return native_chase;
   }
   if (mission_cinematic_phase_ == MissionCinematicPhase::intro) {
     if (legacy_first_mission_ != nullptr && legacy_first_mission_->ready() &&

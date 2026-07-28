@@ -1311,6 +1311,7 @@ void LegacyGameplayVm::bindSyphonFilterUsaV11PlatformCalls() {
 void LegacyGameplayVm::bindSyphonFilterUsaV11BootstrapPlatformCalls() {
   bindSyphonFilterUsaV11PlatformCalls();
   bindSyphonFilterUsaV11HostAimRayHook();
+  bindSyphonFilterUsaV11AimLocomotionHooks();
   bindSyphonFilterUsaV11EnemyCloseAimHook();
   bindSyphonFilterUsaV11WeaponEventHooks();
   bindSyphonFilterUsaV11GameplayTextHooks();
@@ -1655,6 +1656,64 @@ void LegacyGameplayVm::bindSyphonFilterUsaV11BootstrapPlatformCalls() {
                        static_cast<std::uint8_t>(command)));
     context.setReturnValue(0U);
   });
+}
+
+void LegacyGameplayVm::setHostAimLocomotion(bool active, double move,
+                                            double strafe) noexcept {
+  constexpr auto fixed_one = 4096.0;
+  const auto fixed_axis = [fixed_one](double value) {
+    if (!std::isfinite(value)) {
+      return std::int32_t{};
+    }
+    return static_cast<std::int32_t>(
+        std::lround(std::clamp(value, -1.0, 1.0) * fixed_one));
+  };
+  host_aim_locomotion_active_ = active;
+  host_aim_move_ = active ? fixed_axis(move) : 0;
+  host_aim_strafe_ = active ? fixed_axis(strafe) : 0;
+}
+
+void LegacyGameplayVm::bindSyphonFilterUsaV11AimLocomotionHooks() {
+  // These are the same two retail boundaries used by Redux. The first owns
+  // Gabe's facing-relative movement vector; the second normally forces L1
+  // manual aim into locomotion class 5 (idle). Supplying movement here keeps
+  // the original actor mover, room portals, collision and kill volumes
+  // authoritative instead of teleporting a host-computed root into RAM.
+  constexpr std::uint32_t movement_vector_boundary = 0x800362c4U;
+  constexpr std::uint32_t locomotion_class_boundary = 0x8003697cU;
+  bindHostCall(
+      movement_vector_boundary, [this](LegacyHostCallContext &context) {
+        context.continueGuestInstruction();
+        if (!host_aim_locomotion_active_) {
+          return;
+        }
+        constexpr std::uint32_t strafe_offset = 0x74U;
+        constexpr std::uint32_t move_offset = 0x7cU;
+        const auto state = context.argument(0);
+        if (state == 0U ||
+            !context.write32(state + strafe_offset,
+                             std::bit_cast<std::uint32_t>(host_aim_strafe_)) ||
+            !context.write32(state + move_offset,
+                             std::bit_cast<std::uint32_t>(host_aim_move_))) {
+          context.rejectHostCall();
+        }
+      });
+  bindHostCall(
+      locomotion_class_boundary, [this](LegacyHostCallContext &context) {
+        context.continueGuestInstruction();
+        if (!host_aim_locomotion_active_ ||
+            (host_aim_move_ == 0 && host_aim_strafe_ == 0)) {
+          return;
+        }
+        constexpr std::uint32_t stance_offset = 0x15cU;
+        const auto state = context.registerValue(19U);
+        std::uint32_t stance{};
+        if (state == 0U || !context.read32(state + stance_offset, stance)) {
+          context.rejectHostCall();
+          return;
+        }
+        context.setRegister(16U, stance > 1U ? 6U : 7U);
+      });
 }
 
 void LegacyGameplayVm::bindSyphonFilterUsaV11EnemyCloseAimHook(
@@ -5298,7 +5357,7 @@ LegacyGameplayVm::readBridgeState(const LegacyGameplayBridgeProfile &profile) {
   return state;
 }
 
-bool LegacyGameplayVm::writeHostPlayerState(
+bool LegacyGameplayVm::writeHostPlayerPose(
     const LegacyHostPlayerState &state,
     const LegacyNativeMissionBridgeProfile &profile) noexcept {
   constexpr std::uint32_t matrix_translation_x_offset = 0x14U;
@@ -5308,10 +5367,6 @@ bool LegacyGameplayVm::writeHostPlayerState(
   constexpr std::uint32_t motion_position_y_offset = 4U;
   constexpr std::uint32_t motion_position_z_offset = 8U;
   constexpr std::uint32_t motion_cached_position_offset = 0x40U;
-  constexpr std::uint32_t health_armor_offset = 6U;
-  constexpr std::uint32_t health_value_offset = 8U;
-  constexpr std::uint32_t object_health_offset = 0x40U;
-
   const auto &cached_position =
       state.has_previous_position ? state.previous_position : state.position;
   if (state.position.y == std::numeric_limits<std::int32_t>::min() ||
@@ -5350,11 +5405,21 @@ bool LegacyGameplayVm::writeHostPlayerState(
     return false;
   }
 
-  if (!writeLegacyPlayerHeading(runtime_, player->matrix, state.yaw)) {
+  return writeLegacyPlayerHeading(runtime_, player->matrix, state.yaw);
+}
+
+bool LegacyGameplayVm::writeHostPlayerState(
+    const LegacyHostPlayerState &state,
+    const LegacyNativeMissionBridgeProfile &profile) noexcept {
+  constexpr std::uint32_t health_armor_offset = 6U;
+  constexpr std::uint32_t health_value_offset = 8U;
+  constexpr std::uint32_t object_health_offset = 0x40U;
+  if (!writeHostPlayerPose(state, profile)) {
     return false;
   }
-
-  return runtime_.write16(player->health + health_armor_offset,
+  const auto player = resolveLegacyPlayer(runtime_, profile);
+  return player &&
+         runtime_.write16(player->health + health_armor_offset,
                           guestHalf(state.armor)) &&
          runtime_.write16(player->health + health_value_offset,
                           guestHalf(state.health)) &&

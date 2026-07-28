@@ -282,6 +282,18 @@ void loadSettingsFile(GraphicsSettings &graphics, KeyboardMouseBindings &input,
       input[action] = loaded;
     }
   }
+  // Migrate the original retail-style keyboard defaults without overwriting
+  // a customized layout. Mouse free-look owns chase yaw, so A/D now defaults
+  // to strafe; Q/E remains the fallback turn pair and manual-aim corner lean.
+  if (input[KeyboardMouseAction::turn_left] == KeyboardMouseInput::a &&
+      input[KeyboardMouseAction::turn_right] == KeyboardMouseInput::d &&
+      input[KeyboardMouseAction::strafe_left] == KeyboardMouseInput::q &&
+      input[KeyboardMouseAction::strafe_right] == KeyboardMouseInput::e) {
+    input[KeyboardMouseAction::turn_left] = KeyboardMouseInput::q;
+    input[KeyboardMouseAction::turn_right] = KeyboardMouseInput::e;
+    input[KeyboardMouseAction::strafe_left] = KeyboardMouseInput::a;
+    input[KeyboardMouseAction::strafe_right] = KeyboardMouseInput::d;
+  }
 }
 
 void saveSettingsFile(const GraphicsSettings &graphics,

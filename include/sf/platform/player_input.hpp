@@ -339,8 +339,8 @@ struct PlayerInputConfiguration {
 // Product tuning for raw relative mouse counts in native first-person aim.
 // Keep the response linear: acceleration applied to per-frame SDL batches
 // would make identical physical travel depend on presentation refresh.
-inline constexpr double first_person_mouse_yaw_sensitivity = 3.0;
-inline constexpr double first_person_mouse_pitch_sensitivity = 2.75;
+inline constexpr double first_person_mouse_yaw_sensitivity = 3.75;
+inline constexpr double first_person_mouse_pitch_sensitivity = 1.5;
 
 struct PlayerActionState {
   bool held{};

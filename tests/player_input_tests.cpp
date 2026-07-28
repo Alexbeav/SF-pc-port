@@ -198,6 +198,14 @@ void testKeyboardMouseBindingCatalog() {
   }
   require(defaults[KeyboardMouseAction::move_forward] ==
                   KeyboardMouseInput::w &&
+              defaults[KeyboardMouseAction::turn_left] ==
+                  KeyboardMouseInput::q &&
+              defaults[KeyboardMouseAction::turn_right] ==
+                  KeyboardMouseInput::e &&
+              defaults[KeyboardMouseAction::strafe_left] ==
+                  KeyboardMouseInput::a &&
+              defaults[KeyboardMouseAction::strafe_right] ==
+                  KeyboardMouseInput::d &&
               defaults[KeyboardMouseAction::aim] ==
                   KeyboardMouseInput::mouse_right &&
               defaults[KeyboardMouseAction::fire] ==
@@ -414,8 +422,8 @@ void testFirstPersonMousePrecisionTuning() {
   raw.pc.mouse_delta_y = -1.0;
 
   const auto input = sf::platform::firstPersonAimInput(mapper.update(raw));
-  require(near(input.mouse_look.yaw, 3.0) &&
-              near(input.mouse_look.pitch, 2.75) &&
+  require(near(input.mouse_look.yaw, 3.75) &&
+              near(input.mouse_look.pitch, 1.5) &&
               near(input.directional_look_per_guest_tick.yaw, 0.0) &&
               near(input.directional_look_per_guest_tick.pitch, 0.0) &&
               near(input.strafe, -1.0),

@@ -24,6 +24,7 @@
 #include "sf/game/mission_start.hpp"
 #include "sf/game/player_controller.hpp"
 #include "sf/game/state_stack.hpp"
+#include "sf/game/supported_games.hpp"
 #include "sf/game/system.hpp"
 #include "sf/game/title.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
@@ -52,6 +53,21 @@ void require(bool condition, const char *message) {
   if (!condition) {
     throw std::runtime_error{message};
   }
+}
+
+void testSupportedGames() {
+  const auto games = sf::game::supportedGames();
+  require(games.size() == 3U, "Supported-game catalog is incomplete");
+  const auto disc1 = sf::game::identify("SCUS94451", games[1].executable_sha256);
+  const auto disc2 = sf::game::identify("SCUS94492", games[2].executable_sha256);
+  require(disc1 && disc1->serial == "SCUS-94451" &&
+              disc1->executable_path == "SCUS_944.51" &&
+              disc2 && disc2->serial == "SCUS-94492" &&
+              disc2->executable_path == "SCUS_944.92" &&
+              games[1].executable_sha256 == games[2].executable_sha256,
+          "Syphon Filter 2 disc recognition profile mismatch");
+  require(!sf::game::identify("SCUS94451", games[0].executable_sha256),
+          "Supported-game recognition ignored executable identity");
 }
 
 void writeLe32(std::span<std::byte> bytes, std::size_t offset,
@@ -119,6 +135,27 @@ void testFogArchive() {
               unsorted_archive.file("EARLY.BIN").front() == std::byte{0x31} &&
               unsorted_archive.file("LATE.BIN").front() == std::byte{0x73},
           "FOG unsorted/optional extent table was not accepted");
+
+  std::vector<std::byte> extended(3U * sf::assets::FogArchive::sector_size,
+                                  std::byte{0xcd});
+  writeLe32(extended, 0, 0x80000001U);
+  writeLe32(extended, 4, 3U);
+  writeLe32(extended, 8, 0U);
+  writeLe32(extended, 12, 0U);
+  constexpr std::string_view extended_name{"MISSIONDATA.RFF"};
+  std::ranges::transform(
+      extended_name, extended.begin() + 16,
+      [](char value) { return static_cast<std::byte>(value); });
+  extended[16U + extended_name.size()] = std::byte{0};
+  writeLe32(extended, 36U, 1U);
+  writeLe32(extended, 40U, 2U);
+  extended[sf::assets::FogArchive::sector_size] = std::byte{0x52};
+  const auto extended_archive =
+      sf::assets::FogArchive::parse(std::move(extended));
+  require(extended_archive.entries().size() == 1U &&
+              extended_archive.entries()[0].name == extended_name &&
+              extended_archive.file(extended_name).front() == std::byte{0x52},
+          "SF2 extended-name FOG table was not accepted");
 }
 
 void testInvalidFogArchive() {
@@ -1261,6 +1298,21 @@ void testChaseCamera() {
               std::abs(behind_north.target_z - 300.0) < 0.0001,
           "Chase camera did not stay behind the player");
 
+  const auto look_up = sf::game::applyChaseCameraPitch(behind_north, 256.0);
+  const auto look_down =
+      sf::game::applyChaseCameraPitch(behind_north, -256.0);
+  const auto clamped_pitch =
+      sf::game::applyChaseCameraPitch(behind_north, 10000.0);
+  const auto maximum_pitch =
+      sf::game::applyChaseCameraPitch(behind_north, 512.0);
+  require(look_up.x == behind_north.x && look_up.y == behind_north.y &&
+              look_up.z == behind_north.z &&
+              look_up.target_y < behind_north.target_y &&
+              look_down.target_y > behind_north.target_y &&
+              std::abs(clamped_pitch.target_y -
+                       maximum_pitch.target_y) < epsilon,
+          "Aftermarket chase pitch moved the eye or escaped its clamp");
+
   const auto project_player_y = [&](double world_y) {
     constexpr auto native_screen_center_y = 120.0;
     constexpr auto native_projection = 320.0;
@@ -1405,15 +1457,16 @@ void testPlayerController() {
           .strafe = 1.0,
       },
       movement);
-  require(controller.locomotion() == sf::game::PlayerLocomotionState::idle &&
+  require(controller.locomotion() ==
+                  sf::game::PlayerLocomotionState::walking &&
               controller.aim() == sf::game::PlayerAimState::first_person &&
-              controller.state().x == spawn.x &&
               controller.state().y == spawn.y &&
-              controller.state().z == spawn.z && controller.state().grounded &&
+              (controller.state().x != spawn.x ||
+               controller.state().z != spawn.z) &&
+              controller.state().grounded &&
               controller.state().yaw == spawn.yaw &&
-              movement.attempts == attempts_before_aim,
-          "Mouse-only aiming accepted movement/turn input or changed the "
-          "collision root");
+              movement.attempts == attempts_before_aim + 1U,
+          "Modern aim locomotion did not move through the collision resolver");
 
   controller.reset(spawn);
   controller.update(sf::game::PlayerInput{.turn = 1.0}, movement);
@@ -1443,8 +1496,8 @@ void testPlayerController() {
       movement);
   require(controller.state().yaw == spawn.yaw &&
               controller.locomotion() ==
-                  sf::game::PlayerLocomotionState::idle &&
-              controller.actorMotion() == sf::game::ActorMotion::idle &&
+                  sf::game::PlayerLocomotionState::walking &&
+              controller.actorMotion() == sf::game::ActorMotion::walk &&
               controller.aim() == sf::game::PlayerAimState::first_person &&
               controller.weaponSwitch() ==
                   sf::game::PlayerWeaponSwitchState::next &&
@@ -1452,7 +1505,7 @@ void testPlayerController() {
                   sf::game::PlayerActionState::weapon_switching &&
               controller.cameraIntent().mode ==
                   sf::game::PlayerCameraMode::first_person_aim,
-          "First-person aim accepted non-mouse movement/turn input");
+          "First-person aim locomotion or weapon switching state mismatch");
 
   controller.update(
       sf::game::PlayerInput{
@@ -1483,18 +1536,21 @@ void testPlayerController() {
           .fire_pressed = true,
       },
       movement);
-  require(controller.locomotion() == sf::game::PlayerLocomotionState::idle &&
-              controller.actorMotion() == sf::game::ActorMotion::idle &&
+  require(controller.locomotion() ==
+                  sf::game::PlayerLocomotionState::strafing &&
+              controller.actorMotion() ==
+                  sf::game::ActorMotion::strafe_right &&
               controller.aimHeading() == 1024 &&
               controller.state().yaw == spawn.yaw &&
-              controller.state().x == spawn.x &&
               controller.state().y == spawn.y &&
-              controller.state().z == spawn.z && controller.state().grounded &&
+              (controller.state().x != spawn.x ||
+               controller.state().z != spawn.z) &&
+              controller.state().grounded &&
               controller.action() == sf::game::PlayerActionState::firing &&
               controller.cameraIntent().pitch == 1000.0 &&
               controller.camera().x > controller.state().x,
-          "Mouse aim moved Gabe's body or lost its independent yaw/pitch/fire "
-          "state");
+          "Mouse aim locomotion lost its independent yaw/pitch/fire state");
+  const auto aimed_movement_state = controller.state();
 
   controller.update(
       sf::game::PlayerInput{
@@ -1504,8 +1560,10 @@ void testPlayerController() {
       },
       movement);
   require(
-      controller.aimHeading() == 3072 && controller.state().x == spawn.x &&
-          controller.state().y == spawn.y && controller.state().z == spawn.z &&
+      controller.aimHeading() == 3072 &&
+          controller.state().x == aimed_movement_state.x &&
+          controller.state().y == aimed_movement_state.y &&
+          controller.state().z == aimed_movement_state.z &&
           controller.state().yaw == spawn.yaw && controller.state().grounded &&
           controller.cameraIntent().heading == controller.aimHeading() &&
           controller.cameraIntent().pitch == -1000.0 &&
@@ -1515,8 +1573,9 @@ void testPlayerController() {
   controller.update({}, movement);
   require(
       controller.aim() == sf::game::PlayerAimState::chase &&
-          controller.state().x == spawn.x && controller.state().y == spawn.y &&
-          controller.state().z == spawn.z &&
+          controller.state().x == aimed_movement_state.x &&
+          controller.state().y == aimed_movement_state.y &&
+          controller.state().z == aimed_movement_state.z &&
           controller.state().yaw == spawn.yaw && controller.state().grounded,
       "Releasing first-person aim changed Gabe's body pose");
 
@@ -3162,6 +3221,7 @@ void testTitleMenu() {
 int main() {
   try {
     testSha256();
+    testSupportedGames();
     testFogArchive();
     testInvalidFogArchive();
     testMissionCatalog();

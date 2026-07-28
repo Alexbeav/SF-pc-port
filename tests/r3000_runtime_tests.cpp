@@ -1714,6 +1714,48 @@ void testLegacyGameplayVmBoundary() {
   require(vm.unbindHostCall(overlay_address),
           "Could not remove the pass-through host hook");
 
+  constexpr std::uint32_t aim_movement_boundary = 0x800362c4U;
+  constexpr std::uint32_t aim_locomotion_boundary = 0x8003697cU;
+  constexpr std::array return_words{
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  const auto return_code = instructionBytes(return_words);
+  require(vm.loadOverlay(aim_movement_boundary, return_code) &&
+              vm.loadOverlay(aim_locomotion_boundary, return_code),
+          "Could not prepare manual-aim locomotion hook fixtures");
+  vm.bindSyphonFilterUsaV11AimLocomotionHooks();
+  vm.setHostAimLocomotion(true, 1.0, -0.5);
+  constexpr std::uint32_t aim_movement_state = 0x80041000U;
+  const auto aim_movement_result =
+      vm.invoke(aim_movement_boundary, std::array{aim_movement_state});
+  std::uint32_t staged_move{};
+  std::uint32_t staged_strafe{};
+  require(aim_movement_result.completed() &&
+              vm.runtime().read32(aim_movement_state + 0x7cU, staged_move) &&
+              vm.runtime().read32(aim_movement_state + 0x74U,
+                                  staged_strafe) &&
+              std::bit_cast<std::int32_t>(staged_move) == 4096 &&
+              std::bit_cast<std::int32_t>(staged_strafe) == -2048,
+          "Manual-aim movement hook did not stage retail fixed-point axes");
+  require(vm.runtime().write32(aim_movement_state + 0x15cU, 2U),
+          "Could not prepare manual-aim stance fixture");
+  vm.runtime().setRegister(19U, aim_movement_state);
+  const auto aim_locomotion_result = vm.invoke(aim_locomotion_boundary);
+  require(aim_locomotion_result.completed() &&
+              vm.runtime().state().gpr[16U] == 6U,
+          "Manual aim still forced the moving actor into retail idle");
+  vm.setHostAimLocomotion(false, 1.0, 1.0);
+  require(vm.runtime().write32(aim_movement_state + 0x74U, 0x12345678U),
+          "Could not prepare disabled aim-locomotion fixture");
+  const auto disabled_aim_movement =
+      vm.invoke(aim_movement_boundary, std::array{aim_movement_state});
+  require(disabled_aim_movement.completed() &&
+              vm.runtime().read32(aim_movement_state + 0x74U,
+                                  staged_strafe) &&
+              staged_strafe == 0x12345678U,
+          "Disabled manual-aim hook modified retail movement state");
+
   constexpr auto retail_aim_profile =
       sf::game::syphonFilterUsaV11HostAimRayProfile();
   static_assert(
@@ -6049,6 +6091,9 @@ void testGuestPadBridge() {
   input.aim = true;
   input.next_weapon = true;
   input.strafe = -1.0;
+  input.aim_sight_yaw = -0.5;
+  input.aim_sight_pitch = 1.0;
+  input.aim_corner_strafe = -1.0;
   input.look_yaw = 96.0;
   input.look_pitch = -96.0;
   input.fire_held = true;
@@ -6073,9 +6118,9 @@ void testGuestPadBridge() {
   input.look_pitch = 96.0;
   const auto native_aim_down = sf::game::legacyPadStateFromPlayerInput(input);
   input.look_pitch = 0.0;
-  input.move = 1.0;
+  input.aim_sight_pitch = 1.0;
   const auto keyboard_aim_up = sf::game::legacyPadStateFromPlayerInput(input);
-  input.move = -1.0;
+  input.aim_sight_pitch = -1.0;
   const auto keyboard_aim_down = sf::game::legacyPadStateFromPlayerInput(input);
   require(native_aim_up.left_y == 0x80U && native_aim_down.left_y == 0x80U &&
               keyboard_aim_up.left_y == 1U && keyboard_aim_down.left_y == 0xffU,
@@ -6094,14 +6139,14 @@ void testGuestPadBridge() {
 
   input = {};
   input.aim = true;
-  input.strafe = -1.0;
+  input.aim_corner_strafe = -1.0;
   const auto aim_strafe_left = sf::game::legacyPadStateFromPlayerInput(input);
-  input.strafe = 1.0;
+  input.aim_corner_strafe = 1.0;
   const auto aim_strafe_right = sf::game::legacyPadStateFromPlayerInput(input);
-  input.strafe = 0.0;
-  input.turn = -1.0;
+  input.aim_corner_strafe = 0.0;
+  input.aim_sight_yaw = -1.0;
   const auto aim_turn_left = sf::game::legacyPadStateFromPlayerInput(input);
-  input.turn = 1.0;
+  input.aim_sight_yaw = 1.0;
   const auto aim_turn_right = sf::game::legacyPadStateFromPlayerInput(input);
   require((aim_strafe_left.buttons & 0x0300U) == 0x0100U &&
               (aim_strafe_right.buttons & 0x0300U) == 0x0200U &&

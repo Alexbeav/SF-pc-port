@@ -27,6 +27,12 @@ struct PlayerInput {
     bool quick_weapon{};
 
     double strafe{};
+    // Modern keyboard aim locomotion is independent of the original L1 sight
+    // axes and L2/R2 corner-peek channel. Physical controllers continue to
+    // populate these retail channels unchanged.
+    double aim_sight_yaw{};
+    double aim_sight_pitch{};
+    double aim_corner_strafe{};
     // Mouse/controller look is supplied in PS1 heading-angle units. Keeping
     // device scaling outside the controller makes replay updates deterministic.
     double look_yaw{};
