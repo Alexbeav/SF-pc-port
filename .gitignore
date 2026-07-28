@@ -1,0 +1,29 @@
+/build/
+/out/
+/dist/
+/tmp/
+/.vs/
+/CMakeUserPresets.json
+*.user
+*.suo
+*.VC.db
+/*.log
+/*.dmp
+/*.obj
+/*.zip
+/*.zip.sha256
+/syphon_filter_cheats
+/.psycross-gitlink-backup
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.py[cod]
+__pycache__/
+/tools/fonts/industry/*.ttf
+
+# User-generated localization and review outputs. These may contain data
+# extracted or translated from a user-owned game image.
+/assets/locales/
+/docs/images/sf-cyrillic-*
+/docs/RUSSIAN_LOCALIZATION_REVIEW.*
