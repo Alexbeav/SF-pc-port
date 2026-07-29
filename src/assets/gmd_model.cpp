@@ -87,7 +87,7 @@ GmdModel GmdModel::parse(std::span<const std::byte> bytes) {
         throw core::Error{core::ErrorCode::invalid_format, "Invalid GMD vertex count"};
     }
 
-    const EmdBounds bounds{
+    auto bounds = EmdBounds{
         readSignedLe16(bytes, 0x0a),
         readSignedLe16(bytes, 0x0c),
         readSignedLe16(bytes, 0x0e),
@@ -95,11 +95,10 @@ GmdModel GmdModel::parse(std::span<const std::byte> bytes) {
         readSignedLe16(bytes, 0x12),
         readSignedLe16(bytes, 0x14),
     };
-    if (bounds.minimum_x > bounds.maximum_x ||
-        bounds.minimum_y > bounds.maximum_y ||
-        bounds.minimum_z > bounds.maximum_z) {
-        throw core::Error{core::ErrorCode::invalid_format, "Invalid GMD bounds"};
-    }
+    const auto authored_bounds_valid =
+        bounds.minimum_x <= bounds.maximum_x &&
+        bounds.minimum_y <= bounds.maximum_y &&
+        bounds.minimum_z <= bounds.maximum_z;
 
     std::vector<GmdVertex> vertices;
     vertices.reserve(vertex_count);
@@ -110,6 +109,21 @@ GmdModel GmdModel::parse(std::span<const std::byte> bytes) {
             unpackSigned(packed, 10, 10),
             unpackSigned(packed, 20, 12),
         });
+    }
+    // SF2 uses the retail empty-extents sentinel (+32000/-32000) for a few
+    // generated debris models. Their packed vertices remain authoritative.
+    if (!authored_bounds_valid) {
+        bounds.minimum_x = bounds.maximum_x = vertices.front().x;
+        bounds.minimum_y = bounds.maximum_y = vertices.front().y;
+        bounds.minimum_z = bounds.maximum_z = vertices.front().z;
+        for (const auto& vertex : vertices) {
+            bounds.minimum_x = std::min(bounds.minimum_x, vertex.x);
+            bounds.minimum_y = std::min(bounds.minimum_y, vertex.y);
+            bounds.minimum_z = std::min(bounds.minimum_z, vertex.z);
+            bounds.maximum_x = std::max(bounds.maximum_x, vertex.x);
+            bounds.maximum_y = std::max(bounds.maximum_y, vertex.y);
+            bounds.maximum_z = std::max(bounds.maximum_z, vertex.z);
+        }
     }
 
     std::vector<GmdTriangle> triangles;

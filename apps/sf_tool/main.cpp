@@ -4,15 +4,19 @@
 #include "sf/assets/fog_archive.hpp"
 #include "sf/assets/hog_archive.hpp"
 #include "sf/assets/mission_briefing.hpp"
+#include "sf/assets/mission_script.hpp"
 #include "sf/assets/tim_image.hpp"
 #include "sf/core/error.hpp"
 #include "sf/core/file_io.hpp"
 #include "sf/core/sha256.hpp"
 #include "sf/game/actor_animation.hpp"
+#include "sf/game/disc_cdrom_media.hpp"
+#include "sf/game/disc_info.hpp"
 #include "sf/game/game_disc.hpp"
 #include "sf/game/gameplay.hpp"
 #include "sf/game/legacy_first_mission_runtime.hpp"
 #include "sf/game/legacy_gameplay_vm.hpp"
+#include "sf/game/legacy_mission_image.hpp"
 #include "sf/game/localization.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/title.hpp"
@@ -27,10 +31,15 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -40,8 +49,10 @@ void printUsage() {
   std::cerr
       << "Usage:\n"
       << "  sf_tool inspect <game.cue>\n"
+      << "  sf_tool inspect-disc-info <game.cue>\n"
       << "  sf_tool inspect-title <game.cue>\n"
       << "  sf_tool inspect-mission <game.cue> [mission-index]\n"
+      << "  sf_tool inspect-mission-archive <game.cue> <resource-name>\n"
       << "  sf_tool catalog <game.cue>\n"
       << "  sf_tool list-files <game.cue> [iso-path]\n"
       << "  sf_tool extract-exe <game.cue> <output-file>\n"
@@ -61,7 +72,27 @@ void printUsage() {
          "<output-directory>\n"
       << "  sf_tool export-runtime-strings <game.cue> <output.tsv>\n"
       << "  sf_tool map-functions <game.cue> <output.csv>\n"
+      << "  sf_tool map-function-union <left.cue> <right.cue> <output.csv>\n"
+      << "  sf_tool map-function-calls <game.cue> <output.csv>\n"
+      << "  sf_tool compare-functions <left.cue> <right.cue> <output.csv>\n"
+      << "  sf_tool map-embedded-archives <game.cue> <output.csv>\n"
+      << "  sf_tool map-resident-overlays <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-overlays <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-classes <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-objects <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-scripts <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-script-opcodes <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-script-handler-calls <game.cue> <output.csv>\n"
+      << "  sf_tool compare-mission-script-opcodes <left.cue> <right.cue> "
+         "<output.csv>\n"
+      << "  sf_tool map-mission-script-events <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-script-actions <game.cue> <output.csv>\n"
+      << "  sf_tool map-mission-script-strings <game.cue> <output.csv>\n"
+      << "  sf_tool map-object-handlers <game.cue> <output.csv>\n"
+      << "  sf_tool map-string-references <game.cue> <output.csv>\n"
+      << "  sf_tool map-xa-streams <game.cue> <output.csv>\n"
       << "  sf_tool probe-legacy-vm <game.cue>\n"
+      << "  sf_tool probe-executable-entry <game.cue> [instruction-budget]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -627,6 +658,148 @@ int catalog(const char *cue_path) {
   return 0;
 }
 
+int mapXaStreams(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() || disc.game()->layout.streaming_audio_path.empty()) {
+    throw sf::core::Error{sf::core::ErrorCode::unsupported,
+                          "Disc has no recognized streaming-audio path"};
+  }
+  if (!disc.image().hasRawSectors()) {
+    throw sf::core::Error{sf::core::ErrorCode::unsupported,
+                          "XA mapping requires a MODE2/2352 source track"};
+  }
+  const auto path = std::string{disc.game()->layout.streaming_audio_path};
+  const auto entry = disc.image().find(path);
+  if (entry.is_directory) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Streaming-audio path is a directory"};
+  }
+  const auto sector_count = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(entry.size) +
+       sf::disc::Iso9660Image::logical_sector_size - 1U) /
+      sf::disc::Iso9660Image::logical_sector_size);
+
+  struct StreamSummary {
+    struct Clip {
+      std::uint32_t first_sector{};
+      std::uint32_t last_sector{};
+      std::uint32_t sectors{};
+      bool eof{};
+    };
+    std::uint32_t first_sector{};
+    std::uint32_t last_sector{};
+    std::uint32_t sectors{};
+    std::uint32_t eof_sectors{};
+    std::uint32_t largest_gap{};
+    std::uint8_t submode_or{};
+    std::uint32_t active_clip_first{};
+    std::uint32_t active_clip_sectors{};
+    std::vector<Clip> clips;
+  };
+  std::map<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t>,
+           StreamSummary>
+      streams;
+  std::array<std::byte, 2352U> sector{};
+  for (std::uint32_t index = 0U; index < sector_count; ++index) {
+    if (!disc.image().copyRawSector(entry.extent_lba + index, sector)) {
+      throw sf::core::Error{sf::core::ErrorCode::io,
+                            "Could not read an XA source sector"};
+    }
+    constexpr std::size_t subheader = 16U;
+    const auto file = std::to_integer<std::uint8_t>(sector[subheader]);
+    const auto channel =
+        std::to_integer<std::uint8_t>(sector[subheader + 1U]);
+    const auto submode =
+        std::to_integer<std::uint8_t>(sector[subheader + 2U]);
+    const auto coding =
+        std::to_integer<std::uint8_t>(sector[subheader + 3U]);
+    const auto repeated =
+        sector[subheader] == sector[subheader + 4U] &&
+        sector[subheader + 1U] == sector[subheader + 5U] &&
+        sector[subheader + 2U] == sector[subheader + 6U] &&
+        sector[subheader + 3U] == sector[subheader + 7U];
+    constexpr std::uint8_t audio_bit = 0x04U;
+    constexpr std::uint8_t form2_bit = 0x20U;
+    if (!repeated || (submode & (audio_bit | form2_bit)) !=
+                         (audio_bit | form2_bit)) {
+      continue;
+    }
+    auto [position, inserted] =
+        streams.try_emplace({file, channel, coding},
+                            StreamSummary{index, index, 0U, 0U, 0U, 0U});
+    auto &summary = position->second;
+    if (!inserted && index > summary.last_sector + 1U) {
+      summary.largest_gap =
+          std::max(summary.largest_gap, index - summary.last_sector - 1U);
+    }
+    summary.last_sector = index;
+    ++summary.sectors;
+    if (summary.active_clip_sectors == 0U) {
+      summary.active_clip_first = index;
+    }
+    ++summary.active_clip_sectors;
+    summary.eof_sectors += (submode & 0x80U) != 0U ? 1U : 0U;
+    summary.submode_or = static_cast<std::uint8_t>(summary.submode_or | submode);
+    if ((submode & 0x80U) != 0U) {
+      summary.clips.push_back(StreamSummary::Clip{
+          summary.active_clip_first, index, summary.active_clip_sectors, true});
+      summary.active_clip_sectors = 0U;
+    }
+  }
+  for (auto &[key, summary] : streams) {
+    static_cast<void>(key);
+    if (summary.active_clip_sectors != 0U) {
+      summary.clips.push_back(StreamSummary::Clip{
+          summary.active_clip_first, summary.last_sector,
+          summary.active_clip_sectors, false});
+      summary.active_clip_sectors = 0U;
+    }
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Could not create XA stream map"};
+  }
+  output << "path,file,channel,coding,stereo,sample_rate_hz,clip,"
+            "clip_sectors,clip_duration_seconds,first_relative_sector,"
+            "last_relative_sector,first_lba,last_lba,eof,"
+            "stream_sectors,stream_duration_seconds,stream_clip_count,"
+            "largest_interleave_gap,submode_or\n";
+  for (const auto &[key, summary] : streams) {
+    const auto [file, channel, coding] = key;
+    for (std::size_t clip_index = 0U; clip_index < summary.clips.size();
+         ++clip_index) {
+      const auto &clip = summary.clips[clip_index];
+      output << path << ',' << static_cast<unsigned int>(file) << ','
+             << static_cast<unsigned int>(channel) << ",0x" << std::hex
+             << std::uppercase << static_cast<unsigned int>(coding) << std::dec
+             << ',' << ((coding & 1U) != 0U ? 1 : 0) << ','
+             << ((coding & 4U) != 0U ? 18900 : 37800) << ',' << clip_index
+             << ',' << clip.sectors << ',' << std::fixed
+             << std::setprecision(3)
+             << static_cast<double>(clip.sectors) / 75.0 << std::defaultfloat
+             << ',' << clip.first_sector << ',' << clip.last_sector << ','
+             << entry.extent_lba + clip.first_sector << ','
+             << entry.extent_lba + clip.last_sector << ','
+             << (clip.eof ? 1 : 0) << ',' << summary.sectors << ','
+             << std::fixed << std::setprecision(3)
+             << static_cast<double>(summary.sectors) / 75.0
+             << std::defaultfloat << ',' << summary.clips.size() << ','
+             << summary.largest_gap << ",0x" << std::hex << std::uppercase
+             << static_cast<unsigned int>(summary.submode_or) << std::dec
+             << '\n';
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Could not write XA stream map"};
+  }
+  std::cout << "Mapped " << streams.size() << " XA streams from " << path
+            << " across " << sector_count << " sectors\n";
+  return 0;
+}
+
 void listFiles(sf::disc::Iso9660Image &image, const std::string &path) {
   for (const auto &entry : image.list(path)) {
     const auto child = path.empty() ? entry.name : path + '/' + entry.name;
@@ -660,6 +833,105 @@ int inspectTitle(const char *cue_path) {
   return 0;
 }
 
+int inspectDiscInfo(const char *cue_path) {
+  auto disc = openDisc(cue_path);
+  const auto titles = sf::game::loadDiscSelectionTitles(disc);
+  const auto resources =
+      disc.game() ? sf::game::missionResources(disc.game()->id,
+                                               disc.game()->disc_number)
+                  : std::span<const sf::game::GameMissionResource>{};
+  std::cout << "index,title,available-on-disc,resource\n";
+  for (const auto &entry : titles) {
+    const auto resource = std::ranges::find(
+        resources, entry.index, &sf::game::GameMissionResource::selection_index);
+    std::cout << entry.index << ',' << std::quoted(entry.title) << ','
+              << (resource != resources.end() ? "yes" : "no") << ','
+              << (resource != resources.end() ? resource->resource_name
+                                              : std::string_view{})
+              << '\n';
+  }
+  return 0;
+}
+
+int inspectMissionArchive(const char *cue_path,
+                          std::string_view resource_name) {
+  auto disc = openDisc(cue_path);
+  auto resource = std::string{resource_name};
+  std::ranges::transform(resource, resource.begin(), [](char value) {
+    return value >= 'a' && value <= 'z'
+               ? static_cast<char>(value - ('a' - 'A'))
+               : value;
+  });
+  const auto archive_directory =
+      disc.game() ? disc.game()->layout.mission_archive_directory
+                  : std::string_view{"FOG"};
+  const auto archive_path =
+      std::string{archive_directory} + '/' + resource + ".FOG";
+  const auto archive =
+      sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+  const auto legacy_image =
+      sf::game::LegacyMissionImage::load(disc, archive, archive_path);
+  static_cast<void>(legacy_image.createVirtualCd());
+  const auto world_model_bytes = archive.file("WLDEMD.HOG");
+  const auto world_models = sf::assets::HogArchive::parse(
+      std::vector<std::byte>{world_model_bytes.begin(),
+                             world_model_bytes.end()});
+  std::optional<sf::assets::LevelLayout> layout;
+  std::optional<sf::assets::MissionObjects> objects;
+  std::string layout_error;
+  std::string objects_error;
+  try {
+    layout = sf::assets::LevelLayout::parse(
+        archive.file(resource + ".DAT"), world_models.entries().size());
+  } catch (const sf::core::Error &error) {
+    layout_error = error.what();
+  }
+  try {
+    objects =
+        sf::assets::MissionObjects::parse(archive.file(resource + ".BIN"));
+  } catch (const sf::core::Error &error) {
+    objects_error = error.what();
+  }
+
+  auto texture_count = std::size_t{};
+  for (const auto &entry : archive.entries()) {
+    if (entry.name != "VRAM.HOG" && entry.name != "VRAM1.HOG") {
+      continue;
+    }
+    const auto bytes = archive.file(entry.name);
+    texture_count +=
+        sf::assets::HogArchive::parse(
+            std::vector<std::byte>{bytes.begin(), bytes.end()})
+            .entries()
+            .size();
+  }
+  std::cout << "resource=" << resource
+            << " archive-files=" << archive.entries().size()
+            << " virtual-root-files=" << legacy_image.rootFileCount()
+            << " virtual-archive-files=" << legacy_image.archiveFileCount()
+            << " world-models=" << world_models.entries().size()
+            << " texture-files=" << texture_count;
+  if (layout) {
+    std::cout << " layout-compatible=yes rooms=" << layout->modelCount()
+              << " initial-room=" << layout->initialRoom()
+              << " resident-models=" << layout->residentModels().size();
+  } else {
+    std::cout << " layout-compatible=no layout-error="
+              << std::quoted(layout_error);
+  }
+  if (objects) {
+    std::cout << " objects-compatible=yes objects=" << objects->objects().size()
+              << " definitions=" << objects->definitions().size()
+              << " object-rooms=" << objects->roomCount()
+              << " player-index=" << objects->playerIndex();
+  } else {
+    std::cout << " objects-compatible=no objects-error="
+              << std::quoted(objects_error);
+  }
+  std::cout << '\n';
+  return 0;
+}
+
 int inspectMission(const char *cue_path, std::uint32_t mission_index) {
   auto disc = openDisc(cue_path);
   const auto mission = sf::game::MissionPackage::load(disc, mission_index);
@@ -669,9 +941,11 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
   std::size_t polygon_count = 0;
   std::vector<sf::assets::EmdScene> world_scenes;
   world_scenes.reserve(mission.worldModels().entries().size());
+  const auto emd_vertex_index_stride = static_cast<std::uint8_t>(
+      mission.gameId() == sf::game::GameId::syphon_filter_3 ? 2U : 3U);
   for (const auto &entry : mission.worldModels().entries()) {
-    auto scene =
-        sf::assets::EmdScene::parse(mission.worldModels().file(entry.name));
+    auto scene = sf::assets::EmdScene::parse(
+        mission.worldModels().file(entry.name), emd_vertex_index_stride);
     section_count += scene.sections().size();
     vertex_count += scene.vertexCount();
     polygon_count += scene.polygonCount();
@@ -751,6 +1025,9 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
     auto conflict = false;
     auto alias_remapped = false;
     std::vector<std::string> room_conflicts;
+    const auto canonical_bank = [&](int bank) {
+      return bank >= 0 && mission.textureBankCount() == 1U ? 0 : bank;
+    };
     const auto page_bytes = [&](unsigned int page,
                                 int bank) -> std::span<const std::byte> {
       constexpr std::size_t texture_page_size = 64U * 256U * 2U;
@@ -765,10 +1042,13 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
         name.push_back('0');
       }
       name += std::to_string(page) + ".BIN";
-      return mission.textureBank(static_cast<std::size_t>(bank)).file(name);
+      return mission
+          .textureBank(static_cast<std::size_t>(canonical_bank(bank)))
+          .file(name);
     };
     const auto require_page = [&](unsigned int page, int bank) {
       page &= 0x1fU;
+      bank = canonical_bank(bank);
       auto physical = remap[page];
       const auto source_bank = (vlf_mask & (1U << page)) != 0U ? -2 : bank;
       auto *owner = &slots[physical];
@@ -869,6 +1149,15 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
     }
   }
 
+  auto script_program_count = std::size_t{};
+  auto script_event_count = std::size_t{};
+  if (mission.missionScripts()) {
+    script_program_count = mission.missionScripts()->programs().size();
+    for (const auto &program : mission.missionScripts()->programs()) {
+      script_event_count += program.events.size();
+    }
+  }
+
   std::cout << "Mission:      " << definition.index << " - " << definition.title
             << '\n'
             << "Resource:     " << definition.resource_name << '\n'
@@ -880,8 +1169,30 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
             << "EMD sections: " << section_count << '\n'
             << "EMD vertices: " << vertex_count << '\n'
             << "EMD polygons: " << polygon_count << '\n'
+            << "Script programs/events: " << script_program_count << '/'
+            << script_event_count << '\n'
             << "Native objects: " << gameplay.objects().size() << '\n'
             << "Active objects: " << gameplay.activeObjects().size() << '\n'
+            << "Player source:  " << mission.objects().playerIndex() << " @ "
+            << mission.objects().player().transform.x << ','
+            << -mission.objects().player().transform.y << ','
+            << mission.objects().player().transform.z << " yaw "
+            << gameplay.player().yaw << '\n'
+            << "Initial weapon:  "
+            << static_cast<unsigned int>(
+                   gameplay.hud().inventory().current())
+            << " (" << gameplay.hud().inventory().currentDefinition().name
+            << "), armor " << gameplay.hud().vitals().armor << ", timer "
+            << (gameplay.nativeMissionTimerSeconds()
+                    ? std::to_string(*gameplay.nativeMissionTimerSeconds())
+                    : std::string{"none"})
+            << ", model "
+            << (gameplay.weaponModel(gameplay.hud().inventory().current()) !=
+                        nullptr
+                    ? "loaded"
+                    : "none")
+            << '\n'
+            << "Initial room:   " << mission.layout().initialRoom() << '\n'
             << "HMD models:     " << hmd_model_count << '\n'
             << "VRAM conflicts: " << vram_conflict_rooms << '\n'
             << "VRAM alias remaps: " << vram_alias_remap_names.size() << '\n'
@@ -892,6 +1203,35 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
             << walking_root_distance << ", RN0 " << running_root_frames << "/"
             << running_root_distance << " (frames/world units)\n\n"
             << "name,start_sector,sector_count,size\n";
+  std::cout << "Initial visibility:";
+  for (const auto model :
+       mission.layout().visibility(mission.layout().initialRoom()).active_models) {
+    std::cout << ' ' << model;
+  }
+  std::cout << "\nResident models:";
+  for (const auto model : mission.layout().residentModels()) {
+    std::cout << ' ' << model;
+  }
+  std::cout << "\nResident visibility:";
+  for (const auto resident : mission.layout().residentModels()) {
+    std::cout << " [" << resident << ':';
+    for (const auto model : mission.layout().visibility(resident).active_models) {
+      std::cout << ' ' << model;
+    }
+    std::cout << ']';
+  }
+  std::cout << "\nInitial model bounds:\n";
+  for (const auto model : gameplay.activeModels()) {
+    if (model >= gameplay.models().size()) {
+      continue;
+    }
+    const auto &world = gameplay.models()[model];
+    std::cout << model << ',' << world.name << ',' << world.bounds.minimum_x
+              << ',' << world.bounds.minimum_y << ','
+              << world.bounds.minimum_z << ',' << world.bounds.maximum_x
+              << ',' << world.bounds.maximum_y << ','
+              << world.bounds.maximum_z << '\n';
+  }
   std::cout << "Object definitions:\n";
   for (std::size_t index = 0; index < mission.objects().definitions().size();
        ++index) {
@@ -932,7 +1272,16 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
               << std::hex << object.attributes << ",0x" << object.ai_parameter
               << ",0x" << object.path_data_offset << std::dec << ','
               << object.linked_object << ',' << object.transform.x << ','
-              << object.transform.y << ',' << object.transform.z << '\n';
+              << object.transform.y << ',' << object.transform.z << ','
+              << object.transform.rotation[2] << ','
+              << object.transform.rotation[8] << ','
+              << object.patrol_path.size() << ','
+              << (object.patrol_path_loops ? 1 : 0) << ','
+              << static_cast<unsigned int>(object.patrol_loop_start);
+    for (const auto &point : object.patrol_path) {
+      std::cout << ',' << point.x << ':' << point.y << ':' << point.z;
+    }
+    std::cout << '\n';
   }
   std::cout << "Special effects:\n";
   for (const auto &entry : mission.specialEffects().entries()) {
@@ -967,22 +1316,60 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
   return 0;
 }
 
+std::vector<std::uint32_t> sequelOverlayExecutableSeeds(sf::game::GameDisc &disc);
+std::vector<std::pair<std::uint32_t, std::uint32_t>>
+embeddedArchiveExactDataRanges(std::span<const std::byte> text,
+                               std::uint32_t load_address);
+
 int mapFunctions(const char *cue_path, const char *output_path) {
   const auto disc = openDisc(cue_path);
   const auto &executable = disc.executable();
   const auto &header = executable.header();
-  const auto candidates = sf::psx::discoverFunctionCandidates(
-      executable.text(), header.text_address, header.initial_pc);
+  auto mutable_disc = openDisc(cue_path);
+  const auto overlay_seeds = sequelOverlayExecutableSeeds(mutable_disc);
+  const auto candidates = sf::psx::fingerprintFunctionCandidates(
+      executable.text(), header.text_address, header.initial_pc, true,
+      overlay_seeds);
+  const std::set overlay_seed_set(overlay_seeds.begin(), overlay_seeds.end());
+  const auto asset_ranges = embeddedArchiveExactDataRanges(
+      executable.text(), header.text_address);
+  const auto in_asset_range = [&](std::uint32_t address) {
+    return std::ranges::any_of(asset_ranges, [&](const auto &range) {
+      return address >= range.first && address < range.second;
+    });
+  };
 
   std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
   if (!output) {
     throw sf::core::Error{sf::core::ErrorCode::io,
                           "Cannot open function-map output"};
   }
-  output << "address,static_call_sites\n" << std::hex << std::uppercase;
+  output << "address,static_call_sites,instructions,direct_callees,has_return,"
+            "overlay_referenced,embedded_asset_range,seed_evidence,exact_sha256,"
+            "structural_sha256\n"
+         << std::hex << std::uppercase;
   for (const auto &candidate : candidates) {
     output << "0x" << candidate.address << ',' << std::dec
-           << candidate.static_call_count << '\n'
+           << candidate.static_call_count << ',' << candidate.instruction_count
+           << ',' << candidate.direct_callee_count << ','
+           << (candidate.has_return ? 1 : 0) << ','
+           << (overlay_seed_set.contains(candidate.address) ? 1 : 0) << ','
+           << (in_asset_range(candidate.address) ? 1 : 0) << ',';
+    if (candidate.address == header.initial_pc) {
+      output << "entry";
+    } else if (candidate.static_call_count != 0U &&
+               overlay_seed_set.contains(candidate.address)) {
+      output << "direct_call+overlay";
+    } else if (candidate.static_call_count != 0U) {
+      output << "direct_call";
+    } else if (overlay_seed_set.contains(candidate.address)) {
+      output << "overlay";
+    } else {
+      output << "prologue_only";
+    }
+    output << ','
+           << candidate.exact_sha256 << ',' << candidate.structural_sha256
+           << '\n'
            << std::hex;
   }
   if (!output) {
@@ -990,6 +1377,1744 @@ int mapFunctions(const char *cue_path, const char *output_path) {
                           "Failed to write function map"};
   }
   std::cout << "Wrote " << candidates.size() << " function seeds to "
+            << output_path << '\n';
+  return 0;
+}
+
+int mapFunctionUnion(const char *left_cue_path, const char *right_cue_path,
+                     const char *output_path) {
+  auto left = openDisc(left_cue_path);
+  auto right = openDisc(right_cue_path);
+  if (left.executableHash() != right.executableHash()) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::invalid_argument,
+        "Function-union mapping requires byte-identical executables"};
+  }
+  const auto left_seeds = sequelOverlayExecutableSeeds(left);
+  const auto right_seeds = sequelOverlayExecutableSeeds(right);
+  std::set<std::uint32_t> union_set(left_seeds.begin(), left_seeds.end());
+  union_set.insert(right_seeds.begin(), right_seeds.end());
+  const std::vector<std::uint32_t> union_seeds(union_set.begin(),
+                                               union_set.end());
+  const std::set<std::uint32_t> left_set(left_seeds.begin(), left_seeds.end());
+  const std::set<std::uint32_t> right_set(right_seeds.begin(),
+                                          right_seeds.end());
+  const auto &executable = left.executable();
+  const auto &header = executable.header();
+  const auto candidates = sf::psx::fingerprintFunctionCandidates(
+      executable.text(), header.text_address, header.initial_pc, true,
+      union_seeds);
+  const auto asset_ranges = embeddedArchiveExactDataRanges(
+      executable.text(), header.text_address);
+  const auto in_asset_range = [&](std::uint32_t address) {
+    return std::ranges::any_of(asset_ranges, [&](const auto &range) {
+      return address >= range.first && address < range.second;
+    });
+  };
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open function-union map output"};
+  }
+  output << "address,static_call_sites,instructions,direct_callees,has_return,"
+            "left_overlay_referenced,right_overlay_referenced,"
+            "embedded_asset_range,seed_evidence,exact_sha256,"
+            "structural_sha256\n"
+         << std::hex << std::uppercase;
+  for (const auto &candidate : candidates) {
+    const auto left_overlay = left_set.contains(candidate.address);
+    const auto right_overlay = right_set.contains(candidate.address);
+    output << "0x" << candidate.address << ',' << std::dec
+           << candidate.static_call_count << ',' << candidate.instruction_count
+           << ',' << candidate.direct_callee_count << ','
+           << (candidate.has_return ? 1 : 0) << ','
+           << (left_overlay ? 1 : 0) << ',' << (right_overlay ? 1 : 0) << ','
+           << (in_asset_range(candidate.address) ? 1 : 0) << ',';
+    if (candidate.address == header.initial_pc) {
+      output << "entry";
+    } else if (candidate.static_call_count != 0U &&
+               (left_overlay || right_overlay)) {
+      output << "direct_call+overlay";
+    } else if (candidate.static_call_count != 0U) {
+      output << "direct_call";
+    } else if (left_overlay || right_overlay) {
+      output << "overlay";
+    } else {
+      output << "prologue_only";
+    }
+    output << ',' << candidate.exact_sha256 << ','
+           << candidate.structural_sha256 << '\n'
+           << std::hex;
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write function-union map"};
+  }
+  std::cout << "Wrote " << candidates.size()
+            << " union function seeds from byte-identical executables to "
+            << output_path << '\n';
+  return 0;
+}
+
+int mapFunctionCalls(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  const auto &executable = disc.executable();
+  const auto &header = executable.header();
+  const auto overlay_seeds = sequelOverlayExecutableSeeds(disc);
+  const auto functions = sf::psx::fingerprintFunctionCandidates(
+      executable.text(), header.text_address, header.initial_pc, true,
+      overlay_seeds);
+  const auto calls =
+      sf::psx::discoverDirectCalls(executable.text(), header.text_address);
+  const auto asset_ranges = embeddedArchiveExactDataRanges(
+      executable.text(), header.text_address);
+  const auto in_asset_range = [&](std::uint32_t address) {
+    return std::ranges::any_of(asset_ranges, [&](const auto &range) {
+      return address >= range.first && address < range.second;
+    });
+  };
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open function-call map output"};
+  }
+  output << "caller_address,site,target,target_in_executable,"
+            "site_in_embedded_asset_range\n"
+         << std::hex << std::uppercase;
+  std::size_t mapped_calls{};
+  for (const auto &call : calls) {
+    const auto next = std::ranges::upper_bound(
+        functions, call.site, {}, &sf::psx::FunctionFingerprint::address);
+    if (next == functions.begin()) {
+      continue;
+    }
+    const auto &function = *std::prev(next);
+    const auto function_end =
+        function.address +
+        static_cast<std::uint32_t>(function.instruction_count * 4U);
+    if (call.site >= function_end) {
+      continue;
+    }
+    output << "0x" << function.address << ",0x" << call.site << ",0x"
+           << call.target << ',' << std::dec
+           << (call.target_in_text ? 1 : 0) << ','
+           << (in_asset_range(call.site) ? 1 : 0) << '\n'
+           << std::hex;
+    ++mapped_calls;
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write function-call map"};
+  }
+  std::cout << "Mapped " << mapped_calls << " direct calls to " << output_path
+            << '\n';
+  return 0;
+}
+
+int compareFunctions(const char *left_cue_path, const char *right_cue_path,
+                     const char *output_path) {
+  const auto left_disc = openDisc(left_cue_path);
+  const auto right_disc = openDisc(right_cue_path);
+  const auto &left_executable = left_disc.executable();
+  const auto &right_executable = right_disc.executable();
+  auto left_seed_disc = openDisc(left_cue_path);
+  auto right_seed_disc = openDisc(right_cue_path);
+  const auto left_overlay_seeds =
+      sequelOverlayExecutableSeeds(left_seed_disc);
+  const auto right_overlay_seeds =
+      sequelOverlayExecutableSeeds(right_seed_disc);
+  const auto left = sf::psx::fingerprintFunctionCandidates(
+      left_executable.text(), left_executable.header().text_address,
+      left_executable.header().initial_pc, true, left_overlay_seeds);
+  const auto right = sf::psx::fingerprintFunctionCandidates(
+      right_executable.text(), right_executable.header().text_address,
+      right_executable.header().initial_pc, true, right_overlay_seeds);
+
+  std::map<std::string, std::vector<const sf::psx::FunctionFingerprint *>>
+      right_by_hash;
+  for (const auto &function : right) {
+    right_by_hash[function.structural_sha256].push_back(&function);
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open function comparison output"};
+  }
+  output << "left_address,right_address,instructions,match_kind,"
+            "structural_sha256\n"
+         << std::hex << std::uppercase;
+  std::size_t exact_matches{};
+  std::size_t structural_matches{};
+  for (const auto &left_function : left) {
+    const auto found = right_by_hash.find(left_function.structural_sha256);
+    if (found == right_by_hash.end() || found->second.size() != 1U) {
+      continue;
+    }
+    const auto &right_function = *found->second.front();
+    if (right_function.instruction_count != left_function.instruction_count) {
+      continue;
+    }
+    const auto exact =
+        right_function.exact_sha256 == left_function.exact_sha256;
+    exact_matches += exact ? 1U : 0U;
+    structural_matches += exact ? 0U : 1U;
+    output << "0x" << left_function.address << ",0x" << right_function.address
+           << ',' << std::dec << left_function.instruction_count << ','
+           << (exact ? "exact" : "structural") << ','
+           << left_function.structural_sha256 << '\n'
+           << std::hex;
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write function comparison"};
+  }
+  std::cout << "Matched " << exact_matches << " exact and "
+            << structural_matches << " structurally equivalent unique "
+            << "function seeds to " << output_path << '\n';
+  return 0;
+}
+
+std::size_t sequelOverlayCodeOffset(std::span<const std::byte> bytes) {
+  const auto read_le32 = [&bytes](std::size_t offset) {
+    return std::to_integer<std::uint32_t>(bytes[offset]) |
+           (std::to_integer<std::uint32_t>(bytes[offset + 1U]) << 8U) |
+           (std::to_integer<std::uint32_t>(bytes[offset + 2U]) << 16U) |
+           (std::to_integer<std::uint32_t>(bytes[offset + 3U]) << 24U);
+  };
+  for (std::size_t offset = 0x20U;
+       offset + sizeof(std::uint32_t) <= bytes.size() && offset < 0x100U;
+       offset += sizeof(std::uint32_t)) {
+    const auto instruction = read_le32(offset);
+    const auto opcode = instruction >> 26U;
+    const auto source = (instruction >> 21U) & 0x1fU;
+    const auto target = (instruction >> 16U) & 0x1fU;
+    const auto immediate = instruction & 0xffffU;
+    if ((opcode == 0x09U || opcode == 0x08U) && source == 29U &&
+        target == 29U && (immediate & 0x8000U) != 0U) {
+      return offset;
+    }
+  }
+  for (std::size_t offset = 0x28U;
+       offset + sizeof(std::uint32_t) <= bytes.size() && offset < 0x100U;
+       offset += sizeof(std::uint32_t)) {
+    if (read_le32(offset) == 0x03e00008U) {
+      return offset;
+    }
+  }
+  for (std::size_t offset = 0x28U;
+       offset + sizeof(std::uint32_t) <= bytes.size() && offset < 0x100U;
+       offset += sizeof(std::uint32_t)) {
+    const auto instruction = read_le32(offset);
+    if (instruction >= 0x00010000U && instruction != 0xfffffffeU &&
+        instruction != 0xcdcdcdcdU) {
+      return offset;
+    }
+  }
+  throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                        "Could not locate sequel overlay code prologue"};
+}
+
+constexpr std::size_t sequelMissionOverlayHeaderSize = 0x28U;
+constexpr std::uint32_t sequelMissionOverlayLoadAddress = 0x8014b978U;
+
+std::uint32_t sequelMissionOverlayCodeAddress(std::size_t code_offset) {
+  if (code_offset < sequelMissionOverlayHeaderSize) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::invalid_format,
+        "Sequel mission-overlay code precedes its fixed file header"};
+  }
+  // The loader removes the fixed ten-word OVL header, but preserves any
+  // mission-local data between that header and the first function.  Mapping
+  // every inferred code span directly at 0x8014b978 consequently shifted
+  // COLO by 0x10, HWAY by 0x08, TRAIN by 0x30, and other data-prefixed
+  // overlays by their respective pre-code spans.  Absolute callback pointers
+  // embedded in those overlays prove the corrected address relationship.
+  return sequelMissionOverlayLoadAddress +
+         static_cast<std::uint32_t>(code_offset -
+                                    sequelMissionOverlayHeaderSize);
+}
+
+std::size_t sequelOverlayContentSize(std::span<const std::byte> bytes,
+                                     std::size_t code_offset) {
+  auto end = bytes.size();
+  while (end > code_offset &&
+         (bytes[end - 1U] == std::byte{0xcd} ||
+          bytes[end - 1U] == std::byte{0})) {
+    --end;
+  }
+  end = std::min(bytes.size(), (end + 3U) & ~std::size_t{3U});
+  return end - code_offset;
+}
+
+struct ResidentOverlayDefinition {
+  std::string_view name;
+  std::uint32_t load_address;
+};
+
+std::vector<ResidentOverlayDefinition>
+sequelResidentOverlayDefinitions(sf::game::GameId game) {
+  if (game == sf::game::GameId::syphon_filter_2) {
+    // TITLE and INIT are adjacent in the retail memory layout:
+    // 0x8014b950 + sizeof(TITLE.OVL) == 0x80158878.
+    return {
+        {"MENU.OVL", 0x80142150U},
+        {"MOVIE.OVL", 0x80142150U},
+        {"TITLE.OVL", 0x8014b950U},
+        {"INIT.OVL", 0x80158878U},
+    };
+  }
+  if (game == sf::game::GameId::syphon_filter_3) {
+    // SF3's larger TITLE2 image ends exactly where INIT begins:
+    // 0x80150950 + sizeof(TITLE2.OVL) == 0x8015e978.
+    return {
+        {"MENU.OVL", 0x80146950U},
+        {"MENU2.OVL", 0x80146950U},
+        {"MOVIE.OVL", 0x80146950U},
+        {"TITLE.OVL", 0x80150950U},
+        {"TITLE2.OVL", 0x80150950U},
+        {"INIT.OVL", 0x8015e978U},
+    };
+  }
+  return {};
+}
+
+std::size_t sequelResidentOverlayCodeOffset(
+    std::span<const std::byte> bytes, std::uint32_t load_address) {
+  auto first_internal_target = bytes.size();
+  for (const auto &call :
+       sf::psx::discoverDirectCalls(bytes, load_address)) {
+    if (call.target_in_text) {
+      first_internal_target =
+          std::min(first_internal_target,
+                   static_cast<std::size_t>(call.target - load_address));
+    }
+  }
+  if (first_internal_target == bytes.size()) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Resident overlay has no internal code target"};
+  }
+  return first_internal_target;
+}
+
+std::span<const std::byte>
+readResidentOverlay(sf::game::GameDisc &disc,
+                    const ResidentOverlayDefinition &definition,
+                    std::vector<std::byte> &storage) {
+  storage = disc.image().readFile(
+      "BIN/" + std::string{definition.name});
+  return storage;
+}
+
+std::vector<std::uint32_t>
+sequelOverlayExecutableSeeds(sf::game::GameDisc &disc) {
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    return {};
+  }
+  std::set<std::uint32_t> result;
+  const auto text_begin = disc.executable().header().text_address;
+  const auto text_end =
+      text_begin + disc.executable().header().text_size;
+  for (const auto &definition :
+       sequelResidentOverlayDefinitions(disc.game()->id)) {
+    std::vector<std::byte> storage;
+    const auto overlay_bytes =
+        readResidentOverlay(disc, definition, storage);
+    const auto code_offset = sequelResidentOverlayCodeOffset(
+        overlay_bytes, definition.load_address);
+    const auto code_size =
+        sequelOverlayContentSize(overlay_bytes, code_offset);
+    for (const auto &call : sf::psx::discoverDirectCalls(
+             overlay_bytes.subspan(code_offset, code_size),
+             definition.load_address + static_cast<std::uint32_t>(code_offset))) {
+      if (!call.target_in_text && call.target >= text_begin &&
+          call.target < text_end) {
+        result.insert(call.target);
+      }
+    }
+  }
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto specific_overlay =
+        std::string{resource.resource_name} + ".OVL";
+    const auto has_specific_overlay =
+        std::ranges::any_of(archive.entries(), [&](const auto &entry) {
+          return entry.name == specific_overlay;
+        });
+    const auto overlay_name =
+        has_specific_overlay ? specific_overlay : std::string{"GENERIC.OVL"};
+    const auto overlay_bytes = archive.file(overlay_name);
+    const auto code_offset = sequelOverlayCodeOffset(overlay_bytes);
+    const auto code_size =
+        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto code_address = sequelMissionOverlayCodeAddress(code_offset);
+    for (const auto &call : sf::psx::discoverDirectCalls(
+             overlay_bytes.subspan(code_offset, code_size),
+             code_address)) {
+      if (!call.target_in_text && call.target >= text_begin &&
+          call.target < text_end) {
+        result.insert(call.target);
+      }
+    }
+  }
+  return {result.begin(), result.end()};
+}
+
+int mapResidentOverlays(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Resident-overlay mapping requires a recognized sequel disc"};
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open resident-overlay map output"};
+  }
+  output << "overlay,file_size,load_address,code_offset,code_size,"
+            "function_address,instructions,static_call_sites,direct_callees,"
+            "has_return,exact_sha256,structural_sha256,external_targets\n";
+
+  std::size_t overlay_count{};
+  std::size_t function_count{};
+  for (const auto &definition :
+       sequelResidentOverlayDefinitions(disc.game()->id)) {
+    std::vector<std::byte> storage;
+    const auto overlay_bytes =
+        readResidentOverlay(disc, definition, storage);
+    const auto code_offset = sequelResidentOverlayCodeOffset(
+        overlay_bytes, definition.load_address);
+    const auto code_size =
+        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto code = overlay_bytes.subspan(code_offset, code_size);
+    const auto code_address =
+        definition.load_address + static_cast<std::uint32_t>(code_offset);
+    const auto functions = sf::psx::fingerprintFunctionCandidates(
+        code, code_address, code_address, true);
+    const auto calls = sf::psx::discoverDirectCalls(code, code_address);
+
+    for (const auto &function : functions) {
+      std::set<std::uint32_t> external_targets;
+      const auto function_end =
+          function.address +
+          static_cast<std::uint32_t>(function.instruction_count * 4U);
+      for (const auto &call : calls) {
+        if (call.site >= function.address && call.site < function_end &&
+            !call.target_in_text) {
+          external_targets.insert(call.target);
+        }
+      }
+      output << definition.name << ',' << overlay_bytes.size() << ",0x"
+             << std::hex << std::uppercase << definition.load_address
+             << std::dec << ',' << code_offset << ',' << code_size << ",0x"
+             << std::hex << std::uppercase << function.address << std::dec
+             << ',' << function.instruction_count << ','
+             << function.static_call_count << ','
+             << function.direct_callee_count << ','
+             << (function.has_return ? 1 : 0) << ',' << function.exact_sha256
+             << ',' << function.structural_sha256 << ',';
+      auto first = true;
+      for (const auto target : external_targets) {
+        output << (first ? "" : ";") << "0x" << std::hex << std::uppercase
+               << target << std::dec;
+        first = false;
+      }
+      output << '\n';
+      ++function_count;
+    }
+    ++overlay_count;
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write resident-overlay map"};
+  }
+  std::cout << "Mapped " << function_count << " function seeds across "
+            << overlay_count << " resident overlays to " << output_path
+            << '\n';
+  return 0;
+}
+
+int mapMissionOverlays(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission overlay mapping requires a recognized sequel disc"};
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-overlay map output"};
+  }
+  output << "mission,resource,overlay,file_size,load_address,code_offset,"
+            "code_address,code_size,function_address,instructions,"
+            "static_call_sites,direct_callees,has_return,exact_sha256,"
+            "structural_sha256,external_targets\n";
+
+  std::size_t mission_count{};
+  std::size_t function_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto specific_overlay =
+        std::string{resource.resource_name} + ".OVL";
+    const auto has_specific_overlay =
+        std::ranges::any_of(archive.entries(), [&](const auto &entry) {
+          return entry.name == specific_overlay;
+        });
+    const auto overlay_name =
+        has_specific_overlay ? specific_overlay : std::string{"GENERIC.OVL"};
+    const auto overlay_bytes = archive.file(overlay_name);
+    const auto code_offset = sequelOverlayCodeOffset(overlay_bytes);
+    const auto code_size =
+        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto code = overlay_bytes.subspan(code_offset, code_size);
+    const auto code_address = sequelMissionOverlayCodeAddress(code_offset);
+    const auto functions = sf::psx::fingerprintFunctionCandidates(
+        code, code_address, code_address, true);
+    const auto calls =
+        sf::psx::discoverDirectCalls(code, code_address);
+
+    for (const auto &function : functions) {
+      std::set<std::uint32_t> external_targets;
+      const auto function_end =
+          function.address +
+          static_cast<std::uint32_t>(function.instruction_count * 4U);
+      for (const auto &call : calls) {
+        if (call.site >= function.address && call.site < function_end &&
+            !call.target_in_text) {
+          external_targets.insert(call.target);
+        }
+      }
+      output << resource.selection_index << ',' << resource.resource_name << ','
+             << overlay_name << ',' << overlay_bytes.size() << ','
+             << "0x" << std::hex << std::uppercase
+             << sequelMissionOverlayLoadAddress << std::dec << ','
+             << code_offset << ",0x" << std::hex << std::uppercase
+             << code_address << std::dec << ',' << code_size << ",0x"
+             << std::hex << std::uppercase << function.address << std::dec << ','
+             << function.instruction_count << ','
+             << function.static_call_count << ','
+             << function.direct_callee_count << ','
+             << (function.has_return ? 1 : 0) << ',' << function.exact_sha256
+             << ',' << function.structural_sha256 << ',';
+      auto first = true;
+      for (const auto target : external_targets) {
+        output << (first ? "" : ";") << "0x" << std::hex << std::uppercase
+               << target << std::dec;
+        first = false;
+      }
+      output << '\n';
+      ++function_count;
+    }
+    ++mission_count;
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-overlay map"};
+  }
+  std::cout << "Mapped " << function_count << " function seeds across "
+            << mission_count << " mission overlays to " << output_path << '\n';
+  return 0;
+}
+
+void writeCsvString(std::ostream &output, std::string_view value);
+
+int mapMissionClasses(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-class mapping requires a recognized sequel disc"};
+  }
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-class map output"};
+  }
+  output << "mission,resource,definition,class_id,class_family,class_flags,"
+            "instances,primary_model,secondary_model\n";
+  std::size_t definition_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto objects = sf::assets::MissionObjects::parse(
+        archive.file(std::string{resource.resource_name} + ".BIN"));
+    for (std::size_t index = 0; index < objects.definitions().size(); ++index) {
+      const auto &definition = objects.definitions()[index];
+      const auto instances = static_cast<std::size_t>(std::ranges::count(
+          objects.objects(), index, &sf::assets::MissionObject::type));
+      const auto family = definition.class_id & 0xffffU;
+      const auto flags = definition.class_id & 0xffff0000U;
+      output << resource.selection_index << ',' << resource.resource_name << ','
+             << index << ",0x" << std::hex << std::uppercase
+             << definition.class_id << ",0x" << family << ",0x" << flags
+             << std::dec << ',' << instances << ',';
+      writeCsvString(output, definition.primary_model);
+      output << ',';
+      writeCsvString(output, definition.secondary_model);
+      output << '\n';
+      ++definition_count;
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-class map"};
+  }
+  std::cout << "Mapped " << definition_count << " object definitions across "
+            << sf::game::missionResources(disc.game()->id,
+                                          disc.game()->disc_number)
+                   .size()
+            << " missions to " << output_path << '\n';
+  return 0;
+}
+
+int mapMissionObjects(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-object mapping requires a recognized sequel disc"};
+  }
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-object map output"};
+  }
+  output << "mission,resource,source,definition,class_id,class_family,"
+            "class_flags,primary_model,secondary_model,is_player,rooms,x,y,z,"
+            "rotation_2,rotation_8,attributes,ai_parameter,path_data_offset,"
+            "linked_object,maximum_health,health,handler_parameter_0,"
+            "handler_parameter_1,handler_parameter_2,handler_parameter_3,"
+            "handler_state,path_points,path_loops,path_loop_start\n";
+
+  std::size_t object_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto objects = sf::assets::MissionObjects::parse(
+        archive.file(std::string{resource.resource_name} + ".BIN"));
+    for (std::size_t source = 0; source < objects.objects().size(); ++source) {
+      const auto &object = objects.objects()[source];
+      const auto &definition = objects.definition(object.type);
+      const auto family = definition.class_id & 0xffffU;
+      const auto flags = definition.class_id & 0xffff0000U;
+      output << resource.selection_index << ',' << resource.resource_name << ','
+             << source << ',' << object.type << ",0x" << std::hex
+             << std::uppercase << definition.class_id << ",0x" << family
+             << ",0x" << flags << std::dec << ',';
+      writeCsvString(output, definition.primary_model);
+      output << ',';
+      writeCsvString(output, definition.secondary_model);
+      output << ',' << (source == objects.playerIndex() ? 1 : 0) << ',';
+      auto first_room = true;
+      for (const auto room : objects.roomsContainingObject(source)) {
+        output << (first_room ? "" : ";") << room;
+        first_room = false;
+      }
+      output << ',' << object.transform.x << ',' << object.transform.y << ','
+             << object.transform.z << ',' << object.transform.rotation[2] << ','
+             << object.transform.rotation[8] << ",0x" << std::hex
+             << std::uppercase << object.attributes << ",0x"
+             << object.ai_parameter << ",0x" << object.path_data_offset
+             << std::dec << ',' << object.linked_object << ','
+             << object.maximum_health << ',' << object.health;
+      for (const auto parameter : object.handler_parameters) {
+        output << ',' << parameter;
+      }
+      output << ',' << object.handler_state << ','
+             << object.patrol_path.size() << ','
+             << (object.patrol_path_loops ? 1 : 0) << ','
+             << static_cast<unsigned int>(object.patrol_loop_start) << '\n';
+      ++object_count;
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-object map"};
+  }
+  std::cout << "Mapped " << object_count << " authored objects across "
+            << sf::game::missionResources(disc.game()->id,
+                                          disc.game()->disc_number)
+                   .size()
+            << " missions to " << output_path << '\n';
+  return 0;
+}
+
+int mapMissionScriptStrings(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-script string mapping requires a recognized sequel disc"};
+  }
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-script string map output"};
+  }
+  output << "mission,resource,file_size,sha256,string_offset,string\n";
+  std::size_t string_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto file_name = std::string{resource.resource_name} + ".SS";
+    const auto bytes = archive.file(file_name);
+    const auto digest = sf::core::toHex(sf::core::sha256(bytes));
+    for (std::size_t offset = 0; offset < bytes.size();) {
+      const auto printable = [](std::byte value) {
+        const auto character = std::to_integer<unsigned char>(value);
+        return character >= 0x20U && character <= 0x7eU;
+      };
+      if (!printable(bytes[offset])) {
+        ++offset;
+        continue;
+      }
+      auto end = offset;
+      while (end < bytes.size() && printable(bytes[end])) {
+        ++end;
+      }
+      if (end - offset >= 4U && end < bytes.size() &&
+          bytes[end] == std::byte{0}) {
+        std::string value;
+        value.reserve(end - offset);
+        for (auto cursor = offset; cursor < end; ++cursor) {
+          value.push_back(static_cast<char>(
+              std::to_integer<unsigned char>(bytes[cursor])));
+        }
+        output << resource.selection_index << ',' << resource.resource_name
+               << ',' << bytes.size() << ',' << digest << ',' << offset << ',';
+        writeCsvString(output, value);
+        output << '\n';
+        ++string_count;
+      }
+      offset = std::max(end, offset + 1U);
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script string map"};
+  }
+  std::cout << "Mapped " << string_count << " mission-script strings across "
+            << sf::game::missionResources(disc.game()->id,
+                                          disc.game()->disc_number)
+                   .size()
+            << " missions to " << output_path << '\n';
+  return 0;
+}
+
+int mapMissionScripts(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-script mapping requires a recognized sequel disc"};
+  }
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-script map output"};
+  }
+  output << "mission,resource,file_size,program,record_offset,name,"
+            "header_word_0,header_word_1,format_version,variable_count,"
+            "serialized_variable_begin,timer_count,event_pointer,"
+            "variable_pointer,timer_pointer,name_pointer,pointer_4,pointer_5,"
+            "serialized_size,event_count,event_terminator_offset\n";
+  std::size_t program_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto file_name = std::string{resource.resource_name} + ".SS";
+    const auto bytes = archive.file(file_name);
+    const auto scripts = sf::assets::MissionScriptArchive::parse(bytes);
+    for (std::size_t index = 0; index < scripts.programs().size(); ++index) {
+      const auto &program = scripts.programs()[index];
+      output << resource.selection_index << ',' << resource.resource_name << ','
+             << bytes.size() << ',' << index << ',' << program.offset << ',';
+      writeCsvString(output, program.name);
+      output << ",0x" << std::hex << std::uppercase << program.header_word_0
+             << ",0x" << program.header_word_1 << std::dec << ','
+             << static_cast<unsigned>(program.format_version) << ','
+             << static_cast<unsigned>(program.variable_count) << ','
+             << static_cast<unsigned>(program.serialized_variable_begin) << ','
+             << static_cast<unsigned>(program.timer_count);
+      for (const auto pointer : program.relative_pointers) {
+        output << ",0x" << std::hex << std::uppercase << pointer;
+      }
+      output << std::dec << ',' << program.serialized_size << ','
+             << program.events.size() << ',' << program.event_terminator_offset
+             << '\n';
+      ++program_count;
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script map"};
+  }
+  std::cout << "Mapped " << program_count << " compiled mission programs across "
+            << sf::game::missionResources(disc.game()->id,
+                                          disc.game()->disc_number)
+                   .size()
+            << " missions to " << output_path << '\n';
+  return 0;
+}
+
+int mapMissionScriptEvents(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-script event mapping requires a recognized sequel disc"};
+  }
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-script event map output"};
+  }
+  output << "mission,resource,program,program_name,event_record,"
+            "relative_offset,encoded_header,event_id,event_flags,selector,"
+            "length_halfwords,action_bytes\n";
+  std::size_t event_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto file_name = std::string{resource.resource_name} + ".SS";
+    const auto scripts =
+        sf::assets::MissionScriptArchive::parse(archive.file(file_name));
+    for (std::size_t program_index = 0;
+         program_index < scripts.programs().size(); ++program_index) {
+      const auto &program = scripts.programs()[program_index];
+      for (std::size_t event_index = 0; event_index < program.events.size();
+           ++event_index) {
+        const auto &event = program.events[event_index];
+        output << resource.selection_index << ',' << resource.resource_name
+               << ',' << program_index << ',';
+        writeCsvString(output, program.name);
+        output << ',' << event_index << ',' << event.relative_offset << ",0x"
+               << std::hex << std::uppercase << event.encoded_header
+               << std::dec << ',' << static_cast<unsigned>(event.event_id)
+               << ",0x" << std::hex << std::uppercase
+               << static_cast<unsigned>(event.event_flags) << ",0x"
+               << event.selector << std::dec << ','
+               << static_cast<unsigned>(event.length_halfwords) << ','
+               << (static_cast<unsigned>(event.length_halfwords) * 2U - 4U)
+               << '\n';
+        ++event_count;
+      }
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script event map"};
+  }
+  std::cout << "Mapped " << event_count << " mission-script event records to "
+            << output_path << '\n';
+  return 0;
+}
+
+std::uint32_t readAnalysisWord(std::span<const std::byte> bytes,
+                               std::size_t offset) {
+  return std::to_integer<std::uint32_t>(bytes[offset]) |
+         (std::to_integer<std::uint32_t>(bytes[offset + 1U]) << 8U) |
+         (std::to_integer<std::uint32_t>(bytes[offset + 2U]) << 16U) |
+         (std::to_integer<std::uint32_t>(bytes[offset + 3U]) << 24U);
+}
+
+std::uint16_t readAnalysisHalfword(std::span<const std::byte> bytes,
+                                   std::size_t offset) {
+  return static_cast<std::uint16_t>(
+      std::to_integer<std::uint16_t>(bytes[offset]) |
+      (std::to_integer<std::uint16_t>(bytes[offset + 1U]) << 8U));
+}
+
+int mapMissionScriptOpcodes(const char *cue_path, const char *output_path) {
+  const auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-script opcode mapping requires a recognized sequel disc"};
+  }
+
+  // These table roots are proven by the two retail bytecode decoders. Each
+  // descriptor is {handler pointer, two 16-bit operand/result metadata words}.
+  const auto predicate_table =
+      disc.game()->id == sf::game::GameId::syphon_filter_2
+          ? std::uint32_t{0x801150fcU}
+          : std::uint32_t{0x80117dd0U};
+  constexpr std::size_t opcode_count = 64U;
+  constexpr std::size_t descriptor_size = 8U;
+  constexpr std::size_t table_size = opcode_count * descriptor_size;
+  // The action decoder indexes a biased 128-entry descriptor window with
+  // encoded high bytes 0x80..0xff. Its two logical 64-entry halves begin
+  // 0x180 and 0x380 bytes after the predicate table.
+  constexpr std::array<std::uint32_t, 3> table_deltas{0U, 0x180U, 0x380U};
+
+  const auto &executable = disc.executable();
+  const auto text = executable.text();
+  const auto text_address = executable.header().text_address;
+  if (predicate_table < text_address ||
+      static_cast<std::uint64_t>(predicate_table - text_address) +
+              table_deltas.back() + table_size >
+          text.size()) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Mission-script opcode tables are outside executable "
+                          "text"};
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-script opcode map output"};
+  }
+  output << "table,table_address,opcode,populated,handler_address,"
+            "descriptor_word_0,descriptor_word_1,handler_in_executable\n";
+  std::size_t populated{};
+  constexpr std::array<std::string_view, 3> table_names{
+      "predicate", "action_80_bf", "action_c0_ff"};
+  for (std::size_t table_index = 0; table_index < table_deltas.size();
+       ++table_index) {
+    const auto table_address = predicate_table + table_deltas[table_index];
+    const auto table_offset =
+        static_cast<std::size_t>(table_address - text_address);
+    for (std::size_t opcode = 0; opcode < opcode_count; ++opcode) {
+      const auto descriptor_offset =
+          table_offset + opcode * descriptor_size;
+      const auto handler = readAnalysisWord(text, descriptor_offset);
+      const auto metadata_0 =
+          readAnalysisHalfword(text, descriptor_offset + 4U);
+      const auto metadata_1 =
+          readAnalysisHalfword(text, descriptor_offset + 6U);
+      const auto handler_in_executable =
+          handler >= text_address &&
+          static_cast<std::uint64_t>(handler - text_address) < text.size();
+      output << table_names[table_index] << ",0x"
+             << std::hex << std::uppercase << table_address << ",0x"
+             << opcode << std::dec << ',' << (handler != 0U ? 1 : 0)
+             << ",0x" << std::hex << std::uppercase << handler << ",0x"
+             << metadata_0 << ",0x" << metadata_1 << std::dec << ','
+             << (handler_in_executable ? 1 : 0) << '\n';
+      populated += handler != 0U ? 1U : 0U;
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script opcode map"};
+  }
+  std::cout << "Mapped " << populated
+            << " populated mission-script opcode descriptors from 0x"
+            << std::hex << std::uppercase << predicate_table << std::dec
+            << " to " << output_path << '\n';
+  return 0;
+}
+
+int mapMissionScriptHandlerCalls(const char *cue_path,
+                                 const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-script handler call mapping requires a recognized sequel "
+        "disc"};
+  }
+
+  const auto predicate_table =
+      disc.game()->id == sf::game::GameId::syphon_filter_2
+          ? std::uint32_t{0x801150fcU}
+          : std::uint32_t{0x80117dd0U};
+  constexpr std::size_t opcode_count = 64U;
+  constexpr std::size_t descriptor_size = 8U;
+  constexpr std::array<std::uint32_t, 3> table_deltas{0U, 0x180U, 0x380U};
+  constexpr std::array<std::string_view, 3> table_names{
+      "predicate", "action_80_bf", "action_c0_ff"};
+
+  const auto &executable = disc.executable();
+  const auto text = executable.text();
+  const auto text_address = executable.header().text_address;
+  constexpr auto descriptor_span =
+      table_deltas.back() + opcode_count * descriptor_size;
+  if (predicate_table < text_address ||
+      static_cast<std::uint64_t>(predicate_table - text_address) +
+              descriptor_span >
+          text.size()) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::invalid_format,
+        "Mission-script handler tables are outside executable text"};
+  }
+  const auto functions = sf::psx::fingerprintFunctionCandidates(
+      text, text_address, executable.header().initial_pc, true,
+      sequelOverlayExecutableSeeds(disc));
+  const auto calls = sf::psx::discoverDirectCalls(text, text_address);
+
+  std::multimap<std::uint32_t, sf::psx::DirectCall> calls_by_function;
+  for (const auto &call : calls) {
+    const auto next = std::ranges::upper_bound(
+        functions, call.site, {}, &sf::psx::FunctionFingerprint::address);
+    if (next == functions.begin()) {
+      continue;
+    }
+    const auto &function = *std::prev(next);
+    const auto function_end =
+        function.address +
+        static_cast<std::uint32_t>(function.instruction_count * 4U);
+    if (call.site < function_end) {
+      calls_by_function.emplace(function.address, call);
+    }
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::io,
+        "Cannot open mission-script handler-call map output"};
+  }
+  output << "table,opcode,handler_address,call_site,target,"
+            "target_in_executable\n";
+  std::size_t edge_count{};
+  std::set<std::pair<std::uint32_t, std::uint32_t>> physical_edges;
+  std::set<std::uint32_t> physical_handlers;
+  for (std::size_t table_index = 0; table_index < table_deltas.size();
+       ++table_index) {
+    const auto table_offset = static_cast<std::size_t>(
+        predicate_table + table_deltas[table_index] - text_address);
+    for (std::size_t opcode = 0; opcode < opcode_count; ++opcode) {
+      const auto handler =
+          readAnalysisWord(text, table_offset + opcode * descriptor_size);
+      const auto [begin, end] = calls_by_function.equal_range(handler);
+      for (auto edge = begin; edge != end; ++edge) {
+        output << table_names[table_index] << ",0x" << std::hex
+               << std::uppercase << opcode << ",0x" << handler << ",0x"
+               << edge->second.site << ",0x" << edge->second.target
+               << std::dec << ',' << (edge->second.target_in_text ? 1 : 0)
+               << '\n';
+        ++edge_count;
+        physical_edges.emplace(edge->second.site, edge->second.target);
+        physical_handlers.emplace(handler);
+      }
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::io,
+        "Failed to write mission-script handler-call map"};
+  }
+  std::cout << "Mapped " << edge_count << " descriptor-associated rows ("
+            << physical_edges.size() << " unique direct calls from "
+            << physical_handlers.size() << " physical handlers) to "
+            << output_path << '\n';
+  return 0;
+}
+
+int compareMissionScriptOpcodes(const char *left_cue_path,
+                                const char *right_cue_path,
+                                const char *output_path) {
+  const auto left = openDisc(left_cue_path);
+  const auto right = openDisc(right_cue_path);
+  const auto table_root = [](const sf::game::GameDisc &disc) {
+    if (!disc.game() ||
+        (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+         disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+      throw sf::core::Error{
+          sf::core::ErrorCode::unsupported,
+          "Mission-script opcode comparison requires recognized sequel "
+          "discs"};
+    }
+    return disc.game()->id == sf::game::GameId::syphon_filter_2
+               ? std::uint32_t{0x801150fcU}
+               : std::uint32_t{0x80117dd0U};
+  };
+  const auto left_root = table_root(left);
+  const auto right_root = table_root(right);
+  constexpr std::array<std::uint32_t, 3> table_deltas{0U, 0x180U, 0x380U};
+  constexpr std::array<std::string_view, 3> table_names{
+      "predicate", "action_80_bf", "action_c0_ff"};
+  constexpr std::size_t opcode_count = 64U;
+  constexpr std::size_t descriptor_size = 8U;
+
+  const auto descriptor = [&](const sf::game::GameDisc &disc,
+                              std::uint32_t root, std::uint32_t delta,
+                              std::size_t opcode) {
+    const auto &executable = disc.executable();
+    const auto address = root + delta +
+                         static_cast<std::uint32_t>(opcode * descriptor_size);
+    const auto offset = static_cast<std::size_t>(
+        address - executable.header().text_address);
+    if (offset > executable.text().size() ||
+        executable.text().size() - offset < descriptor_size) {
+      throw sf::core::Error{
+          sf::core::ErrorCode::invalid_format,
+          "Mission-script opcode descriptor is outside executable text"};
+    }
+    return std::array{
+        readAnalysisWord(executable.text(), offset),
+        static_cast<std::uint32_t>(
+            readAnalysisHalfword(executable.text(), offset + 4U)),
+        static_cast<std::uint32_t>(
+            readAnalysisHalfword(executable.text(), offset + 6U))};
+  };
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::io,
+        "Cannot open mission-script opcode comparison output"};
+  }
+  output << "table,opcode,left_handler,right_handler,left_word_0,"
+            "right_word_0,left_word_1,right_word_1,metadata_equal\n";
+  for (std::size_t table = 0; table < table_deltas.size(); ++table) {
+    for (std::size_t opcode = 0; opcode < opcode_count; ++opcode) {
+      const auto left_descriptor =
+          descriptor(left, left_root, table_deltas[table], opcode);
+      const auto right_descriptor =
+          descriptor(right, right_root, table_deltas[table], opcode);
+      output << table_names[table] << ",0x" << std::hex << std::uppercase
+             << opcode << ",0x" << left_descriptor[0] << ",0x"
+             << right_descriptor[0] << ",0x" << left_descriptor[1] << ",0x"
+             << right_descriptor[1] << ",0x" << left_descriptor[2] << ",0x"
+             << right_descriptor[2] << std::dec << ','
+             << (left_descriptor[1] == right_descriptor[1] &&
+                         left_descriptor[2] == right_descriptor[2]
+                     ? 1
+                     : 0)
+             << '\n';
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::io,
+        "Failed to write mission-script opcode comparison"};
+  }
+  std::cout << "Compared " << table_deltas.size() * opcode_count
+            << " aligned mission-script descriptor slots to " << output_path
+            << '\n';
+  return 0;
+}
+
+int mapMissionScriptActions(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Mission-script action mapping requires a recognized sequel disc"};
+  }
+  const auto predicate_table =
+      disc.game()->id == sf::game::GameId::syphon_filter_2
+          ? std::uint32_t{0x801150fcU}
+          : std::uint32_t{0x80117dd0U};
+  const auto descriptor_window = predicate_table + 0x180U;
+  const auto &executable = disc.executable();
+  const auto executable_text = executable.text();
+  const auto text_address = executable.header().text_address;
+  const auto descriptor_offset =
+      static_cast<std::size_t>(descriptor_window - text_address);
+  constexpr std::size_t descriptor_count = 128U;
+  constexpr std::size_t descriptor_size = 8U;
+  if (descriptor_offset > executable_text.size() ||
+      executable_text.size() - descriptor_offset <
+          descriptor_count * descriptor_size) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Mission-script action descriptors are invalid"};
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-script action map output"};
+  }
+  output << "mission,resource,program,program_name,event_record,event_id,"
+            "relative_offset,encoded_word,kind,opcode,handler_address,"
+            "descriptor_word_0,descriptor_word_1,next_offset,"
+            "alternate_offset,operand_0,operand_0_source,operand_1,"
+            "operand_1_source,program_operation,target_program,"
+            "target_program_name\n";
+  std::size_t instruction_count{};
+  for (const auto &resource :
+       sf::game::missionResources(disc.game()->id, disc.game()->disc_number)) {
+    const auto archive_path =
+        std::string{disc.game()->layout.mission_archive_directory} + '/' +
+        std::string{resource.resource_name} + ".FOG";
+    const auto archive =
+        sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
+    const auto file_name = std::string{resource.resource_name} + ".SS";
+    const auto bytes = archive.file(file_name);
+    const auto scripts = sf::assets::MissionScriptArchive::parse(bytes);
+    for (std::size_t program_index = 0;
+         program_index < scripts.programs().size(); ++program_index) {
+      const auto &program = scripts.programs()[program_index];
+      for (std::size_t event_index = 0; event_index < program.events.size();
+           ++event_index) {
+        const auto &event = program.events[event_index];
+        const auto event_begin =
+            static_cast<std::size_t>(event.relative_offset);
+        const auto event_end =
+            event_begin + static_cast<std::size_t>(event.length_halfwords) * 2U;
+        std::vector<std::size_t> pending{event_begin + 4U};
+        std::set<std::size_t> visited;
+        while (!pending.empty()) {
+          const auto instruction_offset = pending.back();
+          pending.pop_back();
+          if (instruction_offset == event_end ||
+              !visited.insert(instruction_offset).second) {
+            continue;
+          }
+          if (instruction_offset < event_begin + 4U ||
+              instruction_offset > event_end ||
+              event_end - instruction_offset < 2U) {
+            throw sf::core::Error{
+                sf::core::ErrorCode::invalid_format,
+                "Mission-script action control flow leaves event record in " +
+                    std::string{resource.resource_name} + '/' + program.name +
+                    " event " + std::to_string(event_index) + " at " +
+                    std::to_string(instruction_offset) + " (record " +
+                    std::to_string(event_begin) + ".." +
+                    std::to_string(event_end) + ')'};
+          }
+          const auto encoded = readAnalysisHalfword(
+              bytes, program.offset + instruction_offset);
+          const auto high = static_cast<std::uint8_t>(encoded >> 8U);
+          const auto low = static_cast<std::uint8_t>(encoded & 0xffU);
+          std::string_view kind{"action"};
+          std::uint32_t handler{};
+          std::uint16_t metadata_0{};
+          std::uint16_t metadata_1{};
+          auto next_offset = std::numeric_limits<std::size_t>::max();
+          auto alternate_offset = std::numeric_limits<std::size_t>::max();
+          auto opcode = static_cast<std::uint8_t>(high & 0x7fU);
+          std::optional<std::uint16_t> operand_0;
+          std::string_view operand_0_source;
+          std::optional<std::uint16_t> operand_1;
+          std::string_view operand_1_source;
+          std::string_view program_operation;
+          std::optional<std::size_t> target_program;
+
+          if (high == 0xffU) {
+            kind = "end";
+          } else if (high == 0xfeU) {
+            kind = "predicate_branch";
+            if (event_end - instruction_offset < 4U) {
+              throw sf::core::Error{
+                  sf::core::ErrorCode::invalid_format,
+                  "Truncated mission-script predicate branch"};
+            }
+            next_offset = instruction_offset +
+                          static_cast<std::size_t>(low) * 2U;
+            alternate_offset =
+                instruction_offset +
+                static_cast<std::size_t>(readAnalysisHalfword(
+                    bytes, program.offset + instruction_offset + 2U)) *
+                    2U;
+            pending.push_back(next_offset);
+            pending.push_back(alternate_offset);
+          } else if (high == 0xfdU || high == 0xfcU || high == 0xfaU ||
+                     high == 0xf9U) {
+            kind = high == 0xfdU   ? "text"
+                   : high == 0xfcU ? "control"
+                   : high == 0xfaU ? "skip"
+                                   : "formatted_text";
+            next_offset = instruction_offset +
+                          static_cast<std::size_t>(low) * 2U;
+            pending.push_back(next_offset);
+          } else {
+            const auto descriptor =
+                descriptor_offset +
+                static_cast<std::size_t>(opcode) * descriptor_size;
+            handler = readAnalysisWord(executable_text, descriptor);
+            metadata_0 =
+                readAnalysisHalfword(executable_text, descriptor + 4U);
+            metadata_1 =
+                readAnalysisHalfword(executable_text, descriptor + 6U);
+            auto size = std::size_t{2U};
+            if ((low & 0x80U) != 0U) {
+              operand_0 = static_cast<std::uint16_t>(low & 0x7fU);
+              operand_0_source = "inline7";
+            } else {
+              if (event_end - instruction_offset < 4U) {
+                throw sf::core::Error{
+                    sf::core::ErrorCode::invalid_format,
+                    "Truncated mission-script extended operand"};
+              }
+              operand_0 = readAnalysisHalfword(
+                  bytes, program.offset + instruction_offset + 2U);
+              operand_0_source = "extended16";
+              size += 2U;
+            }
+            if (metadata_1 != 0xffU) {
+              if ((low & 0x80U) == 0U && (low & 0x40U) != 0U) {
+                operand_1 = static_cast<std::uint16_t>(low & 0x3fU);
+                operand_1_source = "inline6";
+              } else {
+                if (event_end - instruction_offset < size + 2U) {
+                  throw sf::core::Error{
+                      sf::core::ErrorCode::invalid_format,
+                      "Truncated mission-script second operand"};
+                }
+                operand_1 = readAnalysisHalfword(
+                    bytes, program.offset + instruction_offset + size);
+                operand_1_source = "extended16";
+                size += 2U;
+              }
+            }
+            next_offset = instruction_offset + size;
+            pending.push_back(next_offset);
+            if (opcode == 0x0bU || opcode == 0x0cU) {
+              program_operation =
+                  opcode == 0x0bU ? "activate" : "deactivate";
+              if (*operand_0 >= scripts.programs().size()) {
+                throw sf::core::Error{
+                    sf::core::ErrorCode::invalid_format,
+                    "Mission-script program operation references invalid "
+                    "program index"};
+              }
+              target_program = *operand_0;
+            }
+          }
+
+          output << resource.selection_index << ',' << resource.resource_name
+                 << ',' << program_index << ',';
+          writeCsvString(output, program.name);
+          output << ',' << event_index << ','
+                 << static_cast<unsigned>(event.event_id) << ','
+                 << instruction_offset << ",0x" << std::hex << std::uppercase
+                 << encoded << std::dec << ',' << kind << ",0x" << std::hex
+                 << std::uppercase << static_cast<unsigned>(opcode) << ",0x"
+                 << handler << ",0x" << metadata_0 << ",0x" << metadata_1
+                 << std::dec << ',';
+          if (next_offset != std::numeric_limits<std::size_t>::max()) {
+            output << next_offset;
+          }
+          output << ',';
+          if (alternate_offset != std::numeric_limits<std::size_t>::max()) {
+            output << alternate_offset;
+          }
+          output << ',';
+          if (operand_0) {
+            output << *operand_0;
+          }
+          output << ',' << operand_0_source << ',';
+          if (operand_1) {
+            output << *operand_1;
+          }
+          output << ',' << operand_1_source << ',' << program_operation << ',';
+          if (target_program) {
+            output << *target_program;
+          }
+          output << ',';
+          if (target_program) {
+            writeCsvString(output, scripts.programs()[*target_program].name);
+          }
+          output << '\n';
+          ++instruction_count;
+        }
+      }
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script action map"};
+  }
+  std::cout << "Mapped " << instruction_count
+            << " reachable mission-script action instructions to "
+            << output_path << '\n';
+  return 0;
+}
+
+void writeCsvString(std::ostream &output, std::string_view value) {
+  output << '"';
+  for (const auto character : value) {
+    if (character == '"') {
+      output << "\"\"";
+    } else {
+      output << character;
+    }
+  }
+  output << '"';
+}
+
+struct EmbeddedArchiveCandidate {
+  std::size_t offset{};
+  std::uint32_t identifier{};
+  std::size_t names_offset{};
+  std::size_t data_offset{};
+  std::vector<std::uint32_t> file_offsets;
+  std::vector<std::string> names;
+};
+
+std::vector<EmbeddedArchiveCandidate>
+discoverEmbeddedArchives(std::span<const std::byte> text) {
+  constexpr std::size_t header_size = 20U;
+  std::vector<EmbeddedArchiveCandidate> result;
+  for (std::size_t base = 0; base + header_size <= text.size(); base += 4U) {
+    const auto view = text.subspan(base);
+    const auto count = static_cast<std::size_t>(readAnalysisWord(view, 4U));
+    const auto offsets_offset =
+        static_cast<std::size_t>(readAnalysisWord(view, 8U));
+    const auto names_offset =
+        static_cast<std::size_t>(readAnalysisWord(view, 12U));
+    const auto data_offset =
+        static_cast<std::size_t>(readAnalysisWord(view, 16U));
+    if (count == 0U || count > 4096U || offsets_offset != header_size ||
+        header_size + count * 4U > names_offset ||
+        names_offset >= data_offset || data_offset > view.size()) {
+      continue;
+    }
+
+    EmbeddedArchiveCandidate candidate{
+        base, readAnalysisWord(view, 0U), names_offset, data_offset, {}, {}};
+    candidate.file_offsets.reserve(count);
+    auto valid = true;
+    for (std::size_t index = 0; index < count; ++index) {
+      const auto offset =
+          readAnalysisWord(view, header_size + index * 4U);
+      if ((index == 0U && offset != 0U) ||
+          (index > 0U && offset < candidate.file_offsets.back()) ||
+          offset >= view.size() - data_offset) {
+        valid = false;
+        break;
+      }
+      candidate.file_offsets.push_back(offset);
+    }
+    if (!valid) {
+      continue;
+    }
+
+    auto cursor = names_offset;
+    while (candidate.names.size() < count && cursor < data_offset) {
+      const auto start = cursor;
+      while (cursor < data_offset && view[cursor] != std::byte{0}) {
+        const auto character =
+            std::to_integer<unsigned char>(view[cursor]);
+        if (character < 0x20U || character > 0x7eU) {
+          valid = false;
+          break;
+        }
+        ++cursor;
+      }
+      if (!valid || cursor == start || cursor >= data_offset) {
+        valid = false;
+        break;
+      }
+      candidate.names.emplace_back(
+          reinterpret_cast<const char *>(view.data() + start),
+          cursor - start);
+      ++cursor;
+    }
+    if (valid && candidate.names.size() == count) {
+      result.push_back(std::move(candidate));
+    }
+  }
+  return result;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>>
+embeddedArchiveExactDataRanges(std::span<const std::byte> text,
+                               std::uint32_t load_address) {
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> result;
+  for (const auto &archive : discoverEmbeddedArchives(text)) {
+    // The final entry has no size in this archive format, so only preceding
+    // entries are safe exact exclusions. The mapper reports the final size as
+    // an upper bound separately.
+    for (std::size_t index = 0; index + 1U < archive.file_offsets.size();
+         ++index) {
+      const auto begin =
+          archive.offset + archive.data_offset + archive.file_offsets[index];
+      const auto end = archive.offset + archive.data_offset +
+                       archive.file_offsets[index + 1U];
+      result.emplace_back(
+          load_address + static_cast<std::uint32_t>(begin),
+          load_address + static_cast<std::uint32_t>(end));
+    }
+  }
+  std::ranges::sort(result);
+  return result;
+}
+
+int mapEmbeddedArchives(const char *cue_path, const char *output_path) {
+  const auto disc = openDisc(cue_path);
+  const auto &executable = disc.executable();
+  const auto text = executable.text();
+  const auto text_address = executable.header().text_address;
+  const auto archives = discoverEmbeddedArchives(text);
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open embedded-archive map output"};
+  }
+  output << "archive_address,identifier,entry_count,entry_index,name,"
+            "data_address,size,size_is_text_upper_bound\n";
+  std::size_t entry_count{};
+  for (const auto &archive : archives) {
+    for (std::size_t index = 0; index < archive.names.size(); ++index) {
+      const auto data_begin =
+          archive.offset + archive.data_offset + archive.file_offsets[index];
+      const auto data_end =
+          index + 1U < archive.file_offsets.size()
+              ? archive.offset + archive.data_offset +
+                    archive.file_offsets[index + 1U]
+              : text.size();
+      output << "0x" << std::hex << std::uppercase
+             << text_address + static_cast<std::uint32_t>(archive.offset)
+             << ",0x" << archive.identifier << std::dec << ','
+             << archive.names.size() << ',' << index << ',';
+      writeCsvString(output, archive.names[index]);
+      output << ",0x" << std::hex << std::uppercase
+             << text_address + static_cast<std::uint32_t>(data_begin)
+             << std::dec << ',' << data_end - data_begin << ','
+             << (index + 1U == archive.names.size() ? 1 : 0) << '\n';
+      ++entry_count;
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write embedded-archive map"};
+  }
+  std::cout << "Mapped " << entry_count << " entries across "
+            << archives.size() << " embedded archives to " << output_path
+            << '\n';
+  return 0;
+}
+
+int mapObjectHandlers(const char *cue_path, const char *output_path) {
+  const auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "Object-handler mapping requires a recognized sequel disc"};
+  }
+  const auto table_address =
+      disc.game()->id == sf::game::GameId::syphon_filter_2
+          ? std::uint32_t{0x8010c3d4U}
+          : std::uint32_t{0x8010f0f0U};
+  const auto class_count =
+      disc.game()->id == sf::game::GameId::syphon_filter_3
+          ? std::size_t{0x85U}
+          : std::size_t{0x84U};
+  const auto &executable = disc.executable();
+  const auto text = executable.text();
+  const auto text_address = executable.header().text_address;
+  const auto table_offset =
+      static_cast<std::size_t>(table_address - text_address);
+  if (table_offset > text.size() ||
+      text.size() - table_offset < class_count * sizeof(std::uint32_t)) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Object-handler table is outside executable text"};
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open object-handler map output"};
+  }
+  output << "class_family,handler_address,owner\n";
+  constexpr std::uint32_t overlay_begin = 0x8014b978U;
+  constexpr std::uint32_t overlay_end = overlay_begin + 0x10000U;
+  for (std::size_t family = 0; family < class_count; ++family) {
+    const auto handler =
+        readAnalysisWord(text, table_offset + family * 4U);
+    std::string owner{"direct"};
+    if (handler >= overlay_begin && handler < overlay_end) {
+      owner = "MISSION_OVERLAY";
+    } else if (handler >= text_address && handler < text_address + text.size()) {
+      const auto handler_offset =
+          static_cast<std::size_t>(handler - text_address);
+      if (handler_offset + 0x18U < text.size()) {
+        auto cursor = handler_offset + 0x18U;
+        std::string candidate;
+        while (cursor < text.size() && candidate.size() < 15U) {
+          const auto character =
+              std::to_integer<unsigned char>(text[cursor++]);
+          if (character == 0U) {
+            break;
+          }
+          if (character < 0x20U || character > 0x7eU) {
+            candidate.clear();
+            break;
+          }
+          candidate.push_back(static_cast<char>(character));
+        }
+        if (candidate.starts_with("OBJ_")) {
+          owner = std::move(candidate);
+        }
+      }
+    }
+    output << "0x" << std::hex << std::uppercase << family << ",0x"
+           << handler << std::dec << ',';
+    writeCsvString(output, owner);
+    output << '\n';
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write object-handler map"};
+  }
+  std::cout << "Mapped " << class_count << " object-class handlers from 0x"
+            << std::hex << std::uppercase << table_address << std::dec << " to "
+            << output_path << '\n';
+  return 0;
+}
+
+int mapStringReferences(const char *cue_path, const char *output_path) {
+  auto disc = openDisc(cue_path);
+  const auto &executable = disc.executable();
+  const auto &header = executable.header();
+  const auto text = executable.text();
+  const auto overlay_seeds = sequelOverlayExecutableSeeds(disc);
+  const auto functions = sf::psx::fingerprintFunctionCandidates(
+      text, header.text_address, header.initial_pc, true, overlay_seeds);
+
+  std::map<std::uint32_t, std::string> strings;
+  for (std::size_t offset = 0; offset < text.size();) {
+    const auto printable = [](std::byte value) {
+      const auto character = std::to_integer<unsigned char>(value);
+      return character >= 0x20U && character <= 0x7eU;
+    };
+    if (!printable(text[offset])) {
+      ++offset;
+      continue;
+    }
+    auto end = offset;
+    while (end < text.size() && printable(text[end])) {
+      ++end;
+    }
+    if (end - offset >= 4U && end < text.size() &&
+        text[end] == std::byte{0}) {
+      std::string value;
+      value.reserve(end - offset);
+      for (auto cursor = offset; cursor < end; ++cursor) {
+        value.push_back(
+            static_cast<char>(std::to_integer<unsigned char>(text[cursor])));
+      }
+      strings.emplace(
+          header.text_address + static_cast<std::uint32_t>(offset),
+          std::move(value));
+    }
+    offset = std::max(end, offset + 1U);
+  }
+
+  std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open string-reference map output"};
+  }
+  output << "reference_site,function_address,string_address,string\n";
+  std::set<std::pair<std::uint32_t, std::uint32_t>> emitted;
+  std::size_t reference_count{};
+  for (std::size_t offset = 0; offset + 4U <= text.size(); offset += 4U) {
+    const auto instruction = readAnalysisWord(text, offset);
+    if ((instruction >> 26U) != 0x0fU) {
+      continue;
+    }
+    const auto base_register = (instruction >> 16U) & 0x1fU;
+    const auto upper = (instruction & 0xffffU) << 16U;
+    for (std::size_t lookahead = 1U; lookahead <= 8U &&
+                                      offset + lookahead * 4U + 4U <=
+                                          text.size();
+         ++lookahead) {
+      const auto use_offset = offset + lookahead * 4U;
+      const auto use = readAnalysisWord(text, use_offset);
+      const auto opcode = use >> 26U;
+      const auto source = (use >> 21U) & 0x1fU;
+      if ((opcode != 0x08U && opcode != 0x09U && opcode != 0x0dU) ||
+          source != base_register) {
+        continue;
+      }
+      const auto immediate = use & 0xffffU;
+      const auto lower =
+          (opcode == 0x0dU || (immediate & 0x8000U) == 0U)
+              ? immediate
+              : immediate | 0xffff0000U;
+      const auto address = upper + lower;
+      const auto found_string = strings.find(address);
+      if (found_string == strings.end()) {
+        continue;
+      }
+      const auto site =
+          header.text_address + static_cast<std::uint32_t>(use_offset);
+      if (!emitted.emplace(site, address).second) {
+        continue;
+      }
+      auto function_address = std::uint32_t{};
+      const auto function = std::ranges::upper_bound(
+          functions, site, {}, &sf::psx::FunctionFingerprint::address);
+      if (function != functions.begin()) {
+        const auto &candidate = *std::prev(function);
+        const auto candidate_end =
+            candidate.address +
+            static_cast<std::uint32_t>(candidate.instruction_count * 4U);
+        if (site < candidate_end) {
+          function_address = candidate.address;
+        }
+      }
+      output << "0x" << std::hex << std::uppercase << site << ",0x"
+             << function_address << ",0x" << address << std::dec << ',';
+      writeCsvString(output, found_string->second);
+      output << '\n';
+      ++reference_count;
+      break;
+    }
+  }
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write string-reference map"};
+  }
+  std::cout << "Mapped " << reference_count << " references to "
+            << strings.size() << " null-terminated ASCII strings in "
             << output_path << '\n';
   return 0;
 }
@@ -1058,6 +3183,119 @@ int probeLegacyVm(const char *cue_path) {
   std::cout << "LegacyGameplayVM SCUS probe passed: " << cases.size()
             << " math cases + SUBWAY.OVL bootstrap, " << total_instructions
             << " instructions\n";
+  return 0;
+}
+
+int probeExecutableEntry(const char *cue_path, std::uint64_t budget) {
+  auto disc = openDisc(cue_path);
+  sf::game::LegacyGameplayVm vm{disc.executable()};
+  sf::game::DiscCdRomMedia cdrom_media{disc.image()};
+  vm.machine().setCdRomMedia(&cdrom_media);
+  vm.bindPsxBiosCoreVector();
+  if (disc.game()) {
+    const auto &layout = disc.game()->executable_layout;
+    vm.bindPsxVideoTimingCall(layout.vsync_address,
+                              layout.retrace_counter_address);
+    if (layout.cd_pending_command_address != 0U) {
+      vm.bindPsxCdPendingCommandCall(
+          layout.cd_pending_command_address, layout.cd_pending_command_state,
+          layout.cd_response_pointer, layout.cd_completion_state);
+    }
+    if (layout.cd_control_address != 0U) {
+      vm.bindPsxCdControlCall(layout.cd_control_address);
+    }
+    vm.bindPsxCdReadyCallback(
+        layout.cd_ready_callback_address, layout.cd_ready_result_address,
+        layout.cd_ready_state_address, layout.cd_ready_callback_is_pointer);
+  }
+  constexpr std::uint64_t frame_slice_budget = 50'000U;
+  auto remaining = budget;
+  auto total_instructions = std::uint64_t{};
+  auto total_host_calls = std::uint64_t{};
+  auto result =
+      vm.resumeCurrentPcClockNeutral(std::min(remaining, frame_slice_budget));
+  for (;;) {
+    total_instructions += result.execution.instructions;
+    total_host_calls += result.host_calls;
+    const auto consumed = std::min(remaining, frame_slice_budget);
+    remaining -= consumed;
+    if (result.execution.reason !=
+            sf::psx::R3000StopReason::instruction_budget ||
+        remaining == 0U || !disc.game()) {
+      break;
+    }
+    vm.machine().advanceHardwareTicks(consumed);
+    const auto counter_address =
+        disc.game()->executable_layout.retrace_counter_address;
+    std::uint32_t counter{};
+    if (!vm.runtime().read32(counter_address, counter) ||
+        !vm.runtime().write32(counter_address, counter + 1U)) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "Could not advance executable VBlank counter"};
+    }
+    if (!vm.servicePsxCdReadyCallback()) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "Could not dispatch executable CD-ready callback"};
+    }
+    result =
+        vm.resumeCurrentPcClockNeutral(std::min(remaining, frame_slice_budget));
+  }
+  std::uint16_t timer1_counter{};
+  std::uint16_t timer1_mode{};
+  static_cast<void>(vm.runtime().read16(0x1f801110U, timer1_counter));
+  static_cast<void>(vm.runtime().read16(0x1f801114U, timer1_mode));
+  const auto cdrom = vm.machine().cdrom().captureState();
+  const auto cd_dma_madr = vm.machine().dma().madr(sf::psx::DmaChannel::cdrom);
+  const auto cd_dma_bcr = vm.machine().dma().bcr(sf::psx::DmaChannel::cdrom);
+  const auto cd_dma_chcr = vm.machine().dma().chcr(sf::psx::DmaChannel::cdrom);
+  const auto spu_dma_madr = vm.machine().dma().madr(sf::psx::DmaChannel::spu);
+  const auto spu_dma_bcr = vm.machine().dma().bcr(sf::psx::DmaChannel::spu);
+  const auto spu_dma_chcr = vm.machine().dma().chcr(sf::psx::DmaChannel::spu);
+  std::uint32_t cd_response_pointer{};
+  std::uint8_t cd_response{};
+  std::uint8_t cd_completion{};
+  if (disc.game() && disc.game()->executable_layout.cd_response_pointer != 0U) {
+    static_cast<void>(
+        vm.runtime().read32(disc.game()->executable_layout.cd_response_pointer,
+                            cd_response_pointer));
+    static_cast<void>(vm.runtime().read8(cd_response_pointer, cd_response));
+    static_cast<void>(vm.runtime().read8(
+        disc.game()->executable_layout.cd_completion_state, cd_completion));
+  }
+  std::cout << "game="
+            << (disc.game() ? std::string{disc.game()->title} : "unrecognized")
+            << " start=0x" << std::hex << std::uppercase
+            << disc.executable().header().initial_pc << " stop=0x"
+            << result.execution.pc << std::dec
+            << " reason=" << sf::psx::toString(result.execution.reason)
+            << " instructions=" << total_instructions
+            << " host-calls=" << total_host_calls << " instruction=0x"
+            << std::hex << result.execution.instruction << " bad-vaddr=0x"
+            << vm.runtime().state().cop0_bad_vaddr << " v0=0x"
+            << vm.runtime().state().gpr[2U] << " v1=0x"
+            << vm.runtime().state().gpr[3U] << " ra=0x"
+            << vm.runtime().state().gpr[31U] << " sp=0x"
+            << vm.runtime().state().gpr[29U] << " a0=0x"
+            << vm.runtime().state().gpr[4U] << " a1=0x"
+            << vm.runtime().state().gpr[5U] << " a2=0x"
+            << vm.runtime().state().gpr[6U] << " a3=0x"
+            << vm.runtime().state().gpr[7U] << " t1=0x"
+            << vm.runtime().state().gpr[9U] << " timer1=0x" << timer1_counter
+            << " timer1-mode=0x" << timer1_mode << " cd-command=0x"
+            << static_cast<unsigned int>(cdrom.pending_command)
+            << " cd-phase=" << static_cast<unsigned int>(cdrom.command_phase)
+            << " cd-if=0x" << static_cast<unsigned int>(cdrom.interrupt_flags)
+            << " cd-ie=0x" << static_cast<unsigned int>(cdrom.interrupt_enable)
+            << " cd-response-ptr=0x" << cd_response_pointer << " cd-response=0x"
+            << static_cast<unsigned int>(cd_response) << " cd-completion=0x"
+            << static_cast<unsigned int>(cd_completion) << " cd-fifo0=0x"
+            << static_cast<unsigned int>(cdrom.response[0]) << " cd-fifo-pos="
+            << static_cast<unsigned int>(cdrom.response_position) << "/"
+            << static_cast<unsigned int>(cdrom.response_count) << " cd-dma=0x"
+            << cd_dma_madr << ",0x" << cd_dma_bcr << ",0x" << cd_dma_chcr
+            << " spu-dma=0x" << spu_dma_madr << ",0x" << spu_dma_bcr << ",0x"
+            << spu_dma_chcr
+            << std::dec << '\n';
   return 0;
 }
 
@@ -5211,6 +7449,9 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string_view{argv[1]} == "inspect") {
       return inspect(argv[2]);
     }
+    if (argc == 3 && std::string_view{argv[1]} == "inspect-disc-info") {
+      return inspectDiscInfo(argv[2]);
+    }
     if (argc == 3 && std::string_view{argv[1]} == "inspect-title") {
       return inspectTitle(argv[2]);
     }
@@ -5222,13 +7463,16 @@ int main(int argc, char **argv) {
         const auto parsed = std::from_chars(
             value.data(), value.data() + value.size(), mission_index);
         if (parsed.ec != std::errc{} ||
-            parsed.ptr != value.data() + value.size() ||
-            mission_index >= sf::game::missionCatalog().size()) {
+            parsed.ptr != value.data() + value.size()) {
           throw sf::core::Error{sf::core::ErrorCode::invalid_format,
-                                "Mission index must be in the range 0..19"};
+                                "Mission index is not an unsigned integer"};
         }
       }
       return inspectMission(argv[2], mission_index);
+    }
+    if (argc == 4 &&
+        std::string_view{argv[1]} == "inspect-mission-archive") {
+      return inspectMissionArchive(argv[2], argv[3]);
     }
     if (argc == 4 && std::string_view{argv[1]} == "extract-exe") {
       return extractExecutable(argv[2], argv[3]);
@@ -5242,8 +7486,84 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view{argv[1]} == "map-functions") {
       return mapFunctions(argv[2], argv[3]);
     }
+    if (argc == 5 && std::string_view{argv[1]} == "map-function-union") {
+      return mapFunctionUnion(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-function-calls") {
+      return mapFunctionCalls(argv[2], argv[3]);
+    }
+    if (argc == 5 && std::string_view{argv[1]} == "compare-functions") {
+      return compareFunctions(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-embedded-archives") {
+      return mapEmbeddedArchives(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-resident-overlays") {
+      return mapResidentOverlays(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-mission-overlays") {
+      return mapMissionOverlays(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-mission-classes") {
+      return mapMissionClasses(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-mission-objects") {
+      return mapMissionObjects(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-mission-scripts") {
+      return mapMissionScripts(argv[2], argv[3]);
+    }
+    if (argc == 4 &&
+        std::string_view{argv[1]} == "map-mission-script-opcodes") {
+      return mapMissionScriptOpcodes(argv[2], argv[3]);
+    }
+    if (argc == 4 &&
+        std::string_view{argv[1]} == "map-mission-script-handler-calls") {
+      return mapMissionScriptHandlerCalls(argv[2], argv[3]);
+    }
+    if (argc == 5 &&
+        std::string_view{argv[1]} == "compare-mission-script-opcodes") {
+      return compareMissionScriptOpcodes(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 4 &&
+        std::string_view{argv[1]} == "map-mission-script-events") {
+      return mapMissionScriptEvents(argv[2], argv[3]);
+    }
+    if (argc == 4 &&
+        std::string_view{argv[1]} == "map-mission-script-actions") {
+      return mapMissionScriptActions(argv[2], argv[3]);
+    }
+    if (argc == 4 &&
+        (std::string_view{argv[1]} == "map-mission-script-strings" ||
+         std::string_view{argv[1]} == "map-mission-sound-scenes")) {
+      return mapMissionScriptStrings(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-object-handlers") {
+      return mapObjectHandlers(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-string-references") {
+      return mapStringReferences(argv[2], argv[3]);
+    }
+    if (argc == 4 && std::string_view{argv[1]} == "map-xa-streams") {
+      return mapXaStreams(argv[2], argv[3]);
+    }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-vm") {
       return probeLegacyVm(argv[2]);
+    }
+    if ((argc == 3 || argc == 4) &&
+        std::string_view{argv[1]} == "probe-executable-entry") {
+      auto budget = std::uint64_t{1'000'000U};
+      if (argc == 4) {
+        const auto value = std::string_view{argv[3]};
+        const auto parsed =
+            std::from_chars(value.data(), value.data() + value.size(), budget);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != value.data() + value.size() || budget == 0U) {
+          throw sf::core::Error{sf::core::ErrorCode::invalid_argument,
+                                "Instruction budget must be positive"};
+        }
+      }
+      return probeExecutableEntry(argv[2], budget);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {
       return probeLegacyCd(argv[2]);

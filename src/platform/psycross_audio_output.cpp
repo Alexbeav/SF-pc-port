@@ -1,6 +1,7 @@
 #include "psycross_audio_output.hpp"
 
 #include "sf/core/error.hpp"
+#include "sf/game/embedded_hog.hpp"
 #include "sf/game/game_disc.hpp"
 #include "sf/psx/vab_decoder.hpp"
 
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -690,12 +692,33 @@ std::size_t PsyCrossAudioOutput::queuedBufferCount() const {
 
 PsyCrossUiAudio::PsyCrossUiAudio(const std::filesystem::path &cue_path) {
   auto disc = game::GameDisc::open(cue_path);
-  const auto header = disc.image().readFile("COMMON/BEEPSX.VH");
-  const auto body = disc.image().readFile("COMMON/BEEPSX.VB");
+  const auto is_sequel =
+      disc.game() && disc.game()->id != game::GameId::syphon_filter;
+  auto resident_audio = std::optional<assets::HogArchive>{};
+  if (is_sequel) {
+    resident_audio =
+        game::parseEmbeddedHog(disc.executable(), "BEEPSX.VB");
+  }
+  const auto header =
+      resident_audio
+          ? std::vector<std::byte>{resident_audio->file("BEEPSX.VH").begin(),
+                                   resident_audio->file("BEEPSX.VH").end()}
+          : disc.image().readFile("COMMON/BEEPSX.VH");
+  const auto body =
+      resident_audio
+          ? std::vector<std::byte>{resident_audio->file("BEEPSX.VB").begin(),
+                                   resident_audio->file("BEEPSX.VB").end()}
+          : disc.image().readFile("COMMON/BEEPSX.VB");
   constexpr std::array<std::size_t, 3U> retail_sound_ids{2U, 1U, 0U};
   for (std::size_t cue = 0U; cue < cues_.size(); ++cue) {
     auto decoded = psx::decodeVabSound(header, body, retail_sound_ids[cue]);
     if (!decoded.succeeded() || decoded.frames.empty()) {
+      if (is_sequel) {
+        // SF2 remaps the UI program/tone IDs in its resident VAB. Keep sequel
+        // bring-up usable while those cues are catalogued; play() already
+        // treats an empty decoded cue as silence.
+        continue;
+      }
       throw core::Error{core::ErrorCode::invalid_format,
                         "Cannot decode retail COMMON/BEEPSX menu cue " +
                             std::to_string(retail_sound_ids[cue])};

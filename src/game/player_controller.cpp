@@ -273,10 +273,15 @@ void PlayerController::update(const PlayerInput &input,
   if (has_forward_motion || has_strafe_motion) {
     if (stance_ == PlayerStanceState::kneeling) {
       requested_locomotion = PlayerLocomotionState::crouch_walking;
+    } else if (input.run && !manual_aim) {
+      // SF2/SF3 map the right stick to camera-relative 8-way running. The PC
+      // profile applies that contract to normal WASD: Gabe's model faces the
+      // movement vector while the chase heading remains fixed. Holding the
+      // walk modifier falls through to the original left-stick locomotion,
+      // including its slow backward walk.
+      requested_locomotion = PlayerLocomotionState::running;
     } else if (has_strafe_motion && !has_forward_motion) {
       requested_locomotion = PlayerLocomotionState::strafing;
-    } else if (input.run && move > 0.0 && !input.aim) {
-      requested_locomotion = PlayerLocomotionState::running;
     } else {
       requested_locomotion = PlayerLocomotionState::walking;
     }
@@ -293,7 +298,7 @@ void PlayerController::update(const PlayerInput &input,
             : walking_root_motion_;
     const auto &strafe_root_motion =
         strafe < 0.0 ? strafe_left_root_motion_ : strafe_right_root_motion_;
-    const auto native_distance =
+    auto native_distance =
         requested_locomotion == PlayerLocomotionState::strafing &&
                 !strafe_root_motion.empty()
             ? rootMotionPlanarDistance(strafe_root_motion, animation_tick_,
@@ -412,25 +417,39 @@ ActorMotion PlayerController::actorMotion() const noexcept {
 }
 
 std::int32_t PlayerController::modelHeading() const noexcept {
-  if (action_ != PlayerActionState::rolling) {
-    return state_.yaw;
+  if (action_ == PlayerActionState::rolling) {
+    switch (roll_direction_) {
+    case PlayerRollDirection::left:
+      return normalizeHeading(static_cast<std::int64_t>(state_.yaw) - 1024);
+    case PlayerRollDirection::right:
+      return normalizeHeading(static_cast<std::int64_t>(state_.yaw) + 1024);
+    case PlayerRollDirection::forward:
+    default:
+      return state_.yaw;
+    }
   }
-  switch (roll_direction_) {
-  case PlayerRollDirection::left:
-    return normalizeHeading(static_cast<std::int64_t>(state_.yaw) - 1024);
-  case PlayerRollDirection::right:
-    return normalizeHeading(static_cast<std::int64_t>(state_.yaw) + 1024);
-  case PlayerRollDirection::forward:
-  default:
-    return state_.yaw;
+  if (locomotion_ == PlayerLocomotionState::running &&
+      (std::abs(motion_move_) > input_dead_zone ||
+       std::abs(motion_strafe_) > input_dead_zone)) {
+    // The run clip's local forward axis follows the camera-relative movement
+    // vector. This covers every right-stick/WASD direction, including the
+    // 180-degree turn for S, without rotating the chase camera.
+    const auto local_heading =
+        headingFromDirection(motion_strafe_, motion_move_);
+    return normalizeHeading(static_cast<std::int64_t>(state_.yaw) +
+                            local_heading);
   }
+  return state_.yaw;
 }
 
 void PlayerController::updateCamera() noexcept {
   const auto mode = aim_ == PlayerAimState::first_person
                         ? PlayerCameraMode::first_person_aim
                         : PlayerCameraMode::chase;
-  const auto chase_heading = modelHeading();
+  // Lateral running rotates Gabe's presentation, not the camera-relative
+  // movement frame. Directional rolls remain camera-aligned as before.
+  const auto chase_heading =
+      action_ == PlayerActionState::rolling ? modelHeading() : state_.yaw;
   const auto desired =
       aim_ == PlayerAimState::first_person
           ? aim_camera_rig_.view(state_.x, state_.y, state_.z, aim_heading_,
@@ -479,7 +498,9 @@ PlayerCameraIntent PlayerController::cameraIntent() const noexcept {
       state_.x,
       state_.y,
       state_.z,
-      aim_ == PlayerAimState::first_person ? aim_heading_ : modelHeading(),
+      aim_ == PlayerAimState::first_person
+          ? aim_heading_
+          : action_ == PlayerActionState::rolling ? modelHeading() : state_.yaw,
       camera_pitch_,
   };
 }

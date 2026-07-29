@@ -17,6 +17,9 @@ enum class WeaponId : std::uint8_t {
   glock_17 = pistol_9mm,
   unused_357 = 3,
   unused_03 = unused_357,
+  // SF1 leaves slot 3 unused. The sequel adapter uses that otherwise vacant
+  // slot for its authored knife without changing the 26-slot retail bridge.
+  knife = unused_357,
   pistol_45 = 4,
   pistol_357 = pistol_45,
   g_18 = 5,
@@ -189,8 +192,13 @@ public:
   PlayerInventory();
 
   void resetFirstMission() noexcept;
+  void resetUnarmed() noexcept;
   void grant(WeaponId id, std::uint16_t magazine,
              std::uint16_t reserve) noexcept;
+  // Adds pickup quantities to an existing item with the same retail
+  // per-field clamps; unlike grant(), this does not replace carried ammo.
+  void acquire(WeaponId id, std::uint16_t magazine,
+               std::uint16_t reserve) noexcept;
   void remove(WeaponId id) noexcept;
   [[nodiscard]] bool select(WeaponId id) noexcept;
   [[nodiscard]] bool selectNext() noexcept;

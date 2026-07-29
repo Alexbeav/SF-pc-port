@@ -142,7 +142,8 @@ HmdModel::HmdModel(
       triangles_(std::move(triangles)),
       texture_page_mask_(texture_page_mask) {}
 
-HmdModel HmdModel::parse(std::span<const std::byte> bytes) {
+HmdModel HmdModel::parse(std::span<const std::byte> bytes,
+                         std::uint16_t vertex_index_stride_override) {
     if (bytes.size() < header_size) {
         throw core::Error{core::ErrorCode::invalid_format, "HMD header is truncated"};
     }
@@ -262,17 +263,34 @@ HmdModel HmdModel::parse(std::span<const std::byte> bytes) {
     for (std::size_t index = 0; index < parts.size(); ++index) {
         const auto offset = geometry_end + index * bounds_size;
         auto& bounds = parts[index].bounds;
+        auto inverted = false;
         for (std::size_t component = 0; component < 3U; ++component) {
             bounds.minimum[component] = readSignedLe32(bytes, offset + component * 4U);
             bounds.maximum[component] = readSignedLe32(bytes, offset + 0x10U + component * 4U);
             if (bounds.minimum[component] > bounds.maximum[component]) {
-                throw core::Error{core::ErrorCode::invalid_format, "Invalid HMD part bounds"};
+                inverted = true;
             }
+        }
+        if (inverted) {
+            // SF2 may retain a padded hierarchy node with no authored
+            // geometry. SPOOKYX.HMD in HWAY marks that empty right hand with
+            // the retail +32767/-32767 bounds sentinel. Accept it only when
+            // the part declares no usable vertices; an inverted populated
+            // part remains corrupt.
+            if (parts[index].declared_vertex_count != 0U) {
+                throw core::Error{core::ErrorCode::invalid_format,
+                                  "Invalid HMD part bounds"};
+            }
+            bounds.minimum = {};
+            bounds.maximum = {};
         }
     }
     validateHierarchy(parts);
 
-    const auto vertex_stride = (flags & 1U) != 0U ? 8U : 12U;
+    const auto vertex_stride =
+        vertex_index_stride_override != 0U
+            ? static_cast<unsigned int>(vertex_index_stride_override)
+            : ((flags & 1U) != 0U ? 8U : 12U);
     std::vector<HmdTriangle> triangles;
     triangles.reserve(triangle_count);
     std::uint32_t texture_page_mask{};

@@ -172,11 +172,20 @@ public:
     if (!valid(trim_) || !valid(inner_) || !valid(top_) ||
         trim_.clut()->words != inner_.clut()->words ||
         trim_.clut()->words != top_.clut()->words ||
-        timTexturePage(trim_) != 12U || timTexturePage(inner_) != 13U ||
-        timTexturePage(top_) != 13U) {
+        std::ranges::any_of(sourcePages(), [](unsigned int page) {
+          return page >= resident_texture_page_count;
+        })) {
       throw core::Error{core::ErrorCode::invalid_format,
                         "Retail weapon-crate texture layout is invalid"};
     }
+  }
+
+  [[nodiscard]] std::array<unsigned int, 3U> sourcePages() const noexcept {
+    return {
+        timTexturePage(trim_),
+        timTexturePage(inner_),
+        timTexturePage(top_),
+    };
   }
 
   [[nodiscard]] static constexpr std::size_t sourceClutRow() noexcept {
@@ -196,10 +205,10 @@ public:
     }
   }
 
-  void upload(unsigned int trim_page, unsigned int top_page) const {
-    uploadAt(trim_, trim_page);
-    uploadAt(inner_, top_page);
-    uploadAt(top_, top_page);
+  void upload(const std::array<unsigned int, 3U> &physical_pages) const {
+    uploadAt(trim_, physical_pages[0]);
+    uploadAt(inner_, physical_pages[1]);
+    uploadAt(top_, physical_pages[2]);
   }
 
 private:
@@ -467,6 +476,9 @@ struct GlassShardPresentationState {
 class EnvironmentTextureAtlas final {
 public:
   explicit EnvironmentTextureAtlas(const game::MissionPackage &mission) {
+    if (!mission.runtimeProfile().uses_sf1_environment_atlas) {
+      return;
+    }
     const auto append = [&](std::string_view name, std::uint16_t u,
                             std::uint16_t v) {
       auto image = assets::TimImage::parse(mission.specialEffects().file(name));
@@ -1007,12 +1019,20 @@ public:
             const auto *gmd = std::get_if<assets::GmdModel>(&geometry);
             const auto *emd = std::get_if<assets::EmdScene>(&geometry);
             const auto *hmd = std::get_if<assets::HmdModel>(&geometry);
-            const auto bank = emd != nullptr
-                                  ? static_cast<int>(emd->textureBank())
-                                  : selected_bank;
+            const auto authored_emd_bank =
+                emd != nullptr ? static_cast<int>(emd->textureBank()) : -1;
+            const auto bank =
+                emd != nullptr &&
+                        (authored_emd_bank < 2 ||
+                         mission_.gameId() == game::GameId::syphon_filter)
+                    ? authored_emd_bank
+                    : selected_bank;
             if (bank >= 2U) {
-              throw core::Error{core::ErrorCode::unsupported,
-                                "Unsupported object texture bank"};
+              throw core::Error{
+                  core::ErrorCode::unsupported,
+                  "Unsupported object texture bank " + std::to_string(bank) +
+                      " for " + requirement_context,
+              };
             }
             if (gmd != nullptr) {
               require_mask(gmd->renderableTexturePageMask(), bank);
@@ -1038,6 +1058,7 @@ public:
             "object-" + std::to_string(object_index) + "-geometry";
         const auto *object_model = gameplay.displayedObjectModel(object_index);
         if (object_model != nullptr) {
+          requirement_context += "-" + object_model->name;
           const auto bank =
               gameplay.displayedObjectTextureBank(object_index);
           if (object_index < gameplay.objects().size()) {
@@ -1047,6 +1068,9 @@ public:
             if ((class_id == 0x4fU || class_id == 0x50U) && weapon_crate &&
                 bank < 2U) {
               required_crate_banks_[bank] = true;
+              for (const auto page : crate_texture_overlay_.sourcePages()) {
+                require_page(page, static_cast<int>(bank));
+              }
             }
           }
           const auto *hmd_model =
@@ -1294,8 +1318,10 @@ public:
         crate_texture_overlay_.copyClut(
             std::span<std::byte>{required_clut_}.subspan(
                 physical_row * row_bytes, row_bytes));
-        required_crate_overlay_pages_[required_page_remap_[bank][12U]] = true;
-        required_crate_overlay_pages_[required_page_remap_[bank][13U]] = true;
+        for (const auto page : crate_texture_overlay_.sourcePages()) {
+          required_crate_overlay_pages_[required_page_remap_[bank][page]] =
+              true;
+        }
       }
       // A slot which leaves the active requirement set no longer has a
       // trustworthy resident owner. Native effect/framebuffer scratch may use
@@ -1444,22 +1470,28 @@ public:
         crate_overlay_tokens_[bank] = {};
         continue;
       }
-      const auto trim_page = residentPhysicalPage(12U, static_cast<int>(bank));
-      const auto top_page = residentPhysicalPage(13U, static_cast<int>(bank));
-      if (!trim_page || !top_page) {
-        throw core::Error{core::ErrorCode::unsupported,
-                          "Resident weapon-crate texture pages are missing"};
+      std::array<unsigned int, 3U> physical_pages{};
+      const auto source_pages = crate_texture_overlay_.sourcePages();
+      for (std::size_t index = 0U; index < source_pages.size(); ++index) {
+        const auto physical =
+            residentPhysicalPage(source_pages[index], static_cast<int>(bank));
+        if (!physical) {
+          throw core::Error{core::ErrorCode::unsupported,
+                            "Resident weapon-crate texture pages are missing"};
+        }
+        physical_pages[index] = *physical;
       }
       const std::array tokens{
-          page_generations_[*trim_page],
-          page_generations_[*top_page],
+          page_generations_[physical_pages[0]],
+          page_generations_[physical_pages[1]],
+          page_generations_[physical_pages[2]],
       };
       if (crate_overlay_tokens_[bank] != tokens) {
-        crate_texture_overlay_.upload(*trim_page, *top_page);
-        crate_overlay_pages_[*trim_page] = true;
-        crate_overlay_pages_[*top_page] = true;
-        capture_expected_pages[*trim_page] = true;
-        capture_expected_pages[*top_page] = true;
+        crate_texture_overlay_.upload(physical_pages);
+        for (const auto physical : physical_pages) {
+          crate_overlay_pages_[physical] = true;
+          capture_expected_pages[physical] = true;
+        }
         crate_overlay_tokens_[bank] = tokens;
         changed = true;
       }
@@ -2150,7 +2182,7 @@ private:
   std::vector<std::byte> loaded_clut_;
   FireTexturePlacement fire_placement_{};
   const game::ObjectFireEmitter *active_fire_{};
-  std::array<std::array<std::uint64_t, 2U>, 2U> crate_overlay_tokens_{};
+  std::array<std::array<std::uint64_t, 3U>, 2U> crate_overlay_tokens_{};
 };
 
 struct HudTextureAsset {
@@ -2182,6 +2214,8 @@ struct HudTextureAsset {
 class HudTextureAtlas final {
 public:
   explicit HudTextureAtlas(const game::MissionPackage &mission) {
+    const auto hud_atlas = mission.runtimeProfile().hud_atlas;
+    const auto is_sf1 = hud_atlas == game::HudAtlasKind::sf1;
     std::vector<HudTextureAsset> retail_fonts;
     const auto required = [](std::string_view name) {
       // The three font sheets and SYMBOL are shared by the original
@@ -2219,27 +2253,49 @@ public:
       auto localized = font_asset
                            ? game::readLocalizedAsset("fonts/" + entry.name)
                            : std::nullopt;
+      const auto parse_interface_image =
+          [&](std::span<const std::byte> bytes) {
+            try {
+              return assets::TimImage::parse(bytes);
+            } catch (const core::Error &error) {
+              throw core::Error{
+                  error.code(),
+                  "INTERFACE asset " + entry.name + ": " + error.what()};
+            }
+          };
       if (font_asset && game::russianLanguageActive()) {
         retail_fonts.push_back(HudTextureAsset{
             entry.name,
-            assets::TimImage::parse(mission.interfaceAssets().file(entry.name)),
+            parse_interface_image(mission.interfaceAssets().file(entry.name)),
         });
       }
-      auto image = localized ? assets::TimImage::parse(*localized)
-                             : assets::TimImage::parse(
-                                   mission.interfaceAssets().file(entry.name));
+      auto image =
+          localized ? parse_interface_image(*localized)
+                    : parse_interface_image(
+                          mission.interfaceAssets().file(entry.name));
       const auto native_hd_font_layout =
           localized.has_value() && isNativeHdFontSheet(entry.name, image);
       const auto nightvision_layer =
           std::ranges::find(nightvision_scope_layers, entry.name) !=
           nightvision_scope_layers.end();
+      const auto hud_placement = hudResidentPlacement(image.pixels());
+      const auto resident_hud_limit =
+          is_sf1 ? mission_clut_resident_y : pickup_resident_clut_y;
       const auto regular_hud_layout =
           image.pixels().x >= 768U && image.pixels().y < 256U &&
-          static_cast<unsigned int>(image.pixels().x) +
+          static_cast<unsigned int>(hud_placement.x) +
                   image.pixels().width_words <=
-              1024U &&
-          static_cast<unsigned int>(image.pixels().y) + image.pixels().height <=
-              mission_clut_resident_y;
+              256U &&
+          static_cast<unsigned int>(hud_placement.y) + image.pixels().height <=
+              resident_hud_limit;
+      const auto relocated_sequel_hud_layout =
+          hudResidentRelocationSupported(hud_atlas, image.pixels()) &&
+          hud_placement.y < 256U &&
+          static_cast<unsigned int>(hud_placement.x) +
+                  image.pixels().width_words <=
+              256U &&
+          static_cast<unsigned int>(hud_placement.y) + image.pixels().height <=
+              resident_hud_limit;
       const auto nightvision_layout =
           nightvision_layer && image.pixels().x >= 512U &&
           image.pixels().y >= 384U &&
@@ -2249,12 +2305,14 @@ public:
           static_cast<unsigned int>(image.pixels().y) + image.pixels().height <=
               502U;
       if (image.mode() != assets::TimPixelMode::indexed8 || !image.clut() ||
-          (!regular_hud_layout && !nightvision_layout &&
+          (!regular_hud_layout && !relocated_sequel_hud_layout &&
+           !nightvision_layout &&
            !native_hd_font_layout) ||
           image.clut()->x != 768U || image.clut()->y != 483U ||
           image.clut()->width_words != 256U || image.clut()->height != 1U) {
         throw core::Error{core::ErrorCode::invalid_format,
-                          "INTERFACE HUD atlas uses an unexpected VRAM layout"};
+                          "INTERFACE HUD atlas uses an unexpected VRAM layout: " +
+                              entry.name};
       }
       if (!assets_.empty() &&
           image.clut()->words != assets_.front().image.clut()->words) {
@@ -2322,12 +2380,14 @@ public:
     static_cast<void>(image("FONTB.TIM"));
     static_cast<void>(image("FONTC.TIM"));
     static_cast<void>(image("SYMBOL.TIM"));
-    static_cast<void>(image("SCOPED.TIM"));
-    for (const auto bearing : scope_bearings) {
-      static_cast<void>(image(bearing));
-    }
-    for (const auto layer : nightvision_scope_layers) {
-      static_cast<void>(image(layer));
+    if (is_sf1) {
+      static_cast<void>(image("SCOPED.TIM"));
+      for (const auto bearing : scope_bearings) {
+        static_cast<void>(image(bearing));
+      }
+      for (const auto layer : nightvision_scope_layers) {
+        static_cast<void>(image(layer));
+      }
     }
     if (game::russianLanguageActive()) {
       native_font_ = std::make_unique<PsyCrossFontTexture>(
@@ -2630,7 +2690,8 @@ public:
               : assets::TimImage::parse(mission.menuAssets().file(entry.name)),
       });
     }
-    if (image("GLOKSIL.TIM") == nullptr) {
+    if (mission.gameId() == game::GameId::syphon_filter &&
+        image("GLOKSIL.TIM") == nullptr) {
       throw core::Error{
           core::ErrorCode::not_found,
           "MENU.HOG does not contain the universal pause weapon texture"};
@@ -7725,7 +7786,11 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
       pickup_minimum_brightness +
       pickup_brightness_range * pickup_pulse_rise / pickup_pulse_half_ticks);
 
-  for (const auto &item : presentation.dropped_items) {
+  auto dropped_items = presentation.dropped_items;
+  const auto native_dropped_items = gameplay.nativeDroppedItems();
+  dropped_items.insert(dropped_items.end(), native_dropped_items.begin(),
+                       native_dropped_items.end());
+  for (const auto &item : dropped_items) {
     const auto layers = game::droppedItemIconLayers(item.item);
     if (layers.empty()) {
       continue;
@@ -7791,7 +7856,6 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
       switch (static_cast<game::WeaponId>(item.item)) {
       case game::WeaponId::silenced_9mm:
       case game::WeaponId::pistol_9mm:
-      case game::WeaponId::unused_357:
       case game::WeaponId::pistol_45:
       case game::WeaponId::g_18:
         return true;
@@ -7811,10 +7875,11 @@ void renderDroppedItemSprites(const HudTextureAtlas &textures,
     for (std::size_t layer = 0U; layer < layers.size(); ++layer) {
       const auto &image = textures.image(layers[layer]);
       const auto armor_pickup = layers[layer] == armor_pickup_texture;
+      const auto hud_placement = hudResidentPlacement(image.pixels());
       const auto resident_x =
-          armor_pickup ? pickup_resident_x : hudResidentX(image.pixels().x);
+          armor_pickup ? pickup_resident_x : hud_placement.x;
       const auto resident_y =
-          armor_pickup ? pickup_resident_y : image.pixels().y;
+          armor_pickup ? pickup_resident_y : hud_placement.y;
       const auto page_x =
           static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
       const auto page_y =
@@ -9508,6 +9573,11 @@ RenderStats renderWorld(
                   game::droppedItemIconLayers(item.item).size(),
                   "Pickup sprite");
   }
+  for (const auto &item : gameplay.nativeDroppedItems()) {
+    add_to_budget(pickup_sprite_budget,
+                  game::droppedItemIconLayers(item.item).size(),
+                  "Native pickup sprite");
+  }
   primitives.pickup_sprites.reserve(pickup_sprite_budget);
   std::size_t projectile_sprite_budget{};
   for (const auto &projectile : presentation.projectiles) {
@@ -9917,15 +9987,16 @@ void drawHudSpriteAtResident(const assets::TimImage &image,
 
 void drawHudSprite(const assets::TimImage &image, int x, int y,
                    std::uint8_t brightness = 128U) {
-  drawHudSpriteAtResident(image, hudResidentX(image.pixels().x),
-                          image.pixels().y, x, y, brightness);
+  const auto placement = hudResidentPlacement(image.pixels());
+  drawHudSpriteAtResident(image, placement.x, placement.y, x, y, brightness);
 }
 
 void drawHudSpriteScaled(const assets::TimImage &image, float x, float y,
                          float width, float height,
                          std::uint8_t brightness = 128U) {
-  const auto resident_x = hudResidentX(image.pixels().x);
-  const auto resident_y = image.pixels().y;
+  const auto placement = hudResidentPlacement(image.pixels());
+  const auto resident_x = placement.x;
+  const auto resident_y = placement.y;
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
   const auto page_y =
@@ -10050,8 +10121,9 @@ void renderProjectileSprites(const HudTextureAtlas &textures,
 
     for (std::size_t layer = 0U; layer < layers.size(); ++layer) {
       const auto &image = textures.image(layers[layer]);
-      const auto resident_x = hudResidentX(image.pixels().x);
-      const auto resident_y = image.pixels().y;
+      const auto placement = hudResidentPlacement(image.pixels());
+      const auto resident_x = placement.x;
+      const auto resident_y = placement.y;
       const auto page_x =
           static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
       const auto page_y =
@@ -10119,11 +10191,12 @@ void drawHudSpriteRegionTintScaled(const assets::TimImage &page_image, float x,
                                    std::uint8_t height, float scale,
                                    game::LegacyRgbBridgeState color) {
   const auto &pixels = page_image.pixels();
-  const auto resident_x = hudResidentX(pixels.x);
+  const auto placement = hudResidentPlacement(pixels);
+  const auto resident_x = placement.x;
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
   const auto page_y =
-      static_cast<int>(pixels.y & static_cast<std::uint16_t>(~255U));
+      static_cast<int>(placement.y & static_cast<std::uint16_t>(~255U));
   const auto texture_page =
       GetTPage(texturePageMode(page_image.mode()), 0, page_x, page_y);
 
@@ -11654,6 +11727,19 @@ void drawGameplayHud(const HudTextureAtlas &textures,
   }
   if (const auto &timer = gameplay.legacyUiTimer()) {
     drawRetailUiGlyphs(textures, timer->glyphs, offset_x, offset_y);
+  } else if (const auto seconds = gameplay.nativeMissionTimerSeconds()) {
+    const auto minutes = *seconds / 60U;
+    const auto remainder = *seconds % 60U;
+    auto text = std::to_string(minutes);
+    text.push_back(':');
+    if (remainder < 10U) {
+      text.push_back('0');
+    }
+    text += std::to_string(remainder);
+    drawOriginalHudTextSolid(
+        textures, text,
+        (screen_width - game::originalHudTextWidth(text)) / 2 + offset_x,
+        18 + offset_y, 255U);
   }
   for (auto index = std::size_t{}; index < messages.size(); ++index) {
     const auto &message = messages[index];
@@ -11764,18 +11850,19 @@ void drawPauseFontRegion(const assets::TimImage &image, int source_x,
                          int destination_width, int destination_height,
                          PauseRgb color) {
   const auto &pixels = image.pixels();
-  const auto resident_x = hudResidentX(pixels.x);
+  const auto placement = hudResidentPlacement(pixels);
+  const auto resident_x = placement.x;
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
   const auto page_y =
-      static_cast<int>(pixels.y & static_cast<std::uint16_t>(~255U));
+      static_cast<int>(placement.y & static_cast<std::uint16_t>(~255U));
   const auto pixels_per_word =
       image.mode() == assets::TimPixelMode::indexed4   ? 4
       : image.mode() == assets::TimPixelMode::indexed8 ? 2
                                                        : 1;
   const auto u0 =
       (static_cast<int>(resident_x) - page_x) * pixels_per_word + source_x;
-  const auto v0 = static_cast<int>(pixels.y) - page_y + source_y;
+  const auto v0 = static_cast<int>(placement.y) - page_y + source_y;
   const auto texture_page =
       GetTPage(texturePageMode(image.mode()), 0, page_x, page_y);
 
@@ -13178,7 +13265,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
     auto configuration = player_input.configuration();
     configuration.invert_pitch = settings.invert_aim;
     player_input.setConfiguration(configuration);
-    if (!gameplay.setAudioVolumes({
+    if (mission.gameId() == game::GameId::syphon_filter &&
+        !gameplay.setAudioVolumes({
             .sound_effects = settings.sound_effects_volume,
             .music = settings.music_volume,
             .voice_over = settings.voice_volume,
@@ -13414,6 +13502,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
                                  retail_audio_step_seconds));
   };
   const auto service_realtime_audio = [&]() {
+    if (mission.gameId() != game::GameId::syphon_filter) {
+      // SF2 scene bring-up currently has no mapped guest SPU callback. Do not
+      // let an intentionally absent audio clock terminate native rendering.
+      audio_accumulator_seconds = 0.0;
+      gameplay_audio->update();
+      return true;
+    }
     auto audio_updates = 0U;
     while (audio_updates < maximum_audio_updates_per_presentation &&
            audio_accumulator_seconds + 1.0e-9 >= retail_audio_step_seconds) {
@@ -14046,7 +14141,13 @@ SceneViewerResult PsyCrossSceneViewer::run(
                     ? manual_aim ? pc_aim_move : mapped_input.move_forward
                     : 0.0,
         .turn = movement_armed && !manual_aim ? mapped_input.turn : 0.0,
-        .run = movement_armed && mapped_input.run.held,
+        // SF2's native PC profile runs by default and uses Shift as the
+        // precision-walk modifier. SF1 retains the retail hold-to-run PAD
+        // contract because its guest executable remains authoritative.
+        .run = movement_armed &&
+               (mission.gameId() == game::GameId::syphon_filter
+                    ? mapped_input.run.held
+                    : !raw_player_input.pc.run),
         .aim = manual_aim,
         .next_weapon = mapped_input.next_weapon.pressed,
         .previous_weapon = mapped_input.previous_weapon.pressed,

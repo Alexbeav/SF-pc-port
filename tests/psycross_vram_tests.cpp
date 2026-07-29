@@ -18,6 +18,49 @@ int main() {
     return 1;
   }
 
+  const auto regular_hud =
+      hudResidentPlacement(sf::assets::TimBlock{886U, 20U, 5U, 20U, {}});
+  const auto sf3_gas_grenade =
+      hudResidentPlacement(sf::assets::TimBlock{811U, 456U, 5U, 20U, {}});
+  const auto sf3_sniper =
+      hudResidentPlacement(sf::assets::TimBlock{768U, 336U, 16U, 16U, {}});
+  const auto sf3_g3 =
+      hudResidentPlacement(sf::assets::TimBlock{876U, 230U, 11U, 20U, {}});
+  const auto sf3_shot2b =
+      hudResidentPlacement(sf::assets::TimBlock{816U, 232U, 15U, 20U, {}});
+  const auto sf2_keycard =
+      hudResidentPlacement(sf::assets::TimBlock{884U, 238U, 9U, 17U, {}});
+  const auto sf2_sniper =
+      hudResidentPlacement(sf::assets::TimBlock{792U, 240U, 16U, 16U, {}});
+  const auto sf2_super =
+      hudResidentPlacement(sf::assets::TimBlock{866U, 232U, 16U, 24U, {}});
+  if (regular_hud != HudResidentPlacement{118U, 20U} ||
+      sf3_gas_grenade != HudResidentPlacement{0U, 227U} ||
+      sf3_sniper != HudResidentPlacement{80U, 231U} ||
+      sf3_g3 != HudResidentPlacement{40U, 227U} ||
+      sf3_shot2b != HudResidentPlacement{96U, 227U} ||
+      sf2_keycard != HudResidentPlacement{170U, 0U} ||
+      sf2_sniper != HudResidentPlacement{179U, 0U} ||
+      sf2_super != HudResidentPlacement{195U, 0U}) {
+    std::cerr << "Resident HUD atlas mapping changed\n";
+    return 15;
+  }
+  if (!hudResidentRelocationSupported(
+          sf::game::HudAtlasKind::sf2,
+          sf::assets::TimBlock{884U, 238U, 9U, 17U, {}}) ||
+      hudResidentRelocationSupported(
+          sf::game::HudAtlasKind::sf3,
+          sf::assets::TimBlock{884U, 238U, 9U, 17U, {}}) ||
+      !hudResidentRelocationSupported(
+          sf::game::HudAtlasKind::sf3,
+          sf::assets::TimBlock{811U, 456U, 5U, 20U, {}}) ||
+      hudResidentRelocationSupported(
+          sf::game::HudAtlasKind::sf2,
+          sf::assets::TimBlock{811U, 456U, 5U, 20U, {}})) {
+    std::cerr << "Game-specific HUD relocation ownership changed\n";
+    return 16;
+  }
+
   static_assert(extended_texture_page_count == 63U);
   static_assert(resident_texture_page_count - 6U >=
                 maximum_scene_texture_identities);

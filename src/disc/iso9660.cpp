@@ -93,8 +93,26 @@ Iso9660Image Iso9660Image::open(const std::filesystem::path& cue_path) {
     if (!stream) {
         throw core::Error{core::ErrorCode::io, "Cannot open track binary: " + track.binary_path.string()};
     }
+    stream.seekg(0, std::ios::end);
+    const auto track_bytes = stream.tellg();
+    if (track_bytes < 0 ||
+        static_cast<std::uint64_t>(track_bytes) % track.sectorSize() != 0U) {
+        throw core::Error{core::ErrorCode::invalid_format,
+                          "Track length is not sector aligned"};
+    }
+    const auto physical_sector_count =
+        static_cast<std::uint64_t>(track_bytes) / track.sectorSize();
+    if (physical_sector_count < track.index_lba ||
+        physical_sector_count - track.index_lba >
+            std::numeric_limits<std::uint32_t>::max()) {
+        throw core::Error{core::ErrorCode::invalid_format,
+                          "Track sector count is invalid"};
+    }
+    stream.clear();
 
     Iso9660Image image{std::move(track), std::move(stream)};
+    image.sector_count_ = static_cast<std::uint32_t>(physical_sector_count -
+                                                     image.track_.index_lba);
     const auto descriptor = image.readSector(16);
     constexpr std::array magic{
         std::byte{'C'}, std::byte{'D'}, std::byte{'0'}, std::byte{'0'}, std::byte{'1'},
@@ -121,6 +139,38 @@ Iso9660Image Iso9660Image::open(const std::filesystem::path& cue_path) {
         throw core::Error{core::ErrorCode::invalid_format, "ISO9660 root record is not a directory"};
     }
     return image;
+}
+
+bool Iso9660Image::copyDataSector(
+    std::uint32_t lba,
+    std::span<std::byte, logical_sector_size> destination) noexcept {
+    if (lba >= sector_count_) {
+        return false;
+    }
+    try {
+        const auto sector = readSector(lba);
+        std::ranges::copy(sector, destination.begin());
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool Iso9660Image::copyRawSector(
+    std::uint32_t lba, std::span<std::byte, 2352U> destination) noexcept {
+    if (!hasRawSectors() || lba >= sector_count_) {
+        return false;
+    }
+    try {
+        const auto sector = readRawExtent(lba, 1U);
+        if (sector.size() != destination.size()) {
+            return false;
+        }
+        std::ranges::copy(sector, destination.begin());
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 std::array<std::byte, Iso9660Image::logical_sector_size> Iso9660Image::readSector(std::uint32_t lba) {

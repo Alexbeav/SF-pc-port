@@ -498,9 +498,6 @@ bool LegacyGameplayVm::acknowledgeCdRomInterrupt(
 
 bool LegacyGameplayVm::dispatchCdRomReadyCallback() {
   constexpr std::uint8_t data_ready_interrupt = 1U;
-  constexpr std::uint32_t ready_callback_address = 0x80114cc4U;
-  constexpr std::uint32_t ready_result_address = 0x80125450U;
-  constexpr std::uint32_t ready_state_address = 0x80114f9dU;
 
   const auto cdrom = machine_.cdrom().captureState();
   const auto interrupt =
@@ -528,10 +525,17 @@ bool LegacyGameplayVm::dispatchCdRomReadyCallback() {
   }
 
   std::uint32_t callback{};
-  if (!runtime_.read32(ready_callback_address, callback) ||
-      !acknowledgeCdRomInterrupt(data_ready_interrupt) ||
-      !runtime_.loadBytes(ready_result_address, result) ||
-      !runtime_.write8(ready_state_address, data_ready_interrupt)) {
+  if (cd_ready_callback_is_pointer_) {
+    if (!runtime_.read32(cd_ready_callback_address_, callback)) {
+      return false;
+    }
+  } else {
+    callback = cd_ready_callback_address_;
+  }
+  if (!acknowledgeCdRomInterrupt(data_ready_interrupt) ||
+      !runtime_.loadBytes(cd_ready_result_address_, result) ||
+      (cd_ready_state_address_ != 0U &&
+       !runtime_.write8(cd_ready_state_address_, data_ready_interrupt))) {
     return false;
   }
   // The native 120 Hz scheduler owns hardware time. Running this HLE callback
@@ -546,9 +550,22 @@ bool LegacyGameplayVm::dispatchCdRomReadyCallback() {
   const auto callback_result = invokeFrameCall(
       callback,
       std::array{static_cast<std::uint32_t>(data_ready_interrupt),
-                 ready_result_address},
+                 cd_ready_result_address_},
       5'000'000U);
   return callback_result.completed();
+}
+
+void LegacyGameplayVm::bindPsxCdReadyCallback(
+    std::uint32_t callback_address, std::uint32_t result_address,
+    std::uint32_t state_address, bool callback_is_pointer) noexcept {
+  cd_ready_callback_address_ = callback_address;
+  cd_ready_result_address_ = result_address;
+  cd_ready_state_address_ = state_address;
+  cd_ready_callback_is_pointer_ = callback_is_pointer;
+}
+
+bool LegacyGameplayVm::servicePsxCdReadyCallback() {
+  return dispatchCdRomReadyCallback();
 }
 
 void LegacyGameplayVm::recoverCdRomTransfer() noexcept {
@@ -759,6 +776,33 @@ LegacyGameplayVm::findHostCall(std::uint32_t address) const noexcept {
   return const_cast<LegacyGameplayVm *>(this)->findHostCall(address);
 }
 
+bool LegacyGameplayVm::servicePsxBiosSyscall(
+    const psx::R3000RunResult &execution) noexcept {
+  if (execution.reason != psx::R3000StopReason::syscall) {
+    return false;
+  }
+  constexpr std::uint32_t enter_critical_section = 1U;
+  constexpr std::uint32_t exit_critical_section = 2U;
+  constexpr std::uint32_t current_interrupt_enable = 1U;
+  constexpr std::uint32_t hardware_interrupt_mask = 1U << 10U;
+  auto state = runtime_.state();
+  const auto service = state.gpr[4U];
+  if (service == enter_critical_section) {
+    const auto was_enabled =
+        (state.cop0_status &
+         (current_interrupt_enable | hardware_interrupt_mask)) ==
+        (current_interrupt_enable | hardware_interrupt_mask);
+    state.cop0_status &= ~(current_interrupt_enable | hardware_interrupt_mask);
+    state.gpr[2U] = was_enabled ? 1U : 0U;
+  } else if (service == exit_critical_section) {
+    state.cop0_status |= current_interrupt_enable | hardware_interrupt_mask;
+  } else {
+    return false;
+  }
+  runtime_.restoreCpuState(state);
+  return true;
+}
+
 void LegacyGameplayVm::bindPsxBiosRandomCalls() {
   constexpr std::uint32_t random_address = 0xbfc02200U;
   constexpr std::uint32_t seed_random_address = 0xbfc02230U;
@@ -776,6 +820,290 @@ void LegacyGameplayVm::bindPsxBiosRandomCalls() {
   bindHostCall(seed_random_address, [](LegacyHostCallContext &context) {
     static_cast<void>(
         context.write32(random_seed_address, context.argument(0)));
+  });
+}
+
+void LegacyGameplayVm::bindPsxBiosCoreVector() {
+  constexpr std::uint32_t bios_a0_vector = 0x000000a0U;
+  constexpr std::uint32_t bios_b0_vector = 0x000000b0U;
+  constexpr std::uint32_t bios_c0_vector = 0x000000c0U;
+  constexpr std::uint32_t setjmp_call = 0x13U;
+  constexpr std::uint32_t strcmp_call = 0x17U;
+  constexpr std::uint32_t strcpy_call = 0x19U;
+  constexpr std::uint32_t strlen_call = 0x1bU;
+  constexpr std::uint32_t strchr_call = 0x1eU;
+  constexpr std::uint32_t strrchr_call = 0x1fU;
+  constexpr std::uint32_t bzero_call = 0x28U;
+  constexpr std::uint32_t memcpy_call = 0x2aU;
+  constexpr std::uint32_t memset_call = 0x2bU;
+  constexpr std::uint32_t initialize_heap_call = 0x39U;
+  constexpr std::uint32_t printf_call = 0x3fU;
+  constexpr std::uint32_t flush_cache_call = 0x44U;
+  constexpr std::uint32_t send_gp1_command_call = 0x48U;
+  constexpr std::uint32_t send_gp0_command_call = 0x49U;
+  constexpr std::uint32_t initialize_card_driver_call = 0x70U;
+  constexpr std::uint32_t remove_cdrom_driver_call = 0x72U;
+  bindHostCall(bios_a0_vector, [](LegacyHostCallContext &context) {
+    const auto call = context.registerValue(9U);
+    if (call == initialize_heap_call || call == printf_call ||
+        call == flush_cache_call || call == initialize_card_driver_call ||
+        call == remove_cdrom_driver_call) {
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == send_gp1_command_call || call == send_gp0_command_call) {
+      constexpr std::uint32_t gpu_gp0 = 0x1f801810U;
+      constexpr std::uint32_t gpu_gp1 = 0x1f801814U;
+      const auto port = call == send_gp1_command_call ? gpu_gp1 : gpu_gp0;
+      if (!context.write32(port, context.argument(0))) {
+        context.rejectHostCall();
+        return;
+      }
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == bzero_call) {
+      const auto destination = context.argument(0);
+      const auto size = context.argument(1);
+      if (size > psx::R3000Runtime::ram_size) {
+        context.rejectHostCall();
+        return;
+      }
+      const std::vector<std::byte> bytes(size, std::byte{});
+      if (!context.writeBytes(destination, bytes)) {
+        context.rejectHostCall();
+        return;
+      }
+      context.setReturnValue(destination);
+      return;
+    }
+    if (call == memcpy_call || call == memset_call) {
+      const auto destination = context.argument(0);
+      const auto size = context.argument(2);
+      if (size > psx::R3000Runtime::ram_size) {
+        context.rejectHostCall();
+        return;
+      }
+      std::vector<std::byte> bytes(size);
+      if (call == memcpy_call) {
+        if (!context.readBytes(context.argument(1), bytes)) {
+          context.rejectHostCall();
+          return;
+        }
+      } else {
+        std::ranges::fill(bytes,
+                          static_cast<std::byte>(context.argument(1) & 0xffU));
+      }
+      if (!context.writeBytes(destination, bytes)) {
+        context.rejectHostCall();
+        return;
+      }
+      context.setReturnValue(destination);
+      return;
+    }
+    if (call == setjmp_call) {
+      const auto destination = context.argument(0);
+      constexpr std::array saved_registers{
+          31U, 29U, 30U, 16U, 17U, 18U, 19U, 20U, 21U, 22U, 23U, 28U,
+      };
+      for (std::size_t index = 0U; index < saved_registers.size(); ++index) {
+        if (!context.write32(destination +
+                                 static_cast<std::uint32_t>(index * 4U),
+                             context.registerValue(saved_registers[index]))) {
+          context.rejectHostCall();
+          return;
+        }
+      }
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == strcmp_call) {
+      const auto left_address = context.argument(0);
+      const auto right_address = context.argument(1);
+      for (std::uint32_t index = 0U; index < psx::R3000Runtime::ram_size;
+           ++index) {
+        std::uint8_t left{};
+        std::uint8_t right{};
+        if (!context.read8(left_address + index, left) ||
+            !context.read8(right_address + index, right)) {
+          context.rejectHostCall();
+          return;
+        }
+        if (left != right || left == 0U) {
+          context.setReturnValue(
+              static_cast<std::uint32_t>(static_cast<std::int32_t>(left) -
+                                         static_cast<std::int32_t>(right)));
+          return;
+        }
+      }
+      context.rejectHostCall();
+      return;
+    }
+    if (call == strcpy_call) {
+      const auto destination = context.argument(0);
+      const auto source = context.argument(1);
+      std::vector<std::byte> bytes;
+      bytes.reserve(256U);
+      for (std::uint32_t index = 0U; index < psx::R3000Runtime::ram_size;
+           ++index) {
+        std::uint8_t value{};
+        if (!context.read8(source + index, value)) {
+          context.rejectHostCall();
+          return;
+        }
+        bytes.push_back(static_cast<std::byte>(value));
+        if (value == 0U) {
+          if (!context.writeBytes(destination, bytes)) {
+            context.rejectHostCall();
+            return;
+          }
+          context.setReturnValue(destination);
+          return;
+        }
+      }
+      context.rejectHostCall();
+      return;
+    }
+    if (call == strchr_call || call == strrchr_call) {
+      const auto string_address = context.argument(0);
+      const auto character =
+          static_cast<std::uint8_t>(context.argument(1) & 0xffU);
+      auto last_match = std::uint32_t{};
+      for (std::uint32_t index = 0U; index < psx::R3000Runtime::ram_size;
+           ++index) {
+        std::uint8_t value{};
+        if (!context.read8(string_address + index, value)) {
+          context.rejectHostCall();
+          return;
+        }
+        if (value == character) {
+          last_match = string_address + index;
+          if (call == strchr_call) {
+            context.setReturnValue(last_match);
+            return;
+          }
+        }
+        if (value == 0U) {
+          context.setReturnValue(last_match);
+          return;
+        }
+      }
+      context.rejectHostCall();
+      return;
+    }
+    if (call != strlen_call) {
+      context.rejectHostCall();
+      return;
+    }
+    const auto string_address = context.argument(0);
+    for (std::uint32_t length = 0U; length < psx::R3000Runtime::ram_size;
+         ++length) {
+      std::uint8_t value{};
+      if (!context.read8(string_address + length, value)) {
+        context.rejectHostCall();
+        return;
+      }
+      if (value == 0U) {
+        context.setReturnValue(length);
+        return;
+      }
+    }
+    context.rejectHostCall();
+  });
+  bindHostCall(bios_b0_vector, [](LegacyHostCallContext &context) {
+    constexpr std::uint32_t deliver_event_call = 0x07U;
+    constexpr std::uint32_t open_event_call = 0x08U;
+    constexpr std::uint32_t close_event_call = 0x09U;
+    constexpr std::uint32_t wait_event_call = 0x0aU;
+    constexpr std::uint32_t test_event_call = 0x0bU;
+    constexpr std::uint32_t enable_event_call = 0x0cU;
+    constexpr std::uint32_t disable_event_call = 0x0dU;
+    constexpr std::uint32_t hook_entry_interrupt_call = 0x19U;
+    constexpr std::uint32_t undeliver_event_call = 0x20U;
+    constexpr std::uint32_t puts_call = 0x3fU;
+    constexpr std::uint32_t init_card_call = 0x4aU;
+    constexpr std::uint32_t start_card_call = 0x4bU;
+    constexpr std::uint32_t stop_card_call = 0x4cU;
+    constexpr std::uint32_t get_c0_table_call = 0x56U;
+    constexpr std::uint32_t get_b0_table_call = 0x57U;
+    constexpr std::uint32_t change_clear_pad_call = 0x5bU;
+    const auto call = context.registerValue(9U);
+    if (call == open_event_call) {
+      // Bootstrap uses callback events for memory-card and CD services. The
+      // host owns their eventual delivery, but callers still require a stable
+      // BIOS-shaped descriptor for EnableEvent/CloseEvent.
+      const auto descriptor =
+          0xf1000000U |
+          ((context.argument(0) ^ context.argument(1)) & 0x0000ffffU);
+      context.setReturnValue(descriptor);
+      return;
+    }
+    if (call == close_event_call || call == enable_event_call ||
+        call == disable_event_call) {
+      context.setReturnValue(1U);
+      return;
+    }
+    if (call == deliver_event_call || call == undeliver_event_call ||
+        call == wait_event_call || call == test_event_call) {
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == hook_entry_interrupt_call) {
+      // The host scheduler owns exception entry. Retail still installs its
+      // jmp_buf during bootstrap, but no native interrupt may longjmp through
+      // that guest buffer.
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == get_c0_table_call || call == get_b0_table_call) {
+      // Late retail titles compare and patch instructions in Sony's resident
+      // exception handler. HLE owns that handler, so returning an empty table
+      // deliberately fails the signature check and leaves guest patches
+      // unapplied.
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == puts_call || call == init_card_call ||
+        call == start_card_call || call == stop_card_call) {
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call == change_clear_pad_call) {
+      constexpr std::uint32_t clear_pad_state = 0x00008914U;
+      std::uint32_t previous{};
+      if (!context.read32(clear_pad_state, previous) ||
+          !context.write32(clear_pad_state, context.argument(0))) {
+        context.rejectHostCall();
+        return;
+      }
+      context.setReturnValue(previous);
+      return;
+    }
+    context.rejectHostCall();
+  });
+  bindHostCall(bios_c0_vector, [this](LegacyHostCallContext &context) {
+    constexpr std::uint32_t enqueue_interrupt_handler_call = 0x02U;
+    constexpr std::uint32_t dequeue_interrupt_handler_call = 0x03U;
+    constexpr std::uint32_t change_clear_root_counter_call = 0x0aU;
+    const auto call = context.registerValue(9U);
+    if (call == enqueue_interrupt_handler_call ||
+        call == dequeue_interrupt_handler_call) {
+      context.setReturnValue(0U);
+      return;
+    }
+    if (call != change_clear_root_counter_call) {
+      context.rejectHostCall();
+      return;
+    }
+    const auto counter = context.argument(0);
+    if (counter >= bios_clear_root_counter_flags_.size()) {
+      context.setReturnValue(0U);
+      return;
+    }
+    const auto previous = bios_clear_root_counter_flags_[counter];
+    bios_clear_root_counter_flags_[counter] =
+        context.argument(1) == 0U ? 0U : 1U;
+    context.setReturnValue(previous);
   });
 }
 
@@ -973,7 +1301,13 @@ void LegacyGameplayVm::bindPsxLibcStringCalls() {
 void LegacyGameplayVm::bindPsxVideoTimingCall() {
   constexpr std::uint32_t vsync_address = 0x800e3f54U;
   constexpr std::uint32_t retrace_counter_address = 0x8010f378U;
-  bindHostCall(vsync_address, [this](LegacyHostCallContext &context) {
+  bindPsxVideoTimingCall(vsync_address, retrace_counter_address);
+}
+
+void LegacyGameplayVm::bindPsxVideoTimingCall(
+    std::uint32_t vsync_address, std::uint32_t retrace_counter_address) {
+  bindHostCall(vsync_address, [this, retrace_counter_address](
+                                  LegacyHostCallContext &context) {
     std::uint32_t counter{};
     if (!context.read32(retrace_counter_address, counter)) {
       context.rejectHostCall();
@@ -1007,6 +1341,80 @@ void LegacyGameplayVm::bindPsxVideoTimingCall() {
     }
     video_timing_baseline_ = counter;
     context.setReturnValue(elapsed);
+  });
+}
+
+void LegacyGameplayVm::bindPsxCdPendingCommandCall(
+    std::uint32_t address, std::uint32_t state_address,
+    std::uint32_t response_pointer_address,
+    std::uint32_t completion_state_address) {
+  bindHostCall(
+      address, [state_address, response_pointer_address,
+                completion_state_address](LegacyHostCallContext &context) {
+        constexpr std::uint32_t cdrom_base = 0x1f801800U;
+        std::uint16_t pending_command{};
+        std::uint8_t interrupt_flags{};
+        if (!context.read16(state_address, pending_command) ||
+            !context.write8(cdrom_base, 1U) ||
+            !context.read8(cdrom_base + 3U, interrupt_flags)) {
+          context.rejectHostCall();
+          return;
+        }
+        interrupt_flags = static_cast<std::uint8_t>(interrupt_flags & 0x07U);
+        if (interrupt_flags == 0U) {
+          if (!context.write8(cdrom_base, 0U)) {
+            context.rejectHostCall();
+            return;
+          }
+          context.setReturnValue(pending_command);
+          return;
+        }
+
+        std::uint8_t response{};
+        std::uint32_t response_pointer{};
+        if (!context.write8(cdrom_base, 0U) ||
+            !context.read8(cdrom_base + 1U, response) ||
+            !context.read32(response_pointer_address, response_pointer) ||
+            !context.write8(response_pointer, response) ||
+            !context.write8(cdrom_base, 1U) ||
+            !context.write8(cdrom_base + 3U, interrupt_flags)) {
+          context.rejectHostCall();
+          return;
+        }
+        if (!context.write8(cdrom_base, 0U) ||
+            !context.write16(state_address, 0U) ||
+            !context.write8(completion_state_address, 5U)) {
+          context.rejectHostCall();
+          return;
+        }
+        context.setReturnValue(0U);
+      });
+}
+
+void LegacyGameplayVm::bindPsxCdControlCall(std::uint32_t address) {
+  bindHostCall(address, [this](LegacyHostCallContext &context) {
+    const auto command = static_cast<std::uint8_t>(context.argument(0) & 0xffU);
+    auto parameter_count = std::size_t{};
+    if (command == 0x02U) {
+      parameter_count = 3U;
+    } else if (command == 0x0dU || command == 0x0eU) {
+      parameter_count = 1U;
+    }
+    std::array<std::uint8_t, 3U> parameters{};
+    for (std::size_t index = 0U; index < parameter_count; ++index) {
+      if (!context.read8(context.argument(1) +
+                             static_cast<std::uint32_t>(index),
+                         parameters[index])) {
+        context.rejectHostCall();
+        return;
+      }
+    }
+    const auto wait_for_completion = command == 0x09U || command == 0x0aU;
+    const auto succeeded = issueCdRomCommand(
+        command,
+        std::span<const std::uint8_t>{parameters}.first(parameter_count),
+        wait_for_completion);
+    context.setReturnValue(succeeded ? 0U : 0xffffffffU);
   });
 }
 
@@ -1487,6 +1895,7 @@ void LegacyGameplayVm::bindSyphonFilterUsaV11BootstrapPlatformCalls() {
   constexpr std::uint32_t bios_a0_vector = 0x000000a0U;
   bindHostCall(bios_a0_vector, [](LegacyHostCallContext &context) {
     constexpr std::uint32_t strcat_call = 0x15U;
+    constexpr std::uint32_t strlen_call = 0x1bU;
     constexpr std::uint32_t strchr_call = 0x1eU;
     constexpr std::uint32_t bzero_call = 0x28U;
     constexpr std::uint32_t random_call = 0x2fU;
@@ -1494,6 +1903,23 @@ void LegacyGameplayVm::bindSyphonFilterUsaV11BootstrapPlatformCalls() {
     constexpr std::uint32_t initialize_memory_card_devices_call = 0x70U;
     constexpr std::uint32_t random_seed_address = 0xa0009010U;
     const auto call = context.registerValue(9U);
+    if (call == strlen_call) {
+      const auto string_address = context.argument(0);
+      for (std::uint32_t length = 0U; length < psx::R3000Runtime::ram_size;
+           ++length) {
+        std::uint8_t value{};
+        if (!context.read8(string_address + length, value)) {
+          context.rejectHostCall();
+          return;
+        }
+        if (value == 0U) {
+          context.setReturnValue(length);
+          return;
+        }
+      }
+      context.rejectHostCall();
+      return;
+    }
     if (call == strcat_call) {
       const auto destination = context.argument(0);
       const auto source = context.argument(1);
@@ -6135,6 +6561,7 @@ LegacyGameplayVmSnapshot LegacyGameplayVm::captureSnapshot() const {
   std::ranges::copy(runtime_.scratchpad(), snapshot.scratchpad.begin());
   std::ranges::copy(runtime_.mmio(), snapshot.mmio.begin());
   snapshot.video_timing_baseline = video_timing_baseline_;
+  snapshot.bios_clear_root_counter_flags = bios_clear_root_counter_flags_;
   snapshot.audio_frame_tick = audio_frame_tick_;
   snapshot.interrupt_callbacks = interrupt_callbacks_;
   snapshot.attached_text_sources = attached_text_sources_;
@@ -6210,6 +6637,8 @@ bool LegacyGameplayVm::restoreSnapshot(
       snapshot.virtual_cd.has_value() != static_cast<bool>(virtual_cd_) ||
       !valid_attached_text_sources() || !valid_ui_messages() ||
       !valid_pending_actor_drops() || !validCpuSnapshot(snapshot.cpu) ||
+      !std::ranges::all_of(snapshot.bios_clear_root_counter_flags,
+                           [](std::uint32_t flag) { return flag <= 1U; }) ||
       !std::ranges::all_of(snapshot.interrupt_callbacks,
                            validInterruptCallback) ||
       (snapshot.audio_frame_tick_initialized
@@ -6233,6 +6662,7 @@ bool LegacyGameplayVm::restoreSnapshot(
     return false;
   }
   video_timing_baseline_ = snapshot.video_timing_baseline;
+  bios_clear_root_counter_flags_ = snapshot.bios_clear_root_counter_flags;
   audio_frame_tick_ = snapshot.audio_frame_tick;
   interrupt_callbacks_ = snapshot.interrupt_callbacks;
   video_timing_baseline_initialized_ =
@@ -6516,6 +6946,11 @@ LegacyGameplayVm::resumeCurrentPc(std::uint64_t execution_budget) {
   return runExecutionPump(std::nullopt, execution_budget);
 }
 
+LegacyGameplayVmResult
+LegacyGameplayVm::resumeCurrentPcClockNeutral(std::uint64_t execution_budget) {
+  return runExecutionPump(std::nullopt, execution_budget, false);
+}
+
 LegacyGameplayVmResult LegacyGameplayVm::runCurrentPcUntilHostBoundary(
     std::uint32_t boundary_address, std::uint64_t execution_budget) {
   return runExecutionPump(boundary_address, execution_budget);
@@ -6543,6 +6978,25 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
   const auto service_clock_neutral_dma = [&]() {
     return advance_guest_clock || machine_.completePendingDmaTransfers();
   };
+  const auto step_guest = [&]() {
+    if (advance_guest_clock) {
+      return machine_.step();
+    }
+    // Bootstrap/profile callbacks execute before guest exception tables are
+    // necessarily installed. Preserve the hardware I_STAT state for later,
+    // but suppress exception entry while this explicitly clock-neutral call
+    // runs.
+    runtime_.setExternalInterrupt(false);
+    return runtime_.step();
+  };
+  const auto service_bios_syscall = [&](const psx::R3000RunResult &execution) {
+    if (!servicePsxBiosSyscall(execution)) {
+      return false;
+    }
+    ++instructions;
+    ++host_calls;
+    return true;
+  };
 
   for (std::uint64_t operation = 0; operation < execution_budget; ++operation) {
     if (runtime_.atReturnSentinel()) {
@@ -6558,6 +7012,9 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
 
     if (advance_guest_clock && runtime_.interruptPending()) {
       auto execution = machine_.step();
+      if (service_bios_syscall(execution)) {
+        continue;
+      }
       if (execution.reason != psx::R3000StopReason::running) {
         execution.instructions = instructions;
         return LegacyGameplayVmResult{
@@ -6594,8 +7051,10 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
         };
       }
       if (context.continue_guest_instruction_) {
-        auto execution =
-            advance_guest_clock ? machine_.step() : runtime_.step();
+        auto execution = step_guest();
+        if (service_bios_syscall(execution)) {
+          continue;
+        }
         if (execution.reason != psx::R3000StopReason::running) {
           execution.instructions = instructions;
           return LegacyGameplayVmResult{
@@ -6633,7 +7092,10 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
       continue;
     }
 
-    auto execution = advance_guest_clock ? machine_.step() : runtime_.step();
+    auto execution = step_guest();
+    if (service_bios_syscall(execution)) {
+      continue;
+    }
     if (execution.reason != psx::R3000StopReason::running) {
       execution.instructions = instructions;
       return LegacyGameplayVmResult{

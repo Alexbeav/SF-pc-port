@@ -114,7 +114,6 @@ std::string_view pauseWeaponIcon(WeaponId id) noexcept {
   switch (id) {
   case WeaponId::silenced_9mm:
   case WeaponId::pistol_9mm:
-  case WeaponId::unused_357:
   case WeaponId::pistol_45:
   case WeaponId::g_18:
     return "GLOKSIL.TIM";

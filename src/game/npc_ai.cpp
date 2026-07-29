@@ -152,6 +152,7 @@ ActorMotion actorMotion(NpcLocomotion locomotion) noexcept {
 NpcCombatRange npcCombatRange(WeaponId weapon) noexcept {
     switch (weapon) {
     case WeaponId::unarmed:
+    case WeaponId::knife:
     case WeaponId::taser:
         return NpcCombatRange{180.0, 560.0};
     case WeaponId::combat_shotgun:

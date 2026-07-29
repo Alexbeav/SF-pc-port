@@ -1,0 +1,40 @@
+event,target,storage-level operation,confidence
+2,0x80082e74,invoke the mission actor-initialization callback,confirmed
+3,0x80082e7c,no operation,confirmed
+4,0x8008289c,deactivate actor through Actor_Deactivate,confirmed
+5,0x800828c8,activate actor through Actor_Activate,confirmed
+6,0x80082e7c,no operation,confirmed
+7,0x80082e7c,no operation,confirmed
+8,0x80082e7c,no operation,confirmed
+9,0x800824b8,invoke mission death hook then run actor death reaction,confirmed
+10,0x80082e7c,no operation,confirmed
+11,0x80082e7c,no operation,confirmed
+12,0x80082510,invoke mission damage hook then run actor damage reaction,confirmed
+13,0x80082e7c,no operation,confirmed
+14,0x80082e7c,no operation,confirmed
+15,0x80082e7c,no operation,confirmed
+16,0x80082e7c,no operation,confirmed
+17,0x80082e7c,no operation,confirmed
+18,0x80082e7c,no operation,confirmed
+19,0x80082e7c,no operation,confirmed
+20,0x80082e7c,no operation,confirmed
+21,0x80082e7c,no operation,confirmed
+22,0x80082e7c,no operation,confirmed
+23,0x80082e7c,no operation,confirmed
+24,0x8008255c,process actor interaction or hit request and dispatch authored follow-up events,strong
+25,0x80082e7c,no operation,confirmed
+26,0x80082e7c,no operation,confirmed
+27,0x80082e7c,no operation,confirmed
+28,0x80082e7c,no operation,confirmed
+29,0x80082e7c,no operation,confirmed
+30,0x800828f4,stop speech sourced from this actor clear speech flag and set state bit 0x2000,strong
+31,0x80082e7c,no operation,confirmed
+32,0x80082e7c,no operation,confirmed
+33,0x80082e7c,no operation,confirmed
+34,0x80082e7c,no operation,confirmed
+35,0x80082e7c,no operation,confirmed
+36,0x80082e7c,no operation,confirmed
+37,0x80082e7c,no operation,confirmed
+38,0x80082e7c,no operation,confirmed
+39,0x80082958,serialize actor state and runtime fields into the request record,confirmed
+40,0x80082b44,restore actor state and runtime fields from the request record,confirmed

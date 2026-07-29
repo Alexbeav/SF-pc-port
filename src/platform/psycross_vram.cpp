@@ -309,7 +309,8 @@ void uploadTimBlock(const assets::TimBlock &block) {
 }
 
 void uploadHudPixels(const assets::TimBlock &block) {
-  uploadTimBlockAt(block, hudResidentX(block.x), block.y);
+  const auto placement = hudResidentPlacement(block);
+  uploadTimBlockAt(block, placement.x, placement.y);
 }
 
 } // namespace sf::platform::detail

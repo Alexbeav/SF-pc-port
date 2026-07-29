@@ -46,6 +46,7 @@ add_library(sf_assets
     src/assets/level_layout.cpp
     src/assets/mission_briefing.cpp
     src/assets/mission_objects.cpp
+    src/assets/mission_script.cpp
     src/assets/tim_image.cpp
     src/assets/weapon_descriptions.cpp
 )
@@ -96,11 +97,14 @@ target_compile_features(sf_platform_input PUBLIC cxx_std_20)
 sf_set_project_warnings(sf_platform_input)
 
 add_library(sf_game
+    src/game/embedded_hog.cpp
     src/game/actor_animation.cpp
     src/game/campaign.cpp
     src/game/chase_camera.cpp
     src/game/combat.cpp
     src/game/dynamic_lighting.cpp
+    src/game/disc_cdrom_media.cpp
+    src/game/disc_info.cpp
     src/game/effects.cpp
     src/game/gameplay.cpp
     src/game/game_disc.cpp
@@ -120,6 +124,10 @@ add_library(sf_game
     src/game/player_controller.cpp
     src/game/retail_pause_map.cpp
     src/game/retail_cheats.cpp
+    src/game/runtime_profile.cpp
+    src/game/sf1_runtime.cpp
+    src/game/sf2_runtime.cpp
+    src/game/sf3_runtime.cpp
     src/game/state_stack.cpp
     src/game/supported_games.cpp
     src/game/system.cpp

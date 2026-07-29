@@ -913,13 +913,25 @@ public:
                                                      pad, previous_buttons);
     }
     detail::PsyCrossMissionStart mission_start;
-    previous_buttons =
-        mission_start.run(mission_, pad, previous_buttons, input_);
+    std::unique_ptr<game::GameplaySession> preloaded_gameplay;
+    std::unique_ptr<detail::PsyCrossAudioOutput> preloaded_audio;
+    if (mission_.gameId() == game::GameId::syphon_filter) {
+      previous_buttons =
+          mission_start.run(mission_, pad, previous_buttons, input_);
+      preloaded_gameplay = mission_start.takePreloadedGameplay();
+      preloaded_audio = mission_start.takePreloadedAudio();
+    } else {
+      // Sequel scene-test mode is the bring-up boundary: its mission data is
+      // already native, while briefing/audio guest callbacks are mapped
+      // separately. Enter the renderer directly so geometry and controls can
+      // be verified without pretending the SF1 transition VM is compatible.
+      preloaded_gameplay = std::make_unique<game::GameplaySession>(mission_);
+    }
     detail::PsyCrossSceneViewer scene_viewer{input_, cheats_};
     const auto result = scene_viewer.run(mission_, pad, previous_buttons,
                                          cue_path_, mission_.definition().index,
-                                         mission_start.takePreloadedGameplay(),
-                                         mission_start.takePreloadedAudio());
+                                         std::move(preloaded_gameplay),
+                                         std::move(preloaded_audio));
     if (result.reason == detail::SceneExitReason::mission_complete &&
         !mission_.endingMovie().path.empty()) {
       static_cast<void>(movie_player.playStandalone(mission_.endingMovie(), pad,

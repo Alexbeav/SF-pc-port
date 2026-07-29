@@ -40,6 +40,17 @@ class MissionPackage;
 
 using GameplayInput = PlayerInput;
 
+// BIN class IDs reserve their upper half for authored behavior flags. The
+// shared runtime dispatcher selects the actual object family from the low
+// 16 bits (for example 0x5000e and 0x1000e are both class-0x0e doors).
+[[nodiscard]] constexpr std::uint16_t
+missionObjectBaseClass(std::uint32_t class_id) noexcept {
+  return static_cast<std::uint16_t>(class_id);
+}
+
+// SF2/SF3 replaced the SF1 inventory slot order. Return only items represented
+// by the current native weapon model; unsupported tools remain authored
+// mission items rather than being silently changed into another weapon.
 struct GameplayAudioVolumes {
   static constexpr std::uint8_t maximum = 100U;
 
@@ -683,6 +694,10 @@ public:
   [[nodiscard]] std::span<const GameplayEffect> effects() const noexcept {
     return effects_;
   }
+  [[nodiscard]] std::span<const LegacyDroppedItemBridgeState>
+  nativeDroppedItems() const noexcept {
+    return native_dropped_items_;
+  }
   [[nodiscard]] std::span<const LegacyExplParticle>
   legacyExplParticles() const noexcept {
     return legacy_expl_particles_;
@@ -763,6 +778,13 @@ public:
     return hud_.vitals().health != 0U;
   }
   [[nodiscard]] bool missionFailed() const noexcept { return mission_failed_; }
+  [[nodiscard]] std::optional<unsigned int>
+  nativeMissionTimerSeconds() const noexcept {
+    if (!native_mission_timer_updates_remaining_) {
+      return std::nullopt;
+    }
+    return (*native_mission_timer_updates_remaining_ + 19U) / 20U;
+  }
   [[nodiscard]] bool failureRestartRequested() const noexcept {
     return legacy_failure_restart_requested_;
   }
@@ -847,6 +869,7 @@ public:
 
 private:
   friend class G4CampaignTransitionProbeAccess;
+  friend class Sf2NativeMissionProbeAccess;
 
   struct GuestWeaponRequest {
     std::optional<WeaponId> direct_weapon;
@@ -882,10 +905,15 @@ private:
                             std::uint16_t owner_object = 0U) noexcept;
   void updateEffects() noexcept;
   void damageNpc(std::uint16_t target, std::uint16_t damage,
-                 WeaponDamageKind kind, bool headshot = false) noexcept;
+                 WeaponDamageKind kind, bool headshot = false,
+                 bool by_player = true,
+                 std::optional<std::uint16_t> attacker = std::nullopt) noexcept;
   void updateNpcs(bool player_fired, bool player_rolled) noexcept;
   void updateMissionScripts(bool interact) noexcept;
   void updateScriptedObjects() noexcept;
+  void configureNativeMissionStart() noexcept;
+  void updateNativeMissionItems() noexcept;
+  void updateNativeMissionInteractions(const GameplayInput &input) noexcept;
   void updateCinematic();
   [[nodiscard]] bool legacyMissionAuthoritative() const noexcept;
   void stageNativeChaseFreelook(const GameplayInput &input);
@@ -998,6 +1026,9 @@ private:
   std::uint32_t legacy_parameter_mask_{};
   std::vector<LegacyUiMessageBridgeState> legacy_ui_messages_;
   std::optional<LegacyUiTimerBridgeState> legacy_ui_timer_;
+  std::optional<unsigned int> native_mission_timer_updates_remaining_;
+  std::vector<bool> native_collected_sources_;
+  std::vector<LegacyDroppedItemBridgeState> native_dropped_items_;
   bool legacy_mission_bridge_active_{};
   std::optional<LegacyNativePoint> legacy_player_guest_motion_position_;
   std::optional<std::array<std::int16_t, 9U>> legacy_player_guest_rotation_;

@@ -14,7 +14,6 @@ constexpr std::size_t resident_size = 16;
 constexpr std::size_t model_count_offset = 0x88;
 constexpr std::size_t initial_room_offset = 0x8c;
 constexpr std::size_t visibility_offset = 0x90;
-constexpr std::size_t visibility_entry_size = 15;
 constexpr std::uint8_t prefetch_marker = 0xfe;
 constexpr std::uint8_t end_marker = 0xff;
 
@@ -60,9 +59,11 @@ LevelLayout::LevelLayout(
 
 LevelLayout LevelLayout::parse(
     std::span<const std::byte> bytes,
-    std::size_t expected_model_count) {
+    std::size_t expected_model_count,
+    std::size_t visibility_entry_size) {
     const auto model_count = static_cast<std::size_t>(readLe32(bytes, model_count_offset));
-    if (model_count == 0 || model_count >= prefetch_marker ||
+    if ((visibility_entry_size != 15U && visibility_entry_size != 16U) ||
+        model_count == 0 || model_count >= prefetch_marker ||
         model_count != expected_model_count ||
         model_count > (std::numeric_limits<std::size_t>::max() - visibility_offset) /
             visibility_entry_size ||
@@ -76,11 +77,9 @@ LevelLayout LevelLayout::parse(
     }
 
     std::vector<std::uint16_t> resident_models;
-    bool resident_terminated = false;
     for (std::size_t index = 0; index < resident_size; ++index) {
         const auto value = readByte(bytes, resident_offset + index);
         if (value == end_marker) {
-            resident_terminated = true;
             break;
         }
         if (value == prefetch_marker) {
@@ -88,9 +87,8 @@ LevelLayout LevelLayout::parse(
         }
         addModel(resident_models, value, model_count, initial_room_value);
     }
-    if (!resident_terminated) {
-        throw core::Error{core::ErrorCode::invalid_format, "Resident model list is unterminated"};
-    }
+    // The resident table is fixed-width. Most levels terminate a shorter
+    // list with 0xff, while SF2 SLUMS legitimately occupies all 16 slots.
 
     std::vector<LevelVisibility> rooms(model_count);
     for (std::size_t room = 0; room < model_count; ++room) {

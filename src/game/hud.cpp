@@ -21,8 +21,6 @@ weaponIcon(std::string_view first = {}, std::string_view second = {},
 
 constexpr std::array<std::string_view, 2U> pistol_9mm_pickup_layers{
     "PISTOL2A.TIM", "PISTOL2B.TIM"};
-constexpr std::array<std::string_view, 2U> unused_357_pickup_layers{
-    "PISTOL3A.TIM", "PISTOL3B.TIM"};
 constexpr std::array<std::string_view, 2U> flamethrower_pickup_layers{
     "FLAKA.TIM", "FLAKB.TIM"};
 constexpr std::array<std::string_view, 1U> armor_pickup_layers{"VEST2.TIM"};
@@ -35,7 +33,7 @@ constexpr std::array weapon_definitions{
                      true},
     WeaponDefinition{WeaponId::pistol_9mm, "9mm", weaponIcon(), 15U, 5U, true,
                      true},
-    WeaponDefinition{WeaponId::unused_357, ".357", weaponIcon(), 0U, 0U, false,
+    WeaponDefinition{WeaponId::knife, "Knife", weaponIcon(), 0U, 0U, false,
                      false},
     WeaponDefinition{WeaponId::pistol_45, ".45",
                      weaponIcon("PISTOL4A.TIM", "PISTOL4B.TIM"), 10U, 5U, true,
@@ -493,8 +491,6 @@ droppedItemIconLayers(std::uint16_t item) noexcept {
   switch (static_cast<WeaponId>(item)) {
   case WeaponId::pistol_9mm:
     return pistol_9mm_pickup_layers;
-  case WeaponId::unused_357:
-    return unused_357_pickup_layers;
   case WeaponId::flamethrower:
     return flamethrower_pickup_layers;
   default:
@@ -504,9 +500,14 @@ droppedItemIconLayers(std::uint16_t item) noexcept {
 
 PlayerInventory::PlayerInventory() { resetFirstMission(); }
 
-void PlayerInventory::resetFirstMission() noexcept {
+void PlayerInventory::resetUnarmed() noexcept {
   states_.fill({});
   states_[indexOf(WeaponId::unarmed)].owned = true;
+  current_ = WeaponId::unarmed;
+}
+
+void PlayerInventory::resetFirstMission() noexcept {
+  resetUnarmed();
   grant(WeaponId::silenced_9mm, 15U, 45U);
   grant(WeaponId::taser, 1U, 0U);
   grant(WeaponId::flashlight, 0U, 0U);
@@ -534,6 +535,36 @@ void PlayerInventory::grant(WeaponId id, std::uint16_t magazine,
       definition->reserve_magazines;
   item.reserve = static_cast<std::uint16_t>(
       std::min<std::uint32_t>(reserve, maximum_reserve));
+}
+
+void PlayerInventory::acquire(WeaponId id, std::uint16_t magazine,
+                              std::uint16_t reserve) noexcept {
+  const auto *definition = tryWeaponDefinition(id);
+  if (definition == nullptr) {
+    return;
+  }
+  auto &item = states_[indexOf(id)];
+  if (!item.owned) {
+    grant(id, magazine, reserve);
+    return;
+  }
+  if (!definition->uses_ammo) {
+    item.magazine =
+        definition->magazine_capacity == 0U
+            ? 0U
+            : static_cast<std::uint16_t>(std::min<std::uint32_t>(
+                  static_cast<std::uint32_t>(item.magazine) + magazine,
+                  definition->magazine_capacity));
+    return;
+  }
+  item.magazine = static_cast<std::uint16_t>(std::min<std::uint32_t>(
+      static_cast<std::uint32_t>(item.magazine) + magazine,
+      definition->magazine_capacity));
+  const auto maximum_reserve =
+      static_cast<std::uint32_t>(definition->magazine_capacity) *
+      definition->reserve_magazines;
+  item.reserve = static_cast<std::uint16_t>(std::min<std::uint32_t>(
+      static_cast<std::uint32_t>(item.reserve) + reserve, maximum_reserve));
 }
 
 void PlayerInventory::remove(WeaponId id) noexcept {

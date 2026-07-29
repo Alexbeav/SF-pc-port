@@ -12,7 +12,12 @@ constexpr std::uint32_t interrupt_base = 0x1f801070U;
 constexpr std::uint32_t dma_base = 0x1f801080U;
 constexpr std::uint32_t timer_base = 0x1f801100U;
 constexpr std::uint32_t cdrom_base = 0x1f801800U;
+constexpr std::uint32_t gpu_gp0 = 0x1f801810U;
+constexpr std::uint32_t gpu_gp1 = 0x1f801814U;
 constexpr std::uint32_t spu_base = 0x1f801c00U;
+// Native presentation owns rasterization, but retail code still polls the
+// command-ready bits while initializing PsyQ's graphics layer.
+constexpr std::uint32_t native_gpu_status = 0x14802000U;
 constexpr std::uint32_t ram_address_mask =
     static_cast<std::uint32_t>(R3000Runtime::ram_size - 1U);
 constexpr std::uint64_t maximum_dma_words = 16U * 1024U * 1024U;
@@ -86,6 +91,7 @@ PsxMachine::PsxMachine(R3000Runtime &cpu, CpuClockScale cpu_clock_scale)
   cpu_clock_scale_.denominator /= divisor;
   cpu_.attachMmioBus(this);
   cdrom_.setXaAudioSink(this);
+  dma_ports_[channelIndex(DmaChannel::gpu)] = &native_gpu_dma_port_;
   dma_ports_[channelIndex(DmaChannel::spu)] = &spu_dma_port_;
   reset();
 }
@@ -516,6 +522,8 @@ bool PsxMachine::readMmio(std::uint32_t physical_address,
     register_value = interrupts_.status();
   } else if (aligned == interrupt_base + 4U) {
     register_value = interrupts_.mask();
+  } else if (aligned == gpu_gp1) {
+    register_value = native_gpu_status;
   } else if (aligned >= dma_base &&
              aligned < dma_base + DmaController::register_span) {
     if (!dma_.readRegister(aligned - dma_base, register_value)) {
@@ -625,6 +633,9 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
   } else if (aligned == interrupt_base + 4U) {
     interrupts_.writeMask(static_cast<std::uint16_t>(placed_value),
                           static_cast<std::uint16_t>(write_mask));
+  } else if (aligned == gpu_gp0 || aligned == gpu_gp1) {
+    // The native renderer consumes ordering-table state separately. Accept
+    // command writes here so the guest observes a permanently ready GPU.
   } else if (aligned >= dma_base &&
              aligned < dma_base + DmaController::register_span) {
     std::array<std::uint64_t, DmaController::channel_count> previous_tokens{};

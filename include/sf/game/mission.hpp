@@ -5,11 +5,15 @@
 #include "sf/assets/level_layout.hpp"
 #include "sf/assets/mission_briefing.hpp"
 #include "sf/assets/mission_objects.hpp"
+#include "sf/assets/mission_script.hpp"
 #include "sf/game/disc_movie.hpp"
 #include "sf/game/legacy_mission_image.hpp"
+#include "sf/game/runtime_profile.hpp"
+#include "sf/game/supported_games.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -35,6 +39,8 @@ struct MissionDefinition {
 
 [[nodiscard]] std::span<const MissionDefinition> missionCatalog() noexcept;
 [[nodiscard]] const MissionDefinition &missionDefinition(std::uint32_t index);
+[[nodiscard]] const MissionDefinition &missionDefinition(
+    GameId game, std::uint32_t index);
 [[nodiscard]] std::span<const std::string_view>
 missionScriptedMoviePaths(std::uint32_t index) noexcept;
 
@@ -45,6 +51,10 @@ public:
 
   [[nodiscard]] const MissionDefinition &definition() const noexcept {
     return definition_;
+  }
+  [[nodiscard]] GameId gameId() const noexcept { return game_id_; }
+  [[nodiscard]] const GameRuntimeProfile &runtimeProfile() const {
+    return game::runtimeProfile(game_id_);
   }
   [[nodiscard]] const assets::MissionBriefing &briefing() const noexcept {
     return briefing_;
@@ -57,6 +67,10 @@ public:
   }
   [[nodiscard]] const LegacyMissionImage &legacyImage() const noexcept {
     return legacy_image_;
+  }
+  [[nodiscard]] const std::optional<assets::MissionScriptArchive> &
+  missionScripts() const noexcept {
+    return mission_scripts_;
   }
   [[nodiscard]] DiscMovie &openingMovie() noexcept { return opening_movie_; }
   [[nodiscard]] std::span<const DiscMovie> scriptedMovies() const noexcept {
@@ -102,8 +116,10 @@ public:
 
 private:
   MissionPackage(
-      MissionDefinition definition, assets::MissionBriefing briefing,
+      GameId game_id, MissionDefinition definition,
+      assets::MissionBriefing briefing,
       bool has_retail_briefing, assets::FogArchive archive,
+      std::optional<assets::MissionScriptArchive> mission_scripts,
       LegacyMissionImage legacy_image, DiscMovie opening_movie,
       std::vector<DiscMovie> scripted_movies, DiscMovie ending_movie,
       assets::HogArchive world_models, assets::HogArchive object_models,
@@ -112,10 +128,12 @@ private:
       std::vector<assets::HogArchive> texture_banks, assets::LevelLayout layout,
       assets::MissionObjects objects, std::size_t texture_file_count);
 
+  GameId game_id_{GameId::syphon_filter};
   MissionDefinition definition_;
   assets::MissionBriefing briefing_;
   bool has_retail_briefing_{};
   assets::FogArchive archive_;
+  std::optional<assets::MissionScriptArchive> mission_scripts_;
   LegacyMissionImage legacy_image_;
   DiscMovie opening_movie_;
   std::vector<DiscMovie> scripted_movies_;

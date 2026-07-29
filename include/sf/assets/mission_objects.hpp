@@ -34,6 +34,12 @@ struct MissionObject {
     // objects, switches for elevators/gates and invisible triggers for their
     // authored event target. -1 means that the object owns the event itself.
     std::int32_t linked_object{-1};
+    // Raw class-handler parameters retained at the tail of each 0x4c-byte
+    // retail object record. Their meanings are class-specific; for example,
+    // the shared sequel event handler reads parameter 3 (+0x48) as another
+    // object index and reads +0x4a as its authored state/event selector.
+    std::array<std::int16_t, 4> handler_parameters{};
+    std::int16_t handler_state{};
     std::vector<MissionPathPoint> patrol_path;
     bool patrol_path_loops{};
     std::uint8_t patrol_loop_start{};

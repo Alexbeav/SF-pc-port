@@ -4,6 +4,7 @@
 #include "sf/game/legacy_first_mission_runtime.hpp"
 #include "sf/game/legacy_presentation_bridge.hpp"
 #include "sf/game/mission.hpp"
+#include "sf/game/sf2_runtime.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,8 +25,7 @@ namespace {
 constexpr double maximum_ground_step = 160.0;
 constexpr double minimum_floor_normal = 0.60;
 constexpr double maximum_wall_normal_y = 0.45;
-constexpr double player_radius = 58.0;
-constexpr double player_height = 390.0;
+constexpr double actor_avoidance_radius = 58.0;
 constexpr double maximum_target_distance = npc_maximum_sight_distance;
 constexpr double actor_target_radius = 145.0;
 constexpr double actor_target_height = 185.0;
@@ -161,6 +161,8 @@ constexpr std::int16_t legacyDamageReaction(WeaponDamageKind kind) noexcept {
     return 0x10;
   case WeaponDamageKind::gas:
     return 0x12;
+  case WeaponDamageKind::melee:
+    return 0x0f;
   case WeaponDamageKind::none:
     return 0;
   }
@@ -264,7 +266,8 @@ NpcBehavior legacyBridgedBehavior(const LegacyObjectBridgeState &guest,
 }
 
 bool solidMissionObject(std::uint32_t class_id) noexcept {
-  switch (class_id) {
+  switch (missionObjectBaseClass(class_id)) {
+  case 0x0eU: // SF2/SF3 doors (upper bits are behavior flags)
   case 0x11U: // gas pipe
   case 0x2cU: // police cars
   case 0x2fU: // pipe sections
@@ -867,7 +870,15 @@ std::optional<ActorAimHit> actorAimHit(const ActorAimRay &ray, double actor_x,
 
 GameplaySession::GameplaySession(const MissionPackage &mission,
                                  LoadProgressCallback load_progress)
-    : mission_(mission) {
+    : mission_(mission),
+      player_controller_(
+          ChaseCameraConfiguration{},
+          FirstPersonCameraConfiguration{
+              .eye_height = mission.runtimeProfile().first_person_eye_height,
+          }) {
+  const auto &runtime = mission.runtimeProfile();
+  const auto emd_vertex_index_stride = runtime.emd_vertex_index_stride;
+  const auto hmd_vertex_index_stride = runtime.hmd_vertex_index_stride;
   const auto report_load = [&](std::uint8_t percent) {
     if (load_progress) {
       load_progress(percent);
@@ -877,7 +888,8 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
   const auto &archive = mission.worldModels();
   models_.reserve(archive.entries().size());
   for (const auto &entry : archive.entries()) {
-    auto scene = assets::EmdScene::parse(archive.file(entry.name));
+    auto scene = assets::EmdScene::parse(archive.file(entry.name),
+                                         emd_vertex_index_stride);
     auto bounds = findBounds(scene);
     models_.push_back(WorldModel{entry.name, std::move(scene), bounds});
   }
@@ -911,14 +923,20 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
                                            &assets::HogEntry::name);
       scrim != mission.objectModels().entries().end()) {
     detached_scrim_ =
-        assets::EmdScene::parse(mission.objectModels().file(scrim->name));
+        assets::EmdScene::parse(mission.objectModels().file(scrim->name),
+                                emd_vertex_index_stride);
   }
   std::unordered_map<std::string, std::uint16_t> loaded_models;
+  const auto has_sf1_fire_frames =
+      std::ranges::find(mission.specialEffects().entries(),
+                        std::string_view{"EXPL000.TIM"},
+                        &assets::HogEntry::name) !=
+      mission.specialEffects().entries().end();
   const auto load_model = [&](const std::string &stem,
                               const assets::HogEntry &resource,
                               std::uint32_t class_id) {
     const auto fire_presentation =
-        legacyFireEmitterPresentation(class_id, stem);
+        has_sf1_fire_frames && legacyFireEmitterPresentation(class_id, stem);
     const auto model_key = fire_presentation
                                ? std::string{"SPFX:CFIRE"}
                                : resource.name + ":" + std::to_string(class_id);
@@ -932,17 +950,27 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
     }
     const auto resource_bytes = mission.objectModels().file(resource.name);
     auto geometry = [&]() -> ObjectGeometry {
-      if (resource.name.ends_with(".HMD")) {
-        return assets::HmdModel::parse(resource_bytes);
+      try {
+        if (resource.name.ends_with(".HMD")) {
+          return assets::HmdModel::parse(resource_bytes,
+                                         hmd_vertex_index_stride);
+        }
+        if (resource.name.ends_with(".EMD")) {
+          return assets::EmdScene::parse(resource_bytes,
+                                         emd_vertex_index_stride);
+        }
+        auto gmd = assets::GmdModel::parse(resource_bytes);
+        if (!fire_presentation) {
+          return gmd;
+        }
+        return makeFireEmitter(gmd, mission.specialEffects());
+      } catch (const core::Error &error) {
+        throw core::Error{
+            error.code(),
+            "Could not parse object model " + resource.name + ": " +
+                error.what(),
+        };
       }
-      if (resource.name.ends_with(".EMD")) {
-        return assets::EmdScene::parse(resource_bytes);
-      }
-      auto gmd = assets::GmdModel::parse(resource_bytes);
-      if (!fire_presentation) {
-        return gmd;
-      }
-      return makeFireEmitter(gmd, mission.specialEffects());
     }();
     const auto bounds = std::visit(
         [](const auto &model) -> std::optional<assets::EmdBounds> {
@@ -1172,7 +1200,10 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
     objects_.push_back(objects_[source_object]);
     return clone;
   };
-  if (mission.definition().index == 0U) {
+  const auto sf1_opening =
+      mission.gameId() == GameId::syphon_filter &&
+      mission.definition().index == 0U;
+  if (sf1_opening) {
     opening_cbdc_objects_ = {
         clone_opening_template(opening_cbdc_source),
         clone_opening_template(opening_cbdc_source),
@@ -1244,18 +1275,40 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
         source.maximum_health > 0 ? source.maximum_health : 100);
     const auto health = static_cast<std::uint16_t>(std::clamp<int>(
         source.health > 0 ? source.health : maximum_health, 0, maximum_health));
-    const auto native_weapon = static_cast<WeaponId>(source.attributes & 0xffU);
+    const auto native_weapon = [&]() -> std::optional<WeaponId> {
+      switch (mission.runtimeProfile().kind) {
+      case GameRuntimeKind::sf1: {
+        const auto direct =
+            static_cast<WeaponId>(source.attributes & 0xffU);
+        return isValidWeaponId(direct) ? std::optional{direct} : std::nullopt;
+      }
+      case GameRuntimeKind::sf2:
+        return sf2WeaponForItem(
+            static_cast<std::uint8_t>(source.attributes & 0xffU));
+      case GameRuntimeKind::sf3:
+        return std::nullopt;
+      }
+      return std::nullopt;
+    }();
+    const auto sequel_ally =
+        mission.gameId() != GameId::syphon_filter &&
+        (scene_object.class_id == 0x02U ||
+         scene_object.class_id == 0x20002U);
+    const auto sequel_hostile =
+        mission.gameId() != GameId::syphon_filter &&
+        scene_object.class_id == 0x03U;
     const auto disposition =
-        scene_object.class_id == 0x01U   ? NpcDisposition::hostile
-        : scene_object.class_id == 0x35U ? NpcDisposition::ally
-                                         : NpcDisposition::neutral;
+        scene_object.class_id == 0x01U || sequel_hostile
+            ? NpcDisposition::hostile
+        : scene_object.class_id == 0x35U || sequel_ally
+            ? NpcDisposition::ally
+            : NpcDisposition::neutral;
     auto state = NpcState{
         .active = true,
         .object = static_cast<std::uint16_t>(index),
         .source_index = scene_object.source_index,
         .disposition = disposition,
-        .weapon =
-            isValidWeaponId(native_weapon) ? native_weapon : WeaponId::unarmed,
+        .weapon = native_weapon.value_or(WeaponId::unarmed),
         .x = static_cast<double>(scene_object.transform.x),
         .y = -static_cast<double>(scene_object.transform.y),
         .z = static_cast<double>(scene_object.transform.z),
@@ -1268,13 +1321,13 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
         .health = health,
         .maximum_health = maximum_health,
         .armor = static_cast<std::uint16_t>(
-            mission.definition().index == 0U &&
+            sf1_opening &&
                     scene_object.source_index == 174U
                 ? 250U
             : (source.attributes & 0x4000U) != 0U ? 100U
                                                   : 0U),
         .maximum_armor = static_cast<std::uint16_t>(
-            mission.definition().index == 0U &&
+            sf1_opening &&
                     scene_object.source_index == 174U
                 ? 250U
             : (source.attributes & 0x4000U) != 0U ? 100U
@@ -1314,7 +1367,24 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
       state.patrol_loops = source.patrol_path_loops;
       state.patrol_loop_start = source.patrol_loop_start;
     }
-    if (mission.definition().index == 0U && scene_object.source_index == 173U) {
+    if (mission.gameId() == GameId::syphon_filter_2 &&
+        mission.definition().index == 2U &&
+        (scene_object.source_index == 278U ||
+         scene_object.source_index == 279U ||
+         scene_object.source_index == 280U)) {
+      // HWAY.BIN gives these three opening SPOOKY actors routes that converge
+      // on Chance (source 45). Keep that authored diversion ahead of generic
+      // nearest-target selection until Gabe actually engages an actor.
+      state.scripted_target_source = std::uint16_t{45U};
+      state.scripted_target_until_damaged = true;
+    }
+    if (mission.gameId() == GameId::syphon_filter_2 &&
+        mission.definition().index == 2U &&
+        scene_object.source_index == 45U) {
+      // Chance owns the reciprocal side of the HWAY opening exchange.
+      state.scripted_target_source = std::uint16_t{278U};
+    }
+    if (sf1_opening && scene_object.source_index == 173U) {
       state.scripted_defuser = true;
       state.behavior = NpcBehavior::idle;
       state.patrol_index = 0U;
@@ -1346,7 +1416,7 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
         state.scripted_opening_lane < opening_encounter_lanes.size();
     // The only actor whose native route is linked to the opening police
     // car is the street reinforcement that enters over the fence.
-    state.scripted_ingress = mission.definition().index == 0U &&
+    state.scripted_ingress = sf1_opening &&
                              source.ai_parameter == 1U &&
                              source.linked_object == 57;
     const auto &weapon_definition = weaponDefinition(state.weapon);
@@ -1376,7 +1446,19 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
     mission_scripts_.configureActor(
         static_cast<std::uint16_t>(index), mission_source_index,
         disposition == NpcDisposition::hostile, mission_ai_parameter);
-    if (mission_scripts_.initiallyDormant(static_cast<std::uint16_t>(index))) {
+    const auto sf2_airbase_delayed_actor =
+        mission.runtimeProfile().kind == GameRuntimeKind::sf2 &&
+        sf2ActorInitiallyDormant(mission.definition().index,
+                                 scene_object.source_index);
+    if ((mission.gameId() == GameId::syphon_filter &&
+         mission_scripts_.initiallyDormant(
+             static_cast<std::uint16_t>(index))) ||
+        sf2_airbase_delayed_actor) {
+      // AIRBASE's authored LEVEL/COME_WITH_ME_DOCTOR programs explicitly
+      // activate sources 84/85/86 through action 0x06. Treating every parsed
+      // actor as live placed source 84 immediately outside Lian's starting
+      // room, causing an unavoidable stealth failure before those programs
+      // had run.
       npc_states_[index].active = false;
       object_script_hidden_[index] = true;
       object_spawn_script_hidden_[index] = true;
@@ -1394,8 +1476,10 @@ GameplaySession::GameplaySession(const MissionPackage &mission,
   };
   current_room_ = mission.layout().initialRoom();
   rebuildActiveModels();
-  legacy_first_mission_ = std::make_unique<LegacyFirstMissionRuntime>(
-      mission.definition(), mission.legacyImage());
+  if (mission.runtimeProfile().uses_legacy_guest_runtime) {
+    legacy_first_mission_ = std::make_unique<LegacyFirstMissionRuntime>(
+        mission.definition(), mission.legacyImage());
+  }
   reset();
   report_load(100U);
 }
@@ -1405,7 +1489,33 @@ GameplaySession::~GameplaySession() = default;
 std::optional<CampaignCarryState>
 GameplaySession::campaignCarryState() const noexcept {
   if (!legacy_first_mission_) {
-    return std::nullopt;
+    CampaignCarryState state;
+    const auto &inventory = hud_.inventory();
+    for (std::size_t weapon = 0U; weapon < weapon_slot_count; ++weapon) {
+      const auto id = static_cast<WeaponId>(weapon);
+      const auto &item = inventory.state(id);
+      if (!item.owned ||
+          (campaign_persistent_weapon_mask &
+           (std::uint32_t{1U} << weapon)) == 0U) {
+        continue;
+      }
+      state.owned_weapons |= std::uint32_t{1U} << weapon;
+      state.magazines[weapon] = item.magazine;
+      state.reserves[weapon] = item.reserve;
+    }
+    state.owned_weapons |= std::uint32_t{1U};
+    const auto current =
+        static_cast<std::uint8_t>(inventory.current());
+    state.current_weapon =
+        (state.owned_weapons & (std::uint32_t{1U} << current)) != 0U
+            ? current
+            : static_cast<std::uint8_t>(
+                  std::countr_zero(state.owned_weapons));
+    state.health = hud_.vitals().health;
+    state.armor = hud_.vitals().armor;
+    return validCampaignCarry(state)
+               ? std::optional<CampaignCarryState>{std::move(state)}
+               : std::nullopt;
   }
   const auto *mission = legacy_first_mission_->missionBridge();
   if (mission == nullptr || mission->player_health < 0 ||
@@ -1441,8 +1551,31 @@ GameplaySession::campaignCarryState() const noexcept {
 
 bool GameplaySession::applyCampaignCarryState(
     const CampaignCarryState &state) noexcept {
-  if (!legacy_first_mission_ || !validCampaignCarry(state) ||
-      !legacy_first_mission_->applyCampaignCarryState(state)) {
+  if (!validCampaignCarry(state)) {
+    return false;
+  }
+  if (!legacy_first_mission_) {
+    hud_.inventory().resetUnarmed();
+    for (std::size_t weapon = 1U; weapon < weapon_slot_count; ++weapon) {
+      if ((state.owned_weapons & (std::uint32_t{1U} << weapon)) == 0U) {
+        continue;
+      }
+      hud_.inventory().grant(static_cast<WeaponId>(weapon),
+                             state.magazines[weapon],
+                             state.reserves[weapon]);
+    }
+    const auto requested = static_cast<WeaponId>(state.current_weapon);
+    if (!hud_.inventory().select(requested)) {
+      return false;
+    }
+    auto vitals = hud_.vitals();
+    vitals.health = state.health;
+    vitals.armor = state.armor;
+    hud_.setVitals(vitals);
+    player_controller_.setWeaponStance(weaponStance(requested));
+    return true;
+  }
+  if (!legacy_first_mission_->applyCampaignCarryState(state)) {
     return false;
   }
   legacy_last_synced_guest_frame_.reset();
@@ -1583,6 +1716,7 @@ void GameplaySession::reset() {
   locked_target_.reset();
   last_shot_ = {};
   effects_.clear();
+  native_dropped_items_.clear();
   legacy_expl_particles_.clear();
   legacy_park2_flamethrower_ribbons_.clear();
   legacy_world_callouts_.clear();
@@ -1596,7 +1730,9 @@ void GameplaySession::reset() {
   mission_failed_ = false;
   // The STR is followed by the retail in-engine street briefing. The guest
   // runtime owns its camera, fade and transient wall attackers.
-  mission_cinematic_phase_ = MissionCinematicPhase::intro;
+  mission_cinematic_phase_ = legacy_first_mission_
+                                 ? MissionCinematicPhase::intro
+                                 : MissionCinematicPhase::gameplay;
   mission_cinematic_updates_ = 0U;
   map_fade_.resetFromBlack();
   mission_script_updates_ = 0U;
@@ -1652,6 +1788,7 @@ void GameplaySession::reset() {
   pending_host_aim_heading_restore_.reset();
   legacy_manual_aim_neutral_camera_.reset();
   legacy_manual_aim_neutral_player_root_ = {};
+  configureNativeMissionStart();
   std::fill(npc_damaged_.begin(), npc_damaged_.end(), false);
   object_health_ = object_spawn_health_;
   std::fill(object_destroyed_.begin(), object_destroyed_.end(), false);
@@ -1660,7 +1797,8 @@ void GameplaySession::reset() {
   }
   object_script_hidden_ = object_spawn_script_hidden_;
   const auto sources = mission_.objects().objects();
-  if (mission_.definition().index == 0U &&
+  if (mission_.gameId() == GameId::syphon_filter &&
+      mission_.definition().index == 0U &&
       opening_police_car_source < sources.size() &&
       opening_police_car_source < source_to_scene_object_.size()) {
     const auto car = source_to_scene_object_[opening_police_car_source];
@@ -1758,6 +1896,298 @@ void GameplaySession::reset() {
   camera_collision_initialized_ = false;
   updateCameraCollision();
   checkpoint_valid_ = false;
+}
+
+void GameplaySession::configureNativeMissionStart() noexcept {
+  native_mission_timer_updates_remaining_.reset();
+  native_collected_sources_.assign(mission_.objects().objects().size(), false);
+  if (!mission_.runtimeProfile().supports_native_mission_items) {
+    return;
+  }
+
+  const auto mission_index = mission_.definition().index;
+  if (mission_index == 1U) {
+    // AIRBASE begins after Lian's capture: she has no combat gear, no armor,
+    // and two minutes to find the adrenaline before continuing the escape.
+    hud_.inventory().resetUnarmed();
+    auto vitals = hud_.vitals();
+    // Retail playthrough/briefing evidence consistently shows Lian beginning
+    // at ten percent health. AIRBASE.OVL contains no direct health literal,
+    // so express that documented ratio against the native maximum.
+    vitals.health =
+        std::max<std::uint16_t>(1U, vitals.maximum_health / 10U);
+    vitals.armor = 0U;
+    hud_.setVitals(vitals);
+    native_mission_timer_updates_remaining_ = 120U * npc_updates_per_second;
+    // Retail masks number entries from the bottom of the stored table. Keep
+    // the recovered briefing order after makeRetailMissionMenuEntries reverses
+    // it for display.
+    legacy_mission_objective_count_ = 3U;
+    legacy_mission_objective_texts_ = {
+        "Escape Holding Facility",
+        "Get Combat Gear",
+        "Find Adrenaline Booster",
+    };
+    legacy_revealed_objectives_ = 0x7U;
+    legacy_mission_parameter_count_ = 3U;
+    legacy_mission_parameter_texts_ = {
+        "Do not allow yourself to be detected",
+        "Do not kill any airbase personnel",
+        "Get adrenaline before you black out in 2 minutes",
+    };
+    legacy_parameter_mask_ = 0x7U;
+  } else if (mission_index == 2U) {
+    // Gabe lands on I-70 without firearms and must recover them from the
+    // authored supply pickup chain while Chance draws enemy fire.
+    hud_.inventory().resetUnarmed();
+    hud_.inventory().grant(WeaponId::knife, 0U, 0U);
+    static_cast<void>(hud_.inventory().select(WeaponId::knife));
+  }
+}
+
+void GameplaySession::updateNativeMissionItems() noexcept {
+  if (!mission_.runtimeProfile().supports_native_mission_items) {
+    return;
+  }
+
+  if (native_mission_timer_updates_remaining_) {
+    if (*native_mission_timer_updates_remaining_ > 0U) {
+      --*native_mission_timer_updates_remaining_;
+    }
+    if (*native_mission_timer_updates_remaining_ == 0U) {
+      if (mission_.gameId() == GameId::syphon_filter_2 &&
+          mission_.definition().index == 1U) {
+        legacy_failed_parameters_ |= 0x4U;
+      }
+      mission_failed_ = true;
+    }
+  }
+
+  const auto &sources = mission_.objects().objects();
+  if (native_collected_sources_.size() != sources.size()) {
+    native_collected_sources_.assign(sources.size(), false);
+  }
+  const auto &player = player_controller_.state();
+  constexpr auto pickup_radius = 220.0;
+  constexpr auto pickup_height = 300.0;
+  std::erase_if(native_dropped_items_, [&](const auto &drop) {
+    const auto delta_x =
+        player.x - static_cast<double>(drop.transform.translation.x);
+    const auto delta_y =
+        player.y + static_cast<double>(drop.transform.translation.y);
+    const auto delta_z =
+        player.z - static_cast<double>(drop.transform.translation.z);
+    if (std::hypot(delta_x, delta_z) > pickup_radius ||
+        std::abs(delta_y) > pickup_height ||
+        drop.item >= weapon_slot_count) {
+      return false;
+    }
+    const auto weapon = static_cast<WeaponId>(drop.item);
+    const auto &definition = weaponDefinition(weapon);
+    const auto reserve = static_cast<std::uint16_t>(
+        static_cast<std::uint32_t>(definition.magazine_capacity) *
+        definition.reserve_magazines);
+    const auto was_unarmed =
+        hud_.inventory().current() == WeaponId::unarmed ||
+        hud_.inventory().current() == WeaponId::knife;
+    hud_.inventory().acquire(
+        weapon, drop.quantity_valid ? drop.magazine
+                                    : definition.magazine_capacity,
+        drop.quantity_valid ? drop.reserve : reserve);
+    if (was_unarmed) {
+      static_cast<void>(hud_.selectWeapon(weapon));
+    }
+    return true;
+  });
+  for (std::size_t source_index = 0U; source_index < sources.size();
+       ++source_index) {
+    if (native_collected_sources_[source_index]) {
+      continue;
+    }
+    const auto &source = sources[source_index];
+    const auto &definition = mission_.objects().definition(source.type);
+    const auto base_class = missionObjectBaseClass(definition.class_id);
+    if (base_class != 0x48U && base_class != 0x50U) {
+      continue;
+    }
+    const auto delta_x =
+        player.x - static_cast<double>(source.transform.x);
+    const auto delta_y =
+        player.y + static_cast<double>(source.transform.y);
+    const auto delta_z =
+        player.z - static_cast<double>(source.transform.z);
+    if (std::hypot(delta_x, delta_z) > pickup_radius ||
+        std::abs(delta_y) > pickup_height) {
+      continue;
+    }
+
+    native_collected_sources_[source_index] = true;
+    if (source_index < source_to_scene_object_.size()) {
+      const auto scene = source_to_scene_object_[source_index];
+      if (scene != std::numeric_limits<std::uint16_t>::max() &&
+          scene < object_script_hidden_.size()) {
+        object_script_hidden_[scene] = true;
+      }
+    }
+
+    if (base_class == 0x50U) {
+      // AIRBASE source 103 is the authored adrenaline pickup. Its gameplay
+      // effect is to stabilize Lian and remove the opening countdown.
+      if (mission_.gameId() == GameId::syphon_filter_2 &&
+          mission_.definition().index == 1U && source_index == 103U) {
+        native_mission_timer_updates_remaining_.reset();
+        auto vitals = hud_.vitals();
+        vitals.health = vitals.maximum_health;
+        hud_.setVitals(vitals);
+        legacy_completed_objectives_ |= 0x4U;
+      }
+      continue;
+    }
+
+    if ((source.attributes & 0x4000U) != 0U) {
+      auto vitals = hud_.vitals();
+      vitals.armor = vitals.maximum_armor;
+      hud_.setVitals(vitals);
+      continue;
+    }
+
+    const auto weapon = sf2WeaponForItem(
+        static_cast<std::uint8_t>(source.attributes & 0xffU));
+    if (!weapon || *weapon == WeaponId::unarmed) {
+      continue;
+    }
+    const auto &weapon_definition = weaponDefinition(*weapon);
+    const auto reserve = static_cast<std::uint16_t>(
+        static_cast<std::uint32_t>(weapon_definition.magazine_capacity) *
+        weapon_definition.reserve_magazines);
+    const auto was_unarmed =
+        hud_.inventory().current() == WeaponId::unarmed;
+    hud_.inventory().acquire(*weapon, weapon_definition.magazine_capacity,
+                             reserve);
+    if (was_unarmed) {
+      static_cast<void>(hud_.selectWeapon(*weapon));
+    }
+  }
+
+  if (mission_.gameId() == GameId::syphon_filter_2 &&
+      mission_.definition().index == 1U) {
+    constexpr std::array combat_gear_sources{
+        std::size_t{97U}, std::size_t{98U}, std::size_t{99U},
+        std::size_t{100U}};
+    const auto combat_gear_collected =
+        std::ranges::all_of(combat_gear_sources, [&](std::size_t source) {
+          return source < native_collected_sources_.size() &&
+                 native_collected_sources_[source];
+        });
+    if (combat_gear_collected) {
+      legacy_completed_objectives_ |= 0x2U;
+    }
+
+    // AIRBASE source 24 is the last of the three class-0x4c authored event
+    // volumes. Its position is the end corridor described by the retail
+    // mission route; sources 22/23 are the earlier Phagan/dialogue events.
+    constexpr auto escape_source = std::size_t{24U};
+    if ((legacy_completed_objectives_ & 0x2U) != 0U &&
+        escape_source < sources.size()) {
+      const auto &escape = sources[escape_source];
+      const auto escape_delta_x =
+          player.x - static_cast<double>(escape.transform.x);
+      const auto escape_delta_y =
+          player.y + static_cast<double>(escape.transform.y);
+      const auto escape_delta_z =
+          player.z - static_cast<double>(escape.transform.z);
+      if (std::hypot(escape_delta_x, escape_delta_z) <= 300.0 &&
+          std::abs(escape_delta_y) <= 320.0) {
+        legacy_completed_objectives_ |= 0x1U;
+        mission_cinematic_phase_ = MissionCinematicPhase::complete;
+      }
+    }
+  }
+}
+
+void GameplaySession::updateNativeMissionInteractions(
+    const GameplayInput &input) noexcept {
+  if (!mission_.runtimeProfile().supports_native_mission_interactions ||
+      !input.interact) {
+    return;
+  }
+
+  const auto &player = player_controller_.state();
+  const auto &sources = mission_.objects().objects();
+  constexpr auto interaction_radius = 300.0;
+  constexpr auto interaction_height = 320.0;
+  const auto hide_source = [&](std::size_t source_index) {
+    if (source_index >= source_to_scene_object_.size()) {
+      return;
+    }
+    const auto scene = source_to_scene_object_[source_index];
+    if (scene != std::numeric_limits<std::uint16_t>::max() &&
+        scene < object_script_hidden_.size()) {
+      object_script_hidden_[scene] = true;
+    }
+  };
+
+  for (const auto scene : active_objects_) {
+    if (scene >= objects_.size() || scene >= object_script_hidden_.size() ||
+        object_script_hidden_[scene]) {
+      continue;
+    }
+    auto &object = objects_[scene];
+    if (object.source_index >= sources.size()) {
+      continue;
+    }
+    const auto delta_x =
+        player.x - static_cast<double>(object.transform.x);
+    const auto delta_y =
+        player.y + static_cast<double>(object.transform.y);
+    const auto delta_z =
+        player.z - static_cast<double>(object.transform.z);
+    if (std::hypot(delta_x, delta_z) > interaction_radius ||
+        std::abs(delta_y) > interaction_height) {
+      continue;
+    }
+
+    const auto base_class = missionObjectBaseClass(object.class_id);
+    const auto &source = sources[object.source_index];
+    if (base_class == 0x0eU) {
+      // The sequel overlays animate these slab meshes, but their open state is
+      // functionally an absent blocker. Hide both halves when a paired door
+      // is linked so presentation and collision change atomically.
+      hide_source(object.source_index);
+      if (source.linked_object >= 0) {
+        const auto linked = static_cast<std::size_t>(source.linked_object);
+        if (linked < sources.size() &&
+            missionObjectBaseClass(
+                mission_.objects().definition(sources[linked].type).class_id) ==
+                0x0eU) {
+          hide_source(linked);
+        }
+      }
+      return;
+    }
+    if (base_class == 0x49U) {
+      // LOCKERA/LOCKERB are the authored closed/open pair. The linked class-48
+      // chain remains collectible at its exact positions after this swap.
+      object.legacy_secondary_model_active = true;
+      return;
+    }
+    if (base_class == 0x54U) {
+      if (source.linked_object >= 0) {
+        // Sequel switches usually point directly at their controlled source.
+        // AIRBASE source 104 links its paired GLASS object this way.
+        hide_source(static_cast<std::size_t>(source.linked_object));
+      } else if (mission_.gameId() == GameId::syphon_filter_2 &&
+                 mission_.definition().index == 1U &&
+                 object.source_index == 105U) {
+        // AIRBASE's post-locker switch is overlay-scripted rather than linked
+        // in BIN. It releases the paired lower-level security doors that the
+        // airman has just passed through.
+        hide_source(31U);
+        hide_source(32U);
+      }
+      return;
+    }
+  }
 }
 
 bool GameplaySession::restartCheckpoint() {
@@ -2180,21 +2610,27 @@ GameplaySession::findGround(double x, double z, double reference_y) const {
 }
 
 bool GameplaySession::collidesWithWall(double x, double y, double z) const {
-  const auto radius_squared = player_radius * player_radius;
-  const auto player_top = y - player_height;
+  // SF2/SF3 use narrower actor cylinders than SF1. Retaining the 58-unit
+  // SUBWAY radius made Lian overlap both jamb edges of AIRBASE's authored
+  // opening even while its door was visibly open.
+  const auto &runtime = mission_.runtimeProfile();
+  const auto collision_radius = runtime.player_collision_radius;
+  const auto collision_height = runtime.player_collision_height;
+  const auto radius_squared = collision_radius * collision_radius;
+  const auto player_top = y - collision_height;
   for (const auto model_index : active_models_) {
     const auto &model = models_[model_index];
-    if (x + player_radius < model.bounds.minimum_x ||
-        x - player_radius > model.bounds.maximum_x ||
-        z + player_radius < model.bounds.minimum_z ||
-        z - player_radius > model.bounds.maximum_z) {
+    if (x + collision_radius < model.bounds.minimum_x ||
+        x - collision_radius > model.bounds.maximum_x ||
+        z + collision_radius < model.bounds.minimum_z ||
+        z - collision_radius > model.bounds.maximum_z) {
       continue;
     }
     for (const auto &section : model.scene.sections()) {
-      if (x + player_radius < section.bounds.minimum_x ||
-          x - player_radius > section.bounds.maximum_x ||
-          z + player_radius < section.bounds.minimum_z ||
-          z - player_radius > section.bounds.maximum_z ||
+      if (x + collision_radius < section.bounds.minimum_x ||
+          x - collision_radius > section.bounds.maximum_x ||
+          z + collision_radius < section.bounds.minimum_z ||
+          z - collision_radius > section.bounds.maximum_z ||
           y < section.bounds.minimum_y ||
           player_top > section.bounds.maximum_y) {
         continue;
@@ -2234,15 +2670,35 @@ bool GameplaySession::collidesWithWall(double x, double y, double z) const {
         if (maximum_y < player_top || minimum_y > y) {
           continue;
         }
-        for (std::size_t first_index = 0; first_index < vertex_count;
-             ++first_index) {
-          for (std::size_t second_index = first_index + 1;
-               second_index < vertex_count; ++second_index) {
-            if (squaredDistanceToSegment(x, z, vertices[first_index],
-                                         vertices[second_index]) <
-                radius_squared) {
-              return true;
-            }
+        const std::array<std::array<std::size_t, 2>, 4> edges =
+            polygon.quad
+                ? std::array<std::array<std::size_t, 2>, 4>{
+                      std::array<std::size_t, 2>{0U, 1U},
+                      std::array<std::size_t, 2>{1U, 3U},
+                      std::array<std::size_t, 2>{3U, 2U},
+                      std::array<std::size_t, 2>{2U, 0U},
+                  }
+                : std::array<std::array<std::size_t, 2>, 4>{
+                      std::array<std::size_t, 2>{0U, 1U},
+                      std::array<std::size_t, 2>{1U, 2U},
+                      std::array<std::size_t, 2>{2U, 0U},
+                      std::array<std::size_t, 2>{0U, 0U},
+                  };
+        const auto edge_count = polygon.quad ? 4U : 3U;
+        for (std::size_t edge = 0U; edge < edge_count; ++edge) {
+          const auto &edge_a = vertices[edges[edge][0]];
+          const auto &edge_b = vertices[edges[edge][1]];
+          const auto edge_minimum_y = std::min(edge_a.y, edge_b.y);
+          const auto edge_maximum_y = std::max(edge_a.y, edge_b.y);
+          // Horizontal floor/ceiling edges do not become full-height walls.
+          // AIRBASE's open starting door had a lower wall edge at y=-466;
+          // projecting it into XZ without this test sealed the doorway.
+          if (edge_maximum_y <= player_top || edge_minimum_y >= y) {
+            continue;
+          }
+          if (squaredDistanceToSegment(x, z, edge_a, edge_b) <
+              radius_squared) {
+            return true;
           }
         }
       }
@@ -2272,7 +2728,7 @@ bool GameplaySession::collidesWithWall(double x, double y, double z) const {
         std::abs(static_cast<int>(bounds.maximum_y)),
         80,
     }));
-    if (y < object_y - vertical_extent - player_height ||
+    if (y < object_y - vertical_extent - collision_height ||
         player_top > object_y + vertical_extent) {
       continue;
     }
@@ -2284,10 +2740,10 @@ bool GameplaySession::collidesWithWall(double x, double y, double z) const {
     const auto delta_z = z - static_cast<double>(object.transform.z);
     const auto local_x = delta_x * basis.right.x + delta_z * basis.right.z;
     const auto local_z = delta_x * basis.forward.x + delta_z * basis.forward.z;
-    if (local_x >= static_cast<double>(bounds.minimum_x) - player_radius &&
-        local_x <= static_cast<double>(bounds.maximum_x) + player_radius &&
-        local_z >= static_cast<double>(bounds.minimum_z) - player_radius &&
-        local_z <= static_cast<double>(bounds.maximum_z) + player_radius) {
+    if (local_x >= static_cast<double>(bounds.minimum_x) - collision_radius &&
+        local_x <= static_cast<double>(bounds.maximum_x) + collision_radius &&
+        local_z >= static_cast<double>(bounds.minimum_z) - collision_radius &&
+        local_z <= static_cast<double>(bounds.maximum_z) + collision_radius) {
       return true;
     }
   }
@@ -2316,14 +2772,26 @@ void GameplaySession::updateCurrentRoom(std::uint16_t ground_model,
   if (ground_model == current_room_) {
     return;
   }
-  if (std::ranges::find(active_models_, ground_model) != active_models_.end() &&
+  const auto resident_models = mission_.layout().residentModels();
+  const auto is_resident = [&](std::uint16_t model) {
+    return std::ranges::find(resident_models, model) != resident_models.end();
+  };
+  // Sequel AROOM meshes are permanently resident connectors/overlays. They
+  // can own the floor under the player without owning a DAT visibility row.
+  // Promoting one to current_room_ discarded the actual portal envelope on
+  // the first movement update (AIRBASE starts in state 2 on resident model
+  // 18), trapping the player in the opening room.
+  if (!is_resident(ground_model) &&
+      std::ranges::find(active_models_, ground_model) !=
+          active_models_.end() &&
       containsXZ(models_[ground_model].bounds, player_x, player_z)) {
     current_room_ = ground_model;
     rebuildActiveModels();
     return;
   }
   for (const auto model : active_models_) {
-    if (containsXZ(models_[model].bounds, player_x, player_z)) {
+    if (!is_resident(model) &&
+        containsXZ(models_[model].bounds, player_x, player_z)) {
       current_room_ = model;
       rebuildActiveModels();
       return;
@@ -2353,11 +2821,13 @@ double GameplaySession::traceWorldSegment(double from_x, double from_y,
   auto nearest = 1.0;
   for (const auto model_index : active_models_) {
     const auto &model = models_[model_index];
-    if (!segmentOverlapsBounds(from, to, model.bounds)) {
+    if (mission_.gameId() == GameId::syphon_filter &&
+        !segmentOverlapsBounds(from, to, model.bounds)) {
       continue;
     }
     for (const auto &section : model.scene.sections()) {
-      if (!segmentOverlapsBounds(from, to, section.bounds)) {
+      if (mission_.gameId() == GameId::syphon_filter &&
+          !segmentOverlapsBounds(from, to, section.bounds)) {
         continue;
       }
       for (const auto &polygon : section.polygons) {
@@ -2664,7 +3134,9 @@ void GameplaySession::updateEffects() noexcept {
 }
 
 void GameplaySession::damageNpc(std::uint16_t target, std::uint16_t damage,
-                                WeaponDamageKind kind, bool headshot) noexcept {
+                                WeaponDamageKind kind, bool headshot,
+                                bool by_player,
+                                std::optional<std::uint16_t> attacker) noexcept {
   if (target >= npc_states_.size() || target >= object_health_.size() ||
       damage == 0U || !npc_states_[target].active ||
       npc_states_[target].health == 0U) {
@@ -2675,12 +3147,66 @@ void GameplaySession::damageNpc(std::uint16_t target, std::uint16_t damage,
   }
 
   auto &state = npc_states_[target];
+  if (!by_player && attacker && *attacker < npc_states_.size() &&
+      state.source_index == 45U &&
+      npc_states_[*attacker].scripted_target_until_damaged) {
+    // Chance is the authored opening diversion, not a timer. Preserve him
+    // while those enemies are still in their forced opening exchange; once
+    // Gabe attacks one, normal ally damage and mission consequences resume.
+    return;
+  }
   state.health = damage >= state.health
                      ? 0U
                      : static_cast<std::uint16_t>(state.health - damage);
   object_health_[target] = state.health;
   npc_damaged_[target] = true;
+  if (by_player && state.scripted_target_until_damaged) {
+    state.scripted_target_source.reset();
+    state.scripted_target_until_damaged = false;
+  }
   if (state.health == 0U) {
+    state.death_kind =
+        kind == WeaponDamageKind::electrical
+            ? NpcDeathKind::electrical
+        : kind == WeaponDamageKind::fire ? NpcDeathKind::fire
+                                          : NpcDeathKind::normal;
+    if (mission_.gameId() == GameId::syphon_filter_2 &&
+        mission_.definition().index == 1U &&
+        state.disposition == NpcDisposition::hostile &&
+        kind != WeaponDamageKind::electrical) {
+      legacy_failed_parameters_ |= 0x2U;
+      mission_failed_ = true;
+    }
+    if (mission_.gameId() != GameId::syphon_filter &&
+        state.disposition == NpcDisposition::hostile &&
+        state.weapon != WeaponId::unarmed &&
+        state.weapon != WeaponId::knife) {
+      const auto clamp_word = [](double value) {
+        return static_cast<std::int16_t>(std::clamp(
+            std::lround(value),
+            static_cast<long>(std::numeric_limits<std::int16_t>::min()),
+            static_cast<long>(std::numeric_limits<std::int16_t>::max())));
+      };
+      auto room = current_room_;
+      const auto authored_rooms =
+          mission_.objects().roomsContainingObject(state.source_index);
+      if (!authored_rooms.empty()) {
+        room = authored_rooms.front();
+      }
+      auto drop = LegacyDroppedItemBridgeState{
+          .slot = static_cast<std::uint8_t>(
+              native_dropped_items_.size() & 0xffU),
+          .room = room,
+          .item = static_cast<std::uint16_t>(state.weapon),
+      };
+      drop.transform.rotation = {4096, 0, 0, 0, 4096, 0, 0, 0, 4096};
+      drop.transform.translation = {
+          clamp_word(state.x), clamp_word(-state.y), clamp_word(state.z)};
+      drop.quantity_valid = true;
+      drop.magazine = state.magazine;
+      drop.reserve = state.reserve_ammo;
+      native_dropped_items_.push_back(drop);
+    }
     mission_scripts_.actorKilled(target);
   }
 }
@@ -2721,9 +3247,9 @@ bool GameplaySession::tryMoveNpc(NpcState &state, double forward_distance,
             return false;
           }
           const auto &other = npc_states_[other_index];
-          return &other != &state && other.active && other.health != 0U &&
+                 return &other != &state && other.active && other.health != 0U &&
                  std::hypot(other.x - candidate_x, other.z - candidate_z) <
-                     player_radius * 1.35;
+                     actor_avoidance_radius * 1.35;
         });
     if (actor_blocked) {
       continue;
@@ -3150,10 +3676,36 @@ void GameplaySession::updateNpcs(bool player_fired,
     auto target_distance =
         target_is_player ? std::hypot(target_x - state.x, target_z - state.z)
                          : std::numeric_limits<double>::max();
+    if (state.scripted_target_source &&
+        (!state.scripted_target_until_damaged ||
+         !npc_damaged_[object_index]) &&
+        *state.scripted_target_source < source_to_scene_object_.size()) {
+      const auto scripted_scene =
+          source_to_scene_object_[*state.scripted_target_source];
+      if (scripted_scene < npc_states_.size()) {
+        const auto &scripted_target = npc_states_[scripted_scene];
+        if (scripted_target.active && scripted_target.health != 0U &&
+            npcDispositionsOppose(state.disposition,
+                                   scripted_target.disposition)) {
+          target_is_player = false;
+          actor_target = scripted_scene;
+          target_x = scripted_target.x;
+          target_y = scripted_target.y;
+          target_z = scripted_target.z;
+          target_distance =
+              std::hypot(target_x - state.x, target_z - state.z);
+        }
+      }
+    }
     const auto opening_player_priority = target_is_player &&
                                          openingEncounterHostileSlot(state) &&
                                          !state.scripted_opening_combat;
     for (const auto candidate_index : active_objects_) {
+      if (actor_target && state.scripted_target_source &&
+          (!state.scripted_target_until_damaged ||
+           !npc_damaged_[object_index])) {
+        continue;
+      }
       if (opening_player_priority) {
         continue;
       }
@@ -3186,11 +3738,22 @@ void GameplaySession::updateNpcs(bool player_fired,
     const auto target_heading = has_target && target_distance > 0.0001
                                     ? headingFromDirection(delta_x, delta_z)
                                     : state.yaw;
+    const auto authored_opening_target =
+        actor_target && state.scripted_target_source &&
+        npc_states_[*actor_target].source_index ==
+            *state.scripted_target_source &&
+        target_distance <= 5200.0;
     const auto visible =
         has_target &&
-        traceWorldSegment(state.x, state.y - actor_target_height, state.z,
-                          target_x, target_y - actor_target_height,
-                          target_z) >= target_visibility_limit;
+        (authored_opening_target ||
+         traceWorldSegment(state.x, state.y - actor_target_height, state.z,
+                           target_x, target_y - actor_target_height,
+                           target_z) >= target_visibility_limit);
+    if (mission_.gameId() == GameId::syphon_filter_2 &&
+        mission_.definition().index == 1U && target_is_player && visible) {
+      legacy_failed_parameters_ |= 0x1U;
+      mission_failed_ = true;
+    }
     const auto target_proxy = PlayerState{
         target_x, target_y, target_z, target_heading, true,
     };
@@ -3308,7 +3871,8 @@ void GameplaySession::updateNpcs(bool player_fired,
       const auto &weapon = weaponCombatDefinition(state.weapon);
       const auto muzzle_forward = headingDirection(state.yaw);
       if (weapon.fire_mode != WeaponFireMode::thrown &&
-          state.weapon != WeaponId::flamethrower) {
+          state.weapon != WeaponId::flamethrower &&
+          weapon.damage_kind != WeaponDamageKind::melee) {
         spawnMuzzleFlash(object_index, state.x + muzzle_forward.x * 100.0,
                          state.y - 235.0, state.z + muzzle_forward.z * 100.0,
                          muzzle_forward.x, muzzle_forward.z,
@@ -3344,7 +3908,8 @@ void GameplaySession::updateNpcs(bool player_fired,
                 state.y - actor_target_height, state.z, false,
                 GameplayEffectAttachment::npc_body, *actor_target);
           }
-          damageNpc(*actor_target, damage, weapon.damage_kind);
+          damageNpc(*actor_target, damage, weapon.damage_kind, false, false,
+                    object_index);
         }
       }
     }
@@ -4106,7 +4671,9 @@ void GameplaySession::syncLegacyActorCombatPresentation(
       guest.presentation_enabled == 10U && guest.presentation_mode == 34U;
   const auto second_traversal_pair =
       guest.presentation_enabled == 12U && guest.presentation_mode == 42U;
-  const auto traversing_wall = mission_.definition().index == 0U &&
+  const auto traversing_wall =
+      mission_.gameId() == GameId::syphon_filter &&
+      mission_.definition().index == 0U &&
                                (first_traversal_pair || second_traversal_pair);
   if (state.scripted_climbing != traversing_wall) {
     state.scripted_climbing = traversing_wall;
@@ -4278,7 +4845,9 @@ void GameplaySession::syncLegacyResidentObjects(
     // Mission 1 has two runtime actors whose exact definitions have no
     // loadable independent presentation. Retain its recovered fallback,
     // but never reinterpret these SUBWAY source numbers in another overlay.
-    if (presentation_template == nullptr && mission_.definition().index == 0U &&
+    if (presentation_template == nullptr &&
+        mission_.gameId() == GameId::syphon_filter &&
+        mission_.definition().index == 0U &&
         (guest.class_id == 0x01 || guest.class_id == 0x35)) {
       const auto fallback_source = guest.class_id == 0x35
                                        ? opening_cbdc_source
@@ -4409,6 +4978,7 @@ void GameplaySession::syncLegacyResidentObjects(
         });
     const auto opening_actor =
         mission_cinematic_phase_ == MissionCinematicPhase::intro &&
+        mission_.gameId() == GameId::syphon_filter &&
         mission_.definition().index == 0U &&
         (std::ranges::find(opening_cbdc_objects_, scene) !=
              opening_cbdc_objects_.end() ||
@@ -5654,8 +6224,131 @@ void GameplaySession::update(const GameplayInput &input) {
   updateEffects();
   last_shot_ = {};
   if (legacy_first_mission_ == nullptr) {
-    legacy_runtime_faulted_ = true;
-    mission_failed_ = true;
+    if (input.aim) {
+      host_free_look_active_ = false;
+      host_free_look_pitch_ = 0.0;
+    } else {
+      host_free_look_active_ = true;
+      host_free_look_pitch_ =
+          std::clamp(host_free_look_pitch_ + input.look_pitch,
+                     -512.0, 512.0);
+    }
+    player_controller_.update(input, *this);
+    updateNativeMissionInteractions(input);
+    updateNativeMissionItems();
+    const auto weapon = hud_.inventory().current();
+    if (input.reload) {
+      static_cast<void>(hud_.inventory().reload());
+    }
+    const auto &combat = weaponCombatDefinition(weapon);
+    if (input.fire_pressed && combat.fires() &&
+        hud_.inventory().consumeRound()) {
+      const auto ray = [&] {
+        if (playerAim() == PlayerAimState::first_person) {
+          return manualAimRay();
+        }
+        const auto &state = player_controller_.state();
+        const auto forward = headingDirection(state.yaw);
+        return ActorAimRay{
+            state.x,
+            state.y - 220.0,
+            state.z,
+            forward.x,
+            0.0,
+            forward.z,
+        };
+      }();
+      if (combat.damage_kind != WeaponDamageKind::melee) {
+        spawnMuzzleFlash(std::nullopt,
+                         ray.origin_x + ray.direction_x * 96.0,
+                         ray.origin_y + ray.direction_y * 96.0,
+                         ray.origin_z + ray.direction_z * 96.0,
+                         ray.direction_x, ray.direction_z, 1.0);
+      }
+      const auto range = static_cast<double>(combat.maximum_range);
+      const auto hit = traceWorldSegment(
+          ray.origin_x, ray.origin_y, ray.origin_z,
+          ray.origin_x + ray.direction_x * range,
+          ray.origin_y + ray.direction_y * range,
+          ray.origin_z + ray.direction_z * range);
+      const auto world_impact = hit < 1.0;
+      const auto world_distance = range * hit;
+      std::optional<std::uint16_t> actor_target;
+      std::optional<ActorAimHit> actor_hit;
+      for (const auto object : active_objects_) {
+        if (object >= npc_states_.size() || object >= object_health_.size()) {
+          continue;
+        }
+        const auto &candidate = npc_states_[object];
+        if (!candidate.active || object_health_[object] == 0U) {
+          continue;
+        }
+        const auto candidate_hit =
+            actorAimHit(ray, candidate.x, candidate.y, candidate.z);
+        if (!candidate_hit || candidate_hit->ray_distance >= world_distance ||
+            candidate_hit->ray_distance > range ||
+            (actor_hit &&
+             candidate_hit->ray_distance >= actor_hit->ray_distance)) {
+          continue;
+        }
+        actor_target = object;
+        actor_hit = candidate_hit;
+      }
+      auto impact_x = ray.origin_x + ray.direction_x * world_distance;
+      auto impact_y = ray.origin_y + ray.direction_y * world_distance;
+      auto impact_z = ray.origin_z + ray.direction_z * world_distance;
+      if (actor_target && actor_hit) {
+        impact_x = actor_hit->target_x;
+        impact_y = actor_hit->target_y;
+        impact_z = actor_hit->target_z;
+        const auto headshot = actor_hit->zone == ActorAimZone::head;
+        spawnActorHitEffects(
+            impact_x, impact_y, impact_z, ray.origin_x, ray.origin_y,
+            ray.origin_z, headshot, GameplayEffectAttachment::npc_body,
+            *actor_target);
+        auto damage = combat.damageAtDistance(actor_hit->ray_distance);
+        if (combat.damage_kind == WeaponDamageKind::melee) {
+          const auto &target_state = npc_states_[*actor_target];
+          const auto attacker_heading = headingFromDirection(
+              ray.origin_x - target_state.x,
+              ray.origin_z - target_state.z);
+          damage = contextualMeleeDamage(
+              damage,
+              signedHeadingDelta(target_state.yaw, attacker_heading));
+        }
+        damageNpc(*actor_target, damage,
+                  combat.damage_kind, headshot);
+      } else if (world_impact &&
+                 combat.damage_kind != WeaponDamageKind::melee) {
+        spawnCombatEffect(GameplayEffectType::blood_decal,
+                          impact_x - ray.direction_x * 3.0,
+                          impact_y - ray.direction_y * 3.0,
+                          impact_z - ray.direction_z * 3.0,
+                          -ray.direction_x, -ray.direction_y,
+                          -ray.direction_z, 0.8);
+      }
+      last_shot_ = GameplayShotEvent{
+          .fired = true,
+          .weapon = weapon,
+          .target = actor_target,
+          .headshot = actor_hit &&
+                      actor_hit->zone == ActorAimZone::head,
+          .world_impact = world_impact && !actor_target,
+          .impact_x = impact_x,
+          .impact_y = impact_y,
+          .impact_z = impact_z,
+      };
+    }
+    updateNpcs(last_shot_.fired, input.roll);
+    rebuildActiveObjects();
+    updateCameraCollision();
+    hud_.update(HudInput{
+        .aiming = playerAim() == PlayerAimState::first_person,
+    });
+    if (input.weapon_menu_delta != 0 ||
+        input.next_weapon != input.previous_weapon) {
+      hud_.showWeaponMenu();
+    }
     return;
   }
 
@@ -5958,7 +6651,12 @@ PlayerAimState GameplaySession::playerAim() const noexcept {
 }
 
 void GameplaySession::updateCameraCollision() noexcept {
-  const auto desired = player_controller_.camera();
+  auto desired = player_controller_.camera();
+  if (legacy_first_mission_ == nullptr &&
+      player_controller_.aim() != PlayerAimState::first_person &&
+      host_free_look_active_) {
+    desired = applyChaseCameraPitch(desired, host_free_look_pitch_);
+  }
   const auto &player = player_controller_.state();
   const auto mode = player_controller_.cameraIntent().mode;
   const auto first_person = mode == PlayerCameraMode::first_person_aim;

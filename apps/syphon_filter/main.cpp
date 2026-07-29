@@ -198,11 +198,8 @@ int main(int argc, char **argv) {
         const auto separator = argument.find('=');
         const auto mission_number =
             parseInteger(argument.substr(separator + 1U));
-        const auto mission_count = sf::game::missionCatalog().size();
-        if (!mission_number || *mission_number < 1 ||
-            static_cast<std::size_t>(*mission_number) > mission_count) {
-          std::cerr << "Mission must be a retail number from 1 to "
-                    << mission_count << ".\n";
+        if (!mission_number || *mission_number < 1) {
+          std::cerr << "Mission must be a positive retail mission number.\n";
           printUsage();
           return 64;
         }
@@ -292,7 +289,9 @@ int main(int argc, char **argv) {
     std::unique_ptr<sf::platform::Host> host;
     if (launch->mode == LaunchMode::game ||
         launch->mode == LaunchMode::title_test) {
-      const auto &definition = sf::game::missionDefinition(mission_index);
+      auto selected_mission =
+          sf::game::MissionPackage::load(disc, mission_index);
+      const auto &definition = selected_mission.definition();
       const auto development_alias = launch->mode == LaunchMode::title_test;
       std::cout << "Disc verified. Starting "
                 << (development_alias ? "native title test" : "campaign")
@@ -301,8 +300,6 @@ int main(int argc, char **argv) {
                 << "].\n";
       auto assets = sf::game::TitleAssets::load(disc);
       auto movies = sf::game::TitleMovies::load(disc);
-      auto selected_mission =
-          sf::game::MissionPackage::load(disc, mission_index);
       auto mission_cue_path = disc.cuePath();
       auto supported_game_serial = std::string{disc.game()->serial};
       host = sf::platform::createPsyCrossTitleHost(
@@ -312,13 +309,13 @@ int main(int argc, char **argv) {
           std::move(mission_cue_path), std::move(supported_game_serial),
           graphics, input, retail_cheats);
     } else if (launch->mode == LaunchMode::scene_test) {
-      const auto &definition = sf::game::missionDefinition(mission_index);
+      auto mission = sf::game::MissionPackage::load(disc, mission_index);
+      const auto &definition = mission.definition();
       std::cout << "Disc verified. Starting native scene test at mission "
                 << (mission_index + 1U) << ": " << definition.title << " ["
                 << definition.resource_name << "].\n";
       host = sf::platform::createPsyCrossSceneHost(
-          "Syphon Filter PC - scene test",
-          sf::game::MissionPackage::load(disc, mission_index), disc.cuePath(),
+          "Syphon Filter PC - scene test", std::move(mission), disc.cuePath(),
           graphics, input, retail_cheats);
     } else {
       std::cout << "Disc verified. Starting PsyCross platform test; "

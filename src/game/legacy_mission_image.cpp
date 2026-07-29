@@ -42,6 +42,7 @@ struct LegacyMissionImage::Storage {
   std::uint32_t xa_first_lba{};
   std::uint32_t xa_sector_count{};
   std::uint32_t xa_byte_size{};
+  std::string xa_path;
   std::string archive_path;
   std::vector<RootFile> root_files;
   std::vector<ArchiveFile> archive_files;
@@ -60,14 +61,22 @@ LegacyMissionImage::loadFirst(GameDisc &disc,
 LegacyMissionImage LegacyMissionImage::load(GameDisc &disc,
                                             const assets::FogArchive &archive,
                                             std::string_view archive_path) {
-  constexpr std::array root_directories{"BIN", "COMMON"};
-  constexpr std::string_view xa_path{"XA/INGAME.XA"};
+  constexpr std::array sf1_root_directories{"BIN", "COMMON"};
+  constexpr std::array sequel_root_directories{"BIN"};
+  auto root_directories = std::span<const char *const>{sf1_root_directories};
+  if (disc.game() && disc.game()->id != GameId::syphon_filter) {
+    root_directories = sequel_root_directories;
+  }
+  const auto xa_path =
+      disc.game() ? disc.game()->layout.streaming_audio_path
+                  : std::string_view{"XA/INGAME.XA"};
   constexpr std::uint64_t iso_sector_size = 2048U;
 
   auto storage = std::make_shared<Storage>();
   storage->executable = disc.executable();
   storage->cue_path = disc.cuePath();
   storage->archive_path = archive_path;
+  storage->xa_path = xa_path;
 
   const auto xa_entry = disc.image().find(std::string{xa_path});
   const auto xa_sector_count =
@@ -133,7 +142,7 @@ std::shared_ptr<LegacyVirtualCd> LegacyMissionImage::createVirtualCd() const {
   if (!virtual_cd->attachRawSectorSource(std::move(raw_sector_source),
                                          storage_->xa_first_lba,
                                          storage_->xa_sector_count) ||
-      !virtual_cd->registerRawExtentFile("XA/INGAME.XA",
+      !virtual_cd->registerRawExtentFile(storage_->xa_path,
                                          storage_->xa_byte_size)) {
     throw core::Error{core::ErrorCode::invalid_format,
                       "Mission XA extent lies outside the source data track"};

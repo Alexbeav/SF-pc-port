@@ -54,7 +54,11 @@ struct HmdTriangle {
 
 class HmdModel final {
 public:
-    [[nodiscard]] static HmdModel parse(std::span<const std::byte> bytes);
+    // A zero override selects the SF1/SF2 stride encoded by the lighting
+    // flags. SF3 uses eight-byte transformed-vertex indices for both forms.
+    [[nodiscard]] static HmdModel parse(
+        std::span<const std::byte> bytes,
+        std::uint16_t vertex_index_stride_override = 0U);
 
     [[nodiscard]] std::uint32_t flags() const noexcept { return flags_; }
     [[nodiscard]] bool flatLit() const noexcept { return (flags_ & 1U) != 0; }

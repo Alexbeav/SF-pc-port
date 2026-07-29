@@ -181,30 +181,38 @@ TitleMovies::TitleMovies(std::vector<TitleMovie> sequence) : sequence_(std::move
 
 TitleAssets TitleAssets::load(GameDisc& disc) {
     struct Definition {
-        const char* name;
+        std::string_view name;
         std::int16_t x;
         std::int16_t y;
     };
     // Recovered from TITLE.OVL at 0x80148474. The archive order is not the
     // same as the on-screen menu order, so names are resolved explicitly.
-    constexpr std::array definitions{
+    const auto training_visual =
+        disc.game() && disc.game()->id == GameId::syphon_filter_3
+            ? std::string_view{"MINIGAME.TIM"}
+            : std::string_view{"VIDEO.TIM"};
+    const std::array definitions{
         Definition{"NEW.TIM", 42, 157},
         Definition{"LOAD.TIM", 131, 157},
-        Definition{"VIDEO.TIM", 233, 157},
+        Definition{training_visual, 233, 157},
         Definition{"SEARCH.TIM", 133, 166},
     };
 
-    auto archive = assets::HogArchive::parse(disc.image().readFile("COMMON/TITLE.HOG"));
+    const auto title_archive_path = disc.game()
+                                        ? disc.game()->layout.title_archive_path
+                                        : std::string_view{"COMMON/TITLE.HOG"};
+    auto archive = assets::HogArchive::parse(
+        disc.image().readFile(std::string{title_archive_path}));
     std::vector<TitleSprite> sprites;
     sprites.reserve(definitions.size());
     for (const auto& definition : definitions) {
         const auto localized = readLocalizedAsset(
-            std::string{"title/"} + definition.name);
+            std::string{"title/"} + std::string{definition.name});
         const auto source = localized
             ? std::span<const std::byte>{*localized}
             : archive.file(definition.name);
         sprites.push_back(TitleSprite{
-            definition.name,
+            std::string{definition.name},
             assets::TimImage::parse(source),
             definition.x,
             definition.y,

@@ -366,6 +366,13 @@ void testMachineInterrupts() {
 
   sf::psx::R3000Runtime runtime;
   sf::psx::PsxMachine machine{runtime};
+  std::uint32_t gpu_status{};
+  require(runtime.read32(0x1f801814U, gpu_status) &&
+              (gpu_status & 0x04000000U) != 0U &&
+              runtime.write32(0x1f801814U, 0x10000007U) &&
+              runtime.read32(0x1f801814U, gpu_status) &&
+              (gpu_status & 0x04000000U) != 0U,
+          "Native GPU boundary did not remain command-ready");
   std::uint16_t value{};
   require(runtime.read16(i_stat, value) && value == 0U &&
               runtime.read16(i_mask, value) && value == 0U,
@@ -1697,6 +1704,13 @@ void testLegacyGameplayVmBoundary() {
   const auto result = vm.invoke(overlay_address, arguments);
   require(result.completed() && result.return_value == 42U,
           "Legacy VM did not execute an overlay function");
+  require(vm.runtime().beginCall(overlay_address, arguments),
+          "Could not prepare clock-neutral guest execution");
+  vm.runtime().setExternalInterrupt(true);
+  const auto clock_neutral_result = vm.resumeCurrentPcClockNeutral();
+  require(clock_neutral_result.completed() &&
+              clock_neutral_result.return_value == 42U,
+          "Clock-neutral guest execution entered an unowned interrupt vector");
 
   std::uint32_t pass_through_calls{};
   vm.bindHostCall(
@@ -2162,6 +2176,42 @@ void testLegacyGameplayVmBoundary() {
           "CD ready callback advanced the hardware/audio timeline twice");
   require(vm.unbindHostCall(cd_ready_callback),
           "Could not remove the CD ready callback fixture");
+
+  // SF2/SF3 register their libcd data-ready entry directly rather than
+  // reading the SF1 callback-pointer global. Keep both executable layouts on
+  // the same hardware acknowledgement path.
+  constexpr std::uint32_t direct_cd_ready_callback = 0x80022040U;
+  constexpr std::uint32_t direct_cd_ready_result = 0x80125460U;
+  std::uint32_t direct_cd_ready_count{};
+  std::array<std::uint32_t, 2U> direct_cd_ready_arguments{};
+  vm.bindHostCall(direct_cd_ready_callback,
+                  [&direct_cd_ready_count, &direct_cd_ready_arguments](
+                      sf::game::LegacyHostCallContext &context) {
+                    ++direct_cd_ready_count;
+                    direct_cd_ready_arguments = {context.argument(0),
+                                                 context.argument(1)};
+                    context.setReturnValue(0U);
+                  });
+  ready_cdrom.interrupt_flags = 1U;
+  ready_cdrom.response_position = 0U;
+  ready_cdrom.response_count = 1U;
+  ready_cdrom.response[0] = 0x22U;
+  vm.bindPsxCdReadyCallback(direct_cd_ready_callback, direct_cd_ready_result,
+                            0U, false);
+  require(vm.machine().cdrom().restoreState(ready_cdrom) &&
+              vm.servicePsxCdReadyCallback(),
+          "Direct executable CD ready callback dispatch failed");
+  std::uint8_t direct_cd_ready_response{};
+  require(
+      direct_cd_ready_count == 1U &&
+          direct_cd_ready_arguments == std::array{1U, direct_cd_ready_result} &&
+          vm.runtime().read8(direct_cd_ready_result,
+                             direct_cd_ready_response) &&
+          direct_cd_ready_response == 0x22U &&
+          (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U,
+      "Direct executable CD ready callback state mismatch");
+  require(vm.unbindHostCall(direct_cd_ready_callback),
+          "Could not remove the direct CD ready callback fixture");
 
   // Non-data CD interrupts belong to the guest CD handler, not to the audio
   // scheduler. In retail gameplay an INT2/INT3 can remain latched while a room
@@ -4545,6 +4595,82 @@ void testLegacyGameplayVmBoundary() {
               vm.runtime().read32(0xa0009010U, random_seed) &&
               random_seed == seeded_value[0],
           "BIOS random seed HLE mismatch");
+  vm.clearHostCalls();
+
+  vm.bindPsxBiosCoreVector();
+  constexpr std::array bios_source{
+      std::byte{0x12},
+      std::byte{0x34},
+      std::byte{0x56},
+      std::byte{0x78},
+  };
+  require(vm.runtime().loadBytes(0x80010400U, bios_source),
+          "Could not seed BIOS memcpy source");
+  vm.runtime().setRegister(9U, 0x2aU);
+  const std::array memcpy_arguments{0x80010500U, 0x80010400U, 4U};
+  const auto bios_memcpy = vm.invoke(0x000000a0U, memcpy_arguments, 1U);
+  std::array<std::byte, bios_source.size()> bios_copy{};
+  require(bios_memcpy.completed() &&
+              bios_memcpy.return_value == memcpy_arguments[0] &&
+              vm.runtime().copyBytes(memcpy_arguments[0], bios_copy) &&
+              bios_copy == bios_source,
+          "BIOS vector memcpy HLE mismatch");
+
+  vm.runtime().setRegister(9U, 0x08U);
+  const std::array open_event_arguments{0xf0000009U, 0x20U, 0x2000U, 0U};
+  const auto bios_open_event =
+      vm.invoke(0x000000b0U, open_event_arguments, 1U);
+  vm.runtime().setRegister(9U, 0x0cU);
+  const auto bios_enable_event =
+      vm.invoke(0x000000b0U, std::array{bios_open_event.return_value}, 1U);
+  require(bios_open_event.completed() &&
+              (bios_open_event.return_value & 0xffff0000U) == 0xf1000000U &&
+              bios_enable_event.completed() &&
+              bios_enable_event.return_value == 1U,
+          "BIOS event bootstrap HLE mismatch");
+
+  vm.runtime().setRegister(9U, 0x0aU);
+  const std::array enable_clear_counter{3U, 1U};
+  const auto clear_counter_first =
+      vm.invoke(0x000000c0U, enable_clear_counter, 1U);
+  const std::array disable_clear_counter{3U, 0U};
+  vm.runtime().setRegister(9U, 0x0aU);
+  const auto clear_counter_second =
+      vm.invoke(0x000000c0U, disable_clear_counter, 1U);
+  require(clear_counter_first.completed() &&
+              clear_counter_first.return_value == 0U &&
+              clear_counter_second.completed() &&
+              clear_counter_second.return_value == 1U,
+          "BIOS ChangeClearRCnt state mismatch");
+
+  constexpr std::uint32_t syscall_address = 0x80030600U;
+  constexpr std::array exit_critical_words{
+      encodeI(0x09U, 0U, 4U, 2U),
+      0x0000000cU,
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  const auto exit_critical_code = instructionBytes(exit_critical_words);
+  require(vm.loadOverlay(syscall_address, exit_critical_code),
+          "Could not load BIOS syscall fixture");
+  const auto bios_exit_critical = vm.invoke(syscall_address);
+  require(bios_exit_critical.completed() &&
+              (vm.runtime().state().cop0_status & 0x401U) == 0x401U,
+          "ExitCriticalSection syscall HLE mismatch");
+  constexpr std::array enter_critical_words{
+      encodeI(0x09U, 0U, 4U, 1U),
+      0x0000000cU,
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  const auto enter_critical_code = instructionBytes(enter_critical_words);
+  require(vm.loadOverlay(syscall_address, enter_critical_code),
+          "Could not replace BIOS syscall fixture");
+  const auto bios_enter_critical = vm.invoke(syscall_address);
+  require(bios_enter_critical.completed() &&
+              bios_enter_critical.return_value == 1U &&
+              (vm.runtime().state().cop0_status & 0x401U) == 0U,
+          "EnterCriticalSection syscall HLE mismatch");
   vm.clearHostCalls();
 
   vm.bindPsxLibcStringCalls();

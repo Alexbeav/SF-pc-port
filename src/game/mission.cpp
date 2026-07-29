@@ -2,9 +2,12 @@
 
 #include "sf/assets/hog_archive.hpp"
 #include "sf/core/error.hpp"
+#include "sf/game/disc_info.hpp"
+#include "sf/game/embedded_hog.hpp"
 #include "sf/game/game_disc.hpp"
 #include "sf/game/localization.hpp"
 
+#include <algorithm>
 #include <array>
 #include <numeric>
 #include <string>
@@ -56,6 +59,86 @@ constexpr std::array missions{
     MissionDefinition{19U, "Missile Silo", "SILO", "WHOUSE.OVL", "",
                       "EOL/SILO.STR", 19, 2U, "CAVE.OVL"},
 };
+
+constexpr std::array sf2_missions{
+    MissionDefinition{0U, "Colorado Mountains", "COLO", "COLO.OVL", "", "",
+                      0},
+    MissionDefinition{1U, "McKenzie Airbase Interior", "AIRBASE",
+                      "AIRBASE.OVL", "", "", 1},
+    MissionDefinition{2U, "Colorado Interstate 70", "HWAY", "HWAY.OVL", "",
+                      "", 2},
+    MissionDefinition{3U, "I-70 Suspension Bridge", "BRIDGE", "BRIDGE.OVL",
+                      "", "", 3},
+    MissionDefinition{4U, "McKenzie Airbase Exterior", "AIRBASEX",
+                      "AIRBASEX.OVL", "", "", 4},
+    MissionDefinition{5U, "Colorado Train Ride", "TRAIN", "TRAIN.OVL", "", "",
+                      5},
+    MissionDefinition{6U, "Colorado Train Race", "TRAIN2", "TRAIN2.OVL", "",
+                      "", 6},
+    MissionDefinition{7U, "C-130 Wreck Site", "WRECK", "WRECK.OVL", "", "",
+                      7},
+    MissionDefinition{8U, "Pharcom Expo Center", "DISCO", "DISCO.OVL", "", "",
+                      8},
+    MissionDefinition{9U, "Morgan", "DARKMUSE", "DARKMUSE.OVL", "", "", 9},
+    MissionDefinition{10U, "Moscow Club 32", "MOSCOW", "MOSCOW.OVL", "", "",
+                      10},
+    MissionDefinition{11U, "Moscow Streets", "MOSCOW2", "MOSCOW2.OVL", "", "",
+                      11},
+    MissionDefinition{12U, "Volkov Park", "MOSCOW3", "MOSCOW3.OVL", "", "",
+                      12},
+    MissionDefinition{13U, "Gregorav", "GARAGE", "GARAGE.OVL", "", "", 13},
+    MissionDefinition{14U, "Aljir Prison Break-in", "GULAG", "GULAG.OVL", "",
+                      "", 14},
+    MissionDefinition{15U, "Aljir Prison Escape", "GULAG2", "GULAG2.OVL", "",
+                      "", 15},
+    MissionDefinition{16U, "Agency Bio-Lab", "LABS1", "LABS1.OVL", "", "",
+                      16},
+    MissionDefinition{17U, "Agency Bio-Lab Escape", "LABS2", "LABS2.OVL", "",
+                      "", 17},
+    MissionDefinition{18U, "New York Slums", "SLUMS", "SLUMS.OVL", "", "",
+                      18},
+    MissionDefinition{19U, "New York Sewer", "SLUMS2", "SLUMS2.OVL", "", "",
+                      19},
+    MissionDefinition{20U, "Chance", "CHINBOSS", "CHINBOSS.OVL", "", "", 20},
+};
+
+constexpr std::array sf3_missions{
+    MissionDefinition{0U, "Hotel Fukushima", "TOKYO", "GENERIC.OVL", "", "",
+                      0},
+    MissionDefinition{1U, "Costa Rican Plantation", "JUNGLE", "GENERIC.OVL",
+                      "", "", 1},
+    MissionDefinition{2U, "C-5 Galaxy Transport", "JUNGLE3", "JUNGLE3.OVL",
+                      "", "", 2},
+    MissionDefinition{3U, "Pugari Gold Mine", "AFRICA1", "AFRICA1.OVL", "",
+                      "", 3},
+    MissionDefinition{4U, "Pugari Complex", "AFRICA2", "AFRICA2.OVL", "", "",
+                      4},
+    MissionDefinition{5U, "Kabul, Afghanistan", "AFGHAN2", "GENERIC.OVL", "",
+                      "", 5},
+    MissionDefinition{6U, "S.S. Lorelei", "LONDON1", "GENERIC.OVL", "", "",
+                      6},
+    MissionDefinition{7U, "Aztec Ruins", "JUNGLE2", "GENERIC.OVL", "", "",
+                      7},
+    MissionDefinition{8U, "Waterfront", "LONDON2", "GENERIC.OVL", "", "", 8},
+    MissionDefinition{9U, "Docks Final Assault", "LONDON3", "GENERIC.OVL", "",
+                      "", 9},
+    MissionDefinition{10U, "Convoy", "AFGHAN1", "GENERIC.OVL", "", "", 10},
+    MissionDefinition{11U, "The Beast", "AFGHAN3", "GENERIC.OVL", "", "",
+                      11},
+    MissionDefinition{12U, "Australian Outback", "TRIAGE1", "GENERIC.OVL", "",
+                      "", 12},
+    MissionDefinition{13U, "St. George Australia", "TRIAGE2", "GENERIC.OVL",
+                      "", "", 13},
+    MissionDefinition{14U, "Paradise Ridge", "RIDGE", "GENERIC.OVL", "", "",
+                      14},
+    MissionDefinition{15U, "Militia Compound", "SNOWCAMP", "GENERIC.OVL", "",
+                      "", 15},
+    MissionDefinition{16U, "Underground Bunker", "MCAVES", "GENERIC.OVL", "",
+                      "", 16},
+    MissionDefinition{17U, "Senate Building", "SENATE", "GENERIC.OVL", "", "",
+                      17},
+    MissionDefinition{18U, "DC Subway", "SENATE2", "GENERIC.OVL", "", "", 18},
+};
 constexpr std::array<std::string_view, 1U> subway_scripted_movies{
     "SOL/INTRO.STR"};
 constexpr std::array<std::string_view, 1U> museum_scripted_movies{
@@ -96,6 +179,45 @@ assets::HogArchive parseObjectModels(std::span<const std::byte> dlf) {
       copyBytes(dlf.subspan(archive_offset, archive_end - archive_offset)));
 }
 
+const MissionDefinition &definitionForDisc(const GameDisc &disc,
+                                           std::uint32_t index) {
+  if (!disc.game() || disc.game()->id == GameId::syphon_filter) {
+    return missionDefinition(index);
+  }
+  if (disc.game()->id == GameId::syphon_filter_2) {
+    const auto &definition =
+        missionDefinition(GameId::syphon_filter_2, index);
+    const auto resources =
+        missionResources(disc.game()->id, disc.game()->disc_number);
+    if (std::ranges::none_of(resources, [index](const auto &resource) {
+          return resource.selection_index == index;
+        })) {
+      throw core::Error{
+          core::ErrorCode::not_found,
+          "Mission is not present on this Syphon Filter 2 disc",
+      };
+    }
+    return definition;
+  }
+  if (disc.game()->id == GameId::syphon_filter_3) {
+    const auto &definition =
+        missionDefinition(GameId::syphon_filter_3, index);
+    const auto resources =
+        missionResources(disc.game()->id, disc.game()->disc_number);
+    if (std::ranges::none_of(resources, [index](const auto &resource) {
+          return resource.selection_index == index;
+        })) {
+      throw core::Error{
+          core::ErrorCode::not_found,
+          "Mission is not present on this Syphon Filter 3 disc",
+      };
+    }
+    return definition;
+  }
+  throw core::Error{core::ErrorCode::invalid_argument,
+                    "Native mission packaging is not mapped for this game"};
+}
+
 } // namespace
 
 std::span<const MissionDefinition> missionCatalog() noexcept {
@@ -108,6 +230,29 @@ const MissionDefinition &missionDefinition(std::uint32_t index) {
                       "Mission index is outside the retail campaign"};
   }
   return missions[index];
+}
+
+const MissionDefinition &missionDefinition(GameId game, std::uint32_t index) {
+  const auto select = [index](const auto &catalog,
+                              std::string_view game_name)
+      -> const MissionDefinition & {
+    if (index >= catalog.size()) {
+      throw core::Error{core::ErrorCode::invalid_argument,
+                        "Mission index is outside the " +
+                            std::string{game_name} + " campaign"};
+    }
+    return catalog[index];
+  };
+  switch (game) {
+  case GameId::syphon_filter:
+    return select(missions, "Syphon Filter");
+  case GameId::syphon_filter_2:
+    return select(sf2_missions, "Syphon Filter 2");
+  case GameId::syphon_filter_3:
+    return select(sf3_missions, "Syphon Filter 3");
+  }
+  throw core::Error{core::ErrorCode::invalid_argument,
+                    "Unknown game in mission catalog"};
 }
 
 std::span<const std::string_view>
@@ -133,8 +278,10 @@ missionScriptedMoviePaths(std::uint32_t index) noexcept {
 }
 
 MissionPackage::MissionPackage(
-    MissionDefinition definition, assets::MissionBriefing briefing,
+    GameId game_id, MissionDefinition definition,
+    assets::MissionBriefing briefing,
     bool has_retail_briefing, assets::FogArchive archive,
+    std::optional<assets::MissionScriptArchive> mission_scripts,
     LegacyMissionImage legacy_image, DiscMovie opening_movie,
     std::vector<DiscMovie> scripted_movies, DiscMovie ending_movie,
     assets::HogArchive world_models, assets::HogArchive object_models,
@@ -142,8 +289,10 @@ MissionPackage::MissionPackage(
     assets::HogArchive menu_assets, assets::HogArchive character_animations,
     std::vector<assets::HogArchive> texture_banks, assets::LevelLayout layout,
     assets::MissionObjects objects, std::size_t texture_file_count)
-    : definition_(definition), briefing_(std::move(briefing)),
+    : game_id_(game_id), definition_(definition),
+      briefing_(std::move(briefing)),
       has_retail_briefing_(has_retail_briefing), archive_(std::move(archive)),
+      mission_scripts_(std::move(mission_scripts)),
       legacy_image_(std::move(legacy_image)),
       opening_movie_(std::move(opening_movie)),
       scripted_movies_(std::move(scripted_movies)),
@@ -160,15 +309,23 @@ MissionPackage::MissionPackage(
 const assets::HogArchive &MissionPackage::textureBank(std::size_t bank) const {
   if (bank >= texture_banks_.size()) {
     throw core::Error{core::ErrorCode::invalid_argument,
-                      "Invalid mission texture bank"};
+                      "Invalid mission texture bank " + std::to_string(bank) +
+                          " (mission contains " +
+                          std::to_string(texture_banks_.size()) + ")"};
   }
   return texture_banks_[bank];
 }
 
 MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
-  const auto &definition = missionDefinition(index);
+  const auto &definition = definitionForDisc(disc, index);
+  const auto is_sf1 =
+      !disc.game() || disc.game()->id == GameId::syphon_filter;
   const auto resource = std::string{definition.resource_name};
-  const auto archive_path = "FOG/" + resource + ".FOG";
+  const auto archive_directory =
+      disc.game() ? disc.game()->layout.mission_archive_directory
+                  : std::string_view{"FOG"};
+  const auto archive_path =
+      std::string{archive_directory} + "/" + resource + ".FOG";
   auto archive = assets::FogArchive::parse(disc.image().readFile(archive_path));
   auto legacy_image = LegacyMissionImage::load(disc, archive, archive_path);
 
@@ -189,9 +346,12 @@ MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
     const auto briefing_overlay = definition.briefing_overlay_name.empty()
                                       ? definition.overlay_name
                                       : definition.briefing_overlay_name;
+    const auto overlay_bytes =
+        is_sf1
+            ? disc.image().readFile("BIN/" + std::string{briefing_overlay})
+            : copyBytes(archive.file(briefing_overlay));
     briefing = assets::MissionBriefing::parseOverlayRecord(
-        disc.image().readFile("BIN/" + std::string{briefing_overlay}),
-        definition.briefing_record, definition.title);
+        overlay_bytes, definition.briefing_record, definition.title);
     has_retail_briefing = true;
   } catch (const core::Error &) {
     // The overlay is authoritative. Keep DLF parsing only as a fallback
@@ -205,11 +365,13 @@ MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
       // A malformed optional briefing must not prevent mission loading.
     }
   }
-  if (const auto localized = localizedMissionBriefing(index)) {
+  if (is_sf1) {
+    if (const auto localized = localizedMissionBriefing(index)) {
     briefing = assets::MissionBriefing::fromFields(
         localized->location, localized->mission_title, localized->date_time,
         localized->directive, localized->additional_directive);
     has_retail_briefing = true;
+    }
   }
   std::vector<assets::HogArchive> texture_banks;
   texture_banks.push_back(
@@ -225,17 +387,27 @@ MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
       assets::HogArchive::parse(copyBytes(archive.file("WLDEMD.HOG")));
   auto object_models = parseObjectModels(archive.file("DLF.RFF"));
   auto special_effects =
-      assets::HogArchive::parse(disc.image().readFile("COMMON/SPFX.HOG"));
+      is_sf1 ? assets::HogArchive::parse(
+                   disc.image().readFile("COMMON/SPFX.HOG"))
+             : parseEmbeddedHog(disc.executable(), "90SIDE.TIM",
+                                "BEEPSX.VB");
   auto interface_assets =
-      assets::HogArchive::parse(disc.image().readFile("COMMON/INTRFACE.HOG"));
+      is_sf1 ? assets::HogArchive::parse(
+                   disc.image().readFile("COMMON/INTRFACE.HOG"))
+             : parseEmbeddedHog(disc.executable(), "AMGA.TIM",
+                                "90SIDE.TIM");
   auto menu_assets =
       assets::HogArchive::parse(copyBytes(archive.file("MENU.HOG")));
   auto character_animations =
-      assets::HogArchive::parse(disc.image().readFile("COMMON/PCHAN.HOG"));
-  for (unsigned int frame = 0; frame < 8U; ++frame) {
-    static_cast<void>(
-        special_effects.file("EXPL00" + std::to_string(frame) + ".TIM"));
-  }
+      is_sf1
+          ? assets::HogArchive::parse(
+                disc.image().readFile("COMMON/PCHAN.HOG"))
+          : parseEmbeddedHog(disc.executable(), "CLIMBA.HAN", "AMGA.TIM");
+  if (is_sf1) {
+    for (unsigned int frame = 0; frame < 8U; ++frame) {
+      static_cast<void>(
+          special_effects.file("EXPL00" + std::to_string(frame) + ".TIM"));
+    }
   constexpr std::array required_interface_assets{
       "DANGER.TIM",   "TARGET.TIM",   "ARMOR.TIM",
       "PISTOL1A.TIM", "PISTOL1B.TIM", "TASERA.TIM",
@@ -244,11 +416,12 @@ MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
   for (const auto *name : required_interface_assets) {
     static_cast<void>(interface_assets.file(name));
   }
+  }
   constexpr std::array required_menu_assets{
       "GLOKSIL.TIM", "TASER.TIM", "FLASHLT.TIM",  "MAP1.TIM",
       "MAP2.TIM",    "MAP3.TIM",  "WEAPDESC.TXT",
   };
-  if (index == 0U) {
+  if (is_sf1 && index == 0U) {
     for (const auto *name : required_menu_assets) {
       static_cast<void>(menu_assets.file(name));
     }
@@ -257,12 +430,20 @@ MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
       "ST0.LWR", "ST02.UPR", "WK0.LWR",    "WK0.UPR",
       "RN0.LWR", "RN0.UPR",  "IDLE13.HAN",
   };
-  for (const auto *name : required_animations) {
-    static_cast<void>(character_animations.file(name));
+  if (is_sf1) {
+    for (const auto *name : required_animations) {
+      static_cast<void>(character_animations.file(name));
+    }
   }
-  auto layout = assets::LevelLayout::parse(archive.file(resource + ".DAT"),
-                                           world_models.entries().size());
+  auto layout = assets::LevelLayout::parse(
+      archive.file(resource + ".DAT"), world_models.entries().size(),
+      is_sf1 ? 15U : 16U);
   auto objects = assets::MissionObjects::parse(archive.file(resource + ".BIN"));
+  std::optional<assets::MissionScriptArchive> mission_scripts;
+  if (!is_sf1) {
+    mission_scripts =
+        assets::MissionScriptArchive::parse(archive.file(resource + ".SS"));
+  }
   const auto texture_file_count =
       std::accumulate(texture_banks.begin(), texture_banks.end(), std::size_t{},
                       [](std::size_t count, const assets::HogArchive &bank) {
@@ -279,15 +460,21 @@ MissionPackage MissionPackage::load(GameDisc &disc, std::uint32_t index) {
   };
   auto opening_movie = load_movie(definition.opening_movie_path);
   std::vector<DiscMovie> scripted_movies;
-  for (const auto path : missionScriptedMoviePaths(index)) {
-    scripted_movies.push_back(load_movie(path));
+  if (is_sf1) {
+    for (const auto path : missionScriptedMoviePaths(index)) {
+      scripted_movies.push_back(load_movie(path));
+    }
   }
   auto ending_movie = load_movie(definition.ending_movie_path);
+  const auto game_id =
+      disc.game() ? disc.game()->id : GameId::syphon_filter;
   return MissionPackage{
+      game_id,
       definition,
       std::move(briefing),
       has_retail_briefing,
       std::move(archive),
+      std::move(mission_scripts),
       std::move(legacy_image),
       std::move(opening_movie),
       std::move(scripted_movies),

@@ -762,6 +762,14 @@ struct LegacyDroppedItemBridgeState {
   // primary world list so its OT depth is shared with Gabe and the level.
   // Preserve the complete transform used to project and sort that sprite.
   LegacyNativeMatrix transform;
+  // The retail presentation pool above exposes only identity and transform.
+  // Native sequel actors also retain their live magazine/reserve when the
+  // carried weapon is detached. Keep that quantity explicitly qualified so
+  // a retail bridge record with zero-filled extension fields still uses the
+  // normal item-table pickup quantity.
+  bool quantity_valid{};
+  std::uint16_t magazine{};
+  std::uint16_t reserve{};
 
   [[nodiscard]] friend bool
   operator==(const LegacyDroppedItemBridgeState &,

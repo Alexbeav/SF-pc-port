@@ -47,7 +47,7 @@ void testOriginalWeaponRecords() {
   using DamagePair = std::array<std::uint16_t, 2U>;
   constexpr std::array<DamagePair, weapon_slot_count> expected_damage{{
       DamagePair{15U, 0U},    DamagePair{50U, 25U},   DamagePair{50U, 25U},
-      DamagePair{15U, 0U},    DamagePair{150U, 75U},  DamagePair{50U, 25U},
+      DamagePair{100U, 0U},   DamagePair{150U, 75U},  DamagePair{50U, 25U},
       DamagePair{300U, 150U}, DamagePair{200U, 75U},  DamagePair{50U, 25U},
       DamagePair{50U, 25U},   DamagePair{75U, 35U},   DamagePair{50U, 25U},
       DamagePair{90U, 90U},   DamagePair{50U, 25U},   DamagePair{100U, 0U},
@@ -71,6 +71,17 @@ void testOriginalWeaponRecords() {
           "Glock record must preserve both native damage fields and model");
   require(glock.fire_mode == WeaponFireMode::semi_automatic,
           "Glock must be semi-automatic");
+  const auto &knife = weaponCombatDefinition(WeaponId::knife);
+  require(knife.fire_mode == WeaponFireMode::semi_automatic &&
+              knife.damage_kind == WeaponDamageKind::melee &&
+              knife.close_damage == 100U && knife.distant_damage == 0U &&
+              knife.world_model == "KNIFE",
+          "SF2 knife record must retain its melee damage and model");
+  require(contextualMeleeDamage(knife.close_damage, 1023) == 100U &&
+              contextualMeleeDamage(knife.close_damage, -1023) == 100U &&
+              contextualMeleeDamage(knife.close_damage, 1024) == 200U &&
+              contextualMeleeDamage(knife.close_damage, -1024) == 200U,
+          "Rear knife strikes must apply the SF2 takedown multiplier");
   const auto &shotgun = weaponCombatDefinition(WeaponId::combat_shotgun);
   require(shotgun.close_damage == 300U && shotgun.distant_damage == 150U &&
               shotgun.pellet_count == 8U && shotgun.world_model == "BERELLI",
@@ -102,14 +113,14 @@ void testOriginalWeaponRecords() {
       "Special weapons must retain distinct beam, flame, projectile and throw "
       "modes");
   constexpr std::array<std::string_view, weapon_slot_count> retail_models{
-      "",        "GLOKSIL",  "GLOCK17", "",         "COLT45",   "GLOCK18",
+      "",        "GLOKSIL",  "GLOCK17", "KNIFE",    "COLT45",   "GLOCK18",
       "BERELLI", "ITHICA37", "AK102",   "M16",      "BIZON2",   "MP5",
       "DRAGSVD", "SUPERG",   "TASER",   "FLAMEGDF", "GRENLAUN", "G3",
       "FLASHLT", "GRENADE",  "GRENADE", "FLASHLT",  "CHNGUN",   "",
       "",        "",
   };
   constexpr std::array<unsigned int, weapon_slot_count> retail_cadence{
-      0U, 4U, 12U, 0U,  8U, 1U, 18U, 15U, 2U, 2U, 2U, 2U, 20U,
+      0U, 4U, 12U, 10U, 8U, 1U, 18U, 15U, 2U, 2U, 2U, 2U, 20U,
       4U, 0U, 2U,  20U, 2U, 0U, 15U, 15U, 0U, 2U, 0U, 0U, 0U,
   };
   for (std::size_t slot = 0U; slot < weapon_slot_count; ++slot) {

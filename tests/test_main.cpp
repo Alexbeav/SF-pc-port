@@ -7,6 +7,7 @@
 #include "sf/assets/level_layout.hpp"
 #include "sf/assets/mission_briefing.hpp"
 #include "sf/assets/mission_objects.hpp"
+#include "sf/assets/mission_script.hpp"
 #include "sf/assets/tim_image.hpp"
 #include "sf/assets/weapon_descriptions.hpp"
 #include "sf/core/error.hpp"
@@ -16,6 +17,8 @@
 #include "sf/disc/iso9660.hpp"
 #include "sf/game/actor_animation.hpp"
 #include "sf/game/chase_camera.hpp"
+#include "sf/game/disc_cdrom_media.hpp"
+#include "sf/game/disc_info.hpp"
 #include "sf/game/effects.hpp"
 #include "sf/game/gameplay.hpp"
 #include "sf/game/hud.hpp"
@@ -23,6 +26,8 @@
 #include "sf/game/mission.hpp"
 #include "sf/game/mission_start.hpp"
 #include "sf/game/player_controller.hpp"
+#include "sf/game/runtime_profile.hpp"
+#include "sf/game/sf2_runtime.hpp"
 #include "sf/game/state_stack.hpp"
 #include "sf/game/supported_games.hpp"
 #include "sf/game/system.hpp"
@@ -57,17 +62,102 @@ void require(bool condition, const char *message) {
 
 void testSupportedGames() {
   const auto games = sf::game::supportedGames();
-  require(games.size() == 3U, "Supported-game catalog is incomplete");
+  require(games.size() == 4U, "Supported-game catalog is incomplete");
   const auto disc1 = sf::game::identify("SCUS94451", games[1].executable_sha256);
   const auto disc2 = sf::game::identify("SCUS94492", games[2].executable_sha256);
   require(disc1 && disc1->serial == "SCUS-94451" &&
-              disc1->executable_path == "SCUS_944.51" &&
-              disc2 && disc2->serial == "SCUS-94492" &&
+              disc1->executable_path == "SCUS_944.51" && disc2 &&
+              disc2->serial == "SCUS-94492" &&
               disc2->executable_path == "SCUS_944.92" &&
+              disc1->id == sf::game::GameId::syphon_filter_2 &&
+              disc1->disc_number == 1U && disc2->disc_number == 2U &&
+              disc1->layout.title_archive_path == "TITLE.HOG" &&
+              disc1->layout.mission_info_path == "DISK1.INF" &&
+              disc1->layout.streaming_audio_path == "SCENES1.XA" &&
+              disc2->layout.streaming_audio_path == "SCENES2.XA" &&
+              disc1->executable_layout.vsync_address == 0x800f48f0U &&
+              disc1->executable_layout.retrace_counter_address == 0x8012d0f4U &&
+              disc1->executable_layout.cd_control_address == 0x80103968U &&
+              disc1->executable_layout.cd_ready_callback_address ==
+                  0x800f703cU &&
+              !disc1->executable_layout.cd_ready_callback_is_pointer &&
               games[1].executable_sha256 == games[2].executable_sha256,
           "Syphon Filter 2 disc recognition profile mismatch");
+  const auto sf3 = sf::game::identify("SCUS94640", games[3].executable_sha256);
+  require(sf3 && sf3->id == sf::game::GameId::syphon_filter_3 &&
+              sf3->serial == "SCUS-94640" &&
+              sf3->layout.title_archive_path == "TITLE.HOG" &&
+              sf3->layout.streaming_audio_path == "SCENES1.XA" &&
+              sf3->executable_layout.vsync_address == 0x800f7660U &&
+              sf3->executable_layout.retrace_counter_address == 0x8012fdc8U &&
+              sf3->executable_layout.cd_control_address == 0x8010669cU &&
+              sf3->executable_layout.cd_ready_callback_address == 0x800f9e0cU,
+          "Syphon Filter 3 disc recognition profile mismatch");
+  const auto sf2_disc1_resources =
+      sf::game::missionResources(sf::game::GameId::syphon_filter_2, 1U);
+  const auto sf2_disc2_resources =
+      sf::game::missionResources(sf::game::GameId::syphon_filter_2, 2U);
+  const auto sf3_resources =
+      sf::game::missionResources(sf::game::GameId::syphon_filter_3, 1U);
+  require(sf2_disc1_resources.size() == 8U &&
+              sf2_disc1_resources.front() ==
+                  sf::game::GameMissionResource{0U, "COLO"} &&
+              sf2_disc1_resources.back() ==
+                  sf::game::GameMissionResource{7U, "WRECK"} &&
+              sf2_disc2_resources.size() == 13U &&
+              sf2_disc2_resources.front() ==
+                  sf::game::GameMissionResource{8U, "DISCO"} &&
+              sf2_disc2_resources.back() ==
+                  sf::game::GameMissionResource{20U, "CHINBOSS"} &&
+              sf3_resources.size() == 19U &&
+              sf3_resources.front() ==
+                  sf::game::GameMissionResource{0U, "TOKYO"} &&
+              sf3_resources[15] ==
+                  sf::game::GameMissionResource{15U, "SNOWCAMP"} &&
+              sf3_resources.back() ==
+                  sf::game::GameMissionResource{18U, "SENATE2"},
+          "Sequel mission resource mapping mismatch");
   require(!sf::game::identify("SCUS94451", games[0].executable_sha256),
           "Supported-game recognition ignored executable identity");
+  require(sf::game::missionDefinition(sf::game::GameId::syphon_filter_3, 2U)
+                  .overlay_name == "JUNGLE3.OVL" &&
+              sf::game::missionDefinition(sf::game::GameId::syphon_filter_3,
+                                          3U)
+                      .overlay_name == "AFRICA1.OVL" &&
+              sf::game::missionDefinition(sf::game::GameId::syphon_filter_3,
+                                          4U)
+                      .overlay_name == "AFRICA2.OVL" &&
+              sf::game::missionDefinition(sf::game::GameId::syphon_filter_3,
+                                          5U)
+                      .overlay_name == "GENERIC.OVL",
+          "Syphon Filter 3 authored mission-overlay catalog mismatch");
+}
+
+void testRuntimeProfiles() {
+  const auto &sf1 =
+      sf::game::runtimeProfile(sf::game::GameId::syphon_filter);
+  const auto &sf2 =
+      sf::game::runtimeProfile(sf::game::GameId::syphon_filter_2);
+  const auto &sf3 =
+      sf::game::runtimeProfile(sf::game::GameId::syphon_filter_3);
+  require(
+      sf1.kind == sf::game::GameRuntimeKind::sf1 &&
+          sf1.uses_legacy_guest_runtime &&
+          !sf1.supports_native_mission_items &&
+          sf1.hud_atlas == sf::game::HudAtlasKind::sf1 &&
+          sf2.kind == sf::game::GameRuntimeKind::sf2 &&
+          !sf2.uses_legacy_guest_runtime &&
+          sf2.supports_native_mission_items &&
+          sf2.supports_native_mission_interactions &&
+          sf2.first_person_eye_height == 220.0 &&
+          sf2.hud_atlas == sf::game::HudAtlasKind::sf2 &&
+          sf3.kind == sf::game::GameRuntimeKind::sf3 &&
+          !sf3.supports_native_mission_items &&
+          !sf3.supports_native_mission_interactions &&
+          sf3.emd_vertex_index_stride == 2U &&
+          sf3.hmd_vertex_index_stride == 8U &&
+          sf3.hud_atlas == sf::game::HudAtlasKind::sf3,
+      "Game runtimes no longer have explicit independent ownership");
 }
 
 void writeLe32(std::span<std::byte> bytes, std::size_t offset,
@@ -82,6 +172,45 @@ void writeLe16(std::span<std::byte> bytes, std::size_t offset,
                std::uint16_t value) {
   bytes[offset] = static_cast<std::byte>(value);
   bytes[offset + 1] = static_cast<std::byte>(value >> 8U);
+}
+
+void testDiscSelectionTitles() {
+  std::vector<std::byte> bytes(64U, std::byte{0});
+  writeLe16(bytes, 0U, 4U);
+  writeLe16(bytes, 2U, 0xfefeU);
+  writeLe16(bytes, 4U, 14U);
+  writeLe16(bytes, 6U, 62U);
+  auto offset = std::size_t{8U};
+  auto append = [&](std::uint16_t index, std::string_view title) {
+    writeLe16(bytes, offset, index);
+    offset += 2U;
+    std::ranges::transform(
+        title, bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+        [](char value) { return static_cast<std::byte>(value); });
+    offset += title.size();
+    bytes[offset++] = std::byte{0};
+  };
+  append(0U, "Colorado Mountains");
+  append(1U, "McKenzie Airbase Interior");
+  bytes.resize(offset + 8U);
+  bytes[offset] = std::byte{'P'};
+  bytes[offset + 1U] = std::byte{'l'};
+
+  const auto titles = sf::game::parseDiscSelectionTitles(bytes);
+  require(titles.size() == 2U && titles[0].index == 0U &&
+              titles[0].title == "Colorado Mountains" &&
+              titles[1].index == 1U &&
+              titles[1].title == "McKenzie Airbase Interior",
+          "SF2 disc selection catalog did not parse sequential titles");
+
+  bytes[8U] = std::byte{1};
+  try {
+    static_cast<void>(sf::game::parseDiscSelectionTitles(bytes));
+    throw std::runtime_error{"Invalid SF2 disc selection catalog was accepted"};
+  } catch (const sf::core::Error &error) {
+    require(error.code() == sf::core::ErrorCode::invalid_format,
+            "Invalid SF2 selection catalog returned the wrong error");
+  }
 }
 
 void writeFogEntry(std::span<std::byte> bytes, std::size_t index,
@@ -310,6 +439,18 @@ void testTimImage() {
   require(image.displayWidth() == 2 && image.displayHeight() == 2,
           "TIM display dimensions mismatch");
   require(image.pixels().words[1] == 0x0302, "TIM pixel payload mismatch");
+
+  writeLe32(bytes, 4U, 0x84000009U);
+  const auto sequel_image = sf::assets::TimImage::parse(bytes);
+  require(sequel_image.mode() == sf::assets::TimPixelMode::indexed8 &&
+              sequel_image.displayWidth() == image.displayWidth(),
+          "SF3 TIM metadata flags changed the decoded image");
+  writeLe32(bytes, 4U, 0x80000009U);
+  const auto partial_metadata_image = sf::assets::TimImage::parse(bytes);
+  require(partial_metadata_image.mode() ==
+                  sf::assets::TimPixelMode::indexed8 &&
+              partial_metadata_image.displayHeight() == image.displayHeight(),
+          "SF3 TIM partial metadata flags changed the decoded image");
 }
 
 void testEmdScene() {
@@ -319,8 +460,11 @@ void testEmdScene() {
       sf::assets::resolveEmdTexturePageSource(0x98U, 1U << 18U, 1U << 24U);
   const auto vlf_fallback =
       sf::assets::resolveEmdTexturePageSource(0x9eU, 0U, 1U << 30U);
+  const auto unaliased_direct =
+      sf::assets::resolveEmdTexturePageSource(0x9fU, 0U, 0U);
   require(direct && *direct == 7U && shifted && *shifted == 18U &&
-              vlf_fallback && *vlf_fallback == 30U,
+              vlf_fallback && *vlf_fallback == 30U && unaliased_direct &&
+              *unaliased_direct == 31U,
           "EMD logical texture-page resolution mismatch");
   require(!sf::assets::resolveEmdTexturePageSource(
               0x98U, (1U << 18U) | (1U << 24U), 0U) &&
@@ -332,7 +476,9 @@ void testEmdScene() {
   constexpr std::size_t section_offset = 0xa0;
   constexpr std::size_t vertex_offset = section_offset + 0x4c;
   std::vector<std::byte> bytes(vertex_offset + 4U * 8U);
-  writeLe32(bytes, 0, 0x303U);
+  // The upper bits in the low flag byte are not part of the texture-bank
+  // selector. This combination still selects bank zero.
+  writeLe32(bytes, 0, 0x323U);
   writeLe32(bytes, 4, static_cast<std::uint32_t>(section_offset));
   writeLe32(bytes, 8, 0xffffffffU);
   writeLe16(bytes, section_offset + 4, 2);
@@ -359,7 +505,7 @@ void testEmdScene() {
   }
 
   const auto scene = sf::assets::EmdScene::parse(bytes);
-  require(scene.flags() == 0x303U, "EMD flags mismatch");
+  require(scene.flags() == 0x323U, "EMD flags mismatch");
   require(scene.textureBank() == 0 && scene.texturePageMask() == 0x12345678U,
           "EMD texture metadata mismatch");
   require(scene.sections().size() == 1 && scene.vertexCount() == 4 &&
@@ -381,6 +527,17 @@ void testEmdScene() {
   require(resolved_mask &&
               *resolved_mask == (scene.texturePageMask() | (1U << 7U)),
           "EMD selective texture-page mask mismatch");
+
+  auto sf3_index_bytes = bytes;
+  writeLe32(sf3_index_bytes, section_offset + 0x30, 0x02870000U);
+  writeLe32(sf3_index_bytes, section_offset + 0x34, 0x04000006U);
+  writeLe32(sf3_index_bytes, section_offset + 0x40, 0x02cb0000U);
+  writeLe32(sf3_index_bytes, section_offset + 0x44, 0x04000006U);
+  const auto sf3_index_scene =
+      sf::assets::EmdScene::parse(sf3_index_bytes, 2U);
+  require(sf3_index_scene.sections().front().polygons.front().vertex_indices ==
+              std::array<std::uint16_t, 4>{1, 0, 2, 3},
+          "SF3 EMD compact vertex-index stride mismatch");
 
   // The retail header reserves 0x04..0x7f for section offsets. The words at
   // 0x80 and 0x84 point to linked-light metadata and must never become fake
@@ -938,6 +1095,59 @@ void testHmdModel() {
                   std::array<std::uint16_t, 3>{0, 1, 2},
           "Flat-lit HMD vertex stride mismatch");
 
+  auto sf3_stride_bytes = makeHmdModel(false);
+  writeLe32(sf3_stride_bytes, 0x30U, (16U << 16U) | 8U);
+  const auto sf3_stride_model =
+      sf::assets::HmdModel::parse(sf3_stride_bytes, 8U);
+  require(sf3_stride_model.triangles().front().vertex_indices ==
+              std::array<std::uint16_t, 3>{0, 1, 2},
+          "SF3 HMD vertex stride mismatch");
+
+  {
+    constexpr std::size_t original_geometry_end = 0xd8U;
+    constexpr std::size_t empty_part_size = 0x74U;
+    constexpr std::size_t expanded_geometry_end =
+        original_geometry_end + empty_part_size;
+    std::vector<std::byte> with_empty_part(expanded_geometry_end + 0x40U);
+    std::copy_n(bytes.begin(), original_geometry_end,
+                with_empty_part.begin());
+    writeLe32(with_empty_part, 4U, 2U);
+    writeLe32(with_empty_part, 0x14U,
+              static_cast<std::uint32_t>(expanded_geometry_end));
+    writeLe32(with_empty_part, original_geometry_end, empty_part_size);
+    writeLe32(with_empty_part, original_geometry_end + 4U, 1U);
+    writeLe32(with_empty_part, original_geometry_end + 8U, 1U);
+    writeLe32(with_empty_part, original_geometry_end + 0x0cU, 1U);
+    writeLe16(with_empty_part, original_geometry_end + 0x10U, 4096U);
+    writeLe16(with_empty_part, original_geometry_end + 0x18U, 4096U);
+    writeLe16(with_empty_part, original_geometry_end + 0x20U, 4096U);
+    constexpr std::string_view empty_name{"Empty"};
+    std::ranges::transform(
+        empty_name, with_empty_part.begin() + original_geometry_end + 0x28U,
+        [](char value) { return static_cast<std::byte>(value); });
+    writeLe16(with_empty_part, original_geometry_end + 0x38U, 0U);
+    writeLe32(with_empty_part, original_geometry_end + 0x40U,
+              static_cast<std::uint32_t>(original_geometry_end + 0x5cU));
+    std::copy_n(bytes.begin() + original_geometry_end, 0x20U,
+                with_empty_part.begin() + expanded_geometry_end);
+    for (std::size_t component = 0U; component < 3U; ++component) {
+      writeLe32(with_empty_part, expanded_geometry_end + 0x20U +
+                                     component * 4U,
+                32767U);
+      writeLe32(with_empty_part, expanded_geometry_end + 0x30U +
+                                     component * 4U,
+                static_cast<std::uint32_t>(-32767));
+    }
+    const auto empty_model = sf::assets::HmdModel::parse(with_empty_part);
+    require(empty_model.parts().size() == 2U &&
+                empty_model.parts()[1].declared_vertex_count == 0U &&
+                empty_model.parts()[1].bounds.minimum ==
+                    std::array<std::int32_t, 3>{} &&
+                empty_model.parts()[1].bounds.maximum ==
+                    std::array<std::int32_t, 3>{},
+            "Empty HMD hierarchy-node bounds sentinel was not normalized");
+  }
+
   auto invalid = bytes;
   writeLe16(invalid, 0x34U + 0x38U, 0);
   try {
@@ -1353,6 +1563,15 @@ void testChaseCamera() {
           "First-person aiming camera is no longer at the lowered requested "
           "height");
 
+  const sf::game::FirstPersonCamera sequel_aim_camera{
+      sf::game::FirstPersonCameraConfiguration{.eye_height = 220.0}};
+  const auto sequel_level_aim =
+      sequel_aim_camera.view(player_x, player_y, player_z, 0, 0.0);
+  require(std::abs(sequel_level_aim.y + 20.0) < epsilon &&
+              std::abs(sequel_level_aim.target_y + 20.0) < epsilon &&
+              std::abs(sequel_level_aim.z - 334.0) < epsilon,
+          "Sequel first-person camera left its upper-chest anchor");
+
   const auto lowered_sight = sf::game::cameraRayAtProjectionOffset(
       level_aim, 0.0, sf::game::manual_aim_reticle_vertical_offset);
   const auto lowered_screen_y =
@@ -1446,6 +1665,57 @@ void testPlayerController() {
   require(
       player_camera_delta > 0.0 && player_camera_delta < 10.0,
       "Chase camera remained rigidly attached instead of following smoothly");
+
+  controller.reset(spawn);
+  controller.update(
+      sf::game::PlayerInput{
+          .run = true,
+          .strafe = 1.0,
+      },
+      movement);
+  require(
+      controller.locomotion() == sf::game::PlayerLocomotionState::running &&
+          controller.actorMotion() == sf::game::ActorMotion::run &&
+          controller.modelHeading() == 1024 &&
+          controller.state().yaw == spawn.yaw &&
+          controller.cameraIntent().heading == spawn.yaw &&
+          controller.state().x > spawn.x &&
+          std::abs(controller.state().z - spawn.z) < 0.0001,
+      "Camera-relative lateral run did not turn Gabe independently of chase");
+
+  controller.reset(spawn);
+  controller.update(sf::game::PlayerInput{.strafe = -1.0}, movement);
+  require(controller.locomotion() ==
+                  sf::game::PlayerLocomotionState::strafing &&
+              controller.actorMotion() == sf::game::ActorMotion::strafe_left &&
+              controller.modelHeading() == spawn.yaw &&
+              controller.state().x < spawn.x,
+          "Walk-modified lateral movement did not retain the sidestep clip");
+
+  controller.reset(spawn);
+  controller.update(
+      sf::game::PlayerInput{
+          .move = -1.0,
+          .run = true,
+      },
+      movement);
+  require(controller.locomotion() ==
+                  sf::game::PlayerLocomotionState::running &&
+              controller.actorMotion() == sf::game::ActorMotion::run &&
+              controller.modelHeading() == 2048 &&
+              controller.state().yaw == spawn.yaw &&
+              controller.cameraIntent().heading == spawn.yaw &&
+              controller.state().z < spawn.z,
+          "Camera-relative backward run did not turn Gabe toward the camera");
+
+  controller.reset(spawn);
+  controller.update(sf::game::PlayerInput{.move = -1.0}, movement);
+  require(controller.locomotion() ==
+                  sf::game::PlayerLocomotionState::walking &&
+              controller.actorMotion() == sf::game::ActorMotion::walk &&
+              controller.modelHeading() == spawn.yaw &&
+              controller.state().z < spawn.z,
+          "Walk-modified S did not retain the original backward walk");
 
   controller.reset(spawn);
   const auto attempts_before_aim = movement.attempts;
@@ -2045,6 +2315,36 @@ void testLevelLayout() {
   require(layout.visibility(1).active_models ==
               std::vector<std::uint16_t>({0, 2}),
           "Level visibility list mismatch");
+
+  std::vector<std::byte> sequel_bytes(0x90U + 3U * 16U, std::byte{0xff});
+  writeLe32(sequel_bytes, 0x88U, 3U);
+  writeLe32(sequel_bytes, 0x8cU, 1U);
+  sequel_bytes[0x90U] = std::byte{0};
+  sequel_bytes[0x91U] = std::byte{2};
+  sequel_bytes[0x92U] = std::byte{0xff};
+  sequel_bytes[0xa0U] = std::byte{0};
+  sequel_bytes[0xa1U] = std::byte{2};
+  sequel_bytes[0xa2U] = std::byte{0xff};
+  sequel_bytes[0xb0U] = std::byte{1};
+  sequel_bytes[0xb1U] = std::byte{0xff};
+  const auto sequel_layout =
+      sf::assets::LevelLayout::parse(sequel_bytes, 3U, 16U);
+  require(sequel_layout.visibility(1).active_models ==
+              std::vector<std::uint16_t>({0, 2}),
+          "SF2 16-byte visibility stride was not honored");
+
+  auto full_resident = bytes;
+  full_resident.resize(0x90U + 16U * 15U, std::byte{0xff});
+  writeLe32(full_resident, 0x88U, 16U);
+  writeLe32(full_resident, 0x8cU, 0U);
+  for (std::size_t index = 0U; index < 16U; ++index) {
+    full_resident[0x78U + index] = static_cast<std::byte>(index);
+  }
+  const auto full_resident_layout =
+      sf::assets::LevelLayout::parse(full_resident, 16U);
+  require(full_resident_layout.residentModels().size() == 16U &&
+              full_resident_layout.residentModels().back() == 15U,
+          "Full fixed-width resident model table was rejected");
 }
 
 void testMissionObjects() {
@@ -2078,6 +2378,11 @@ void testMissionObjects() {
   writeLe32(bytes, room_indices_offset + 4, 1);
   writeLe32(bytes, table_offset + 0x2c, path_offset);
   writeLe32(bytes, table_offset + 0x30, 1U);
+  writeLe16(bytes, table_offset + 0x42U, 0x1234U);
+  writeLe16(bytes, table_offset + 0x44U, 0xfffeU);
+  writeLe16(bytes, table_offset + 0x46U, 0x3456U);
+  writeLe16(bytes, table_offset + 0x48U, 0xffffU);
+  writeLe16(bytes, table_offset + 0x4aU, 0x002cU);
   writeLe16(bytes, path_offset, 100);
   writeLe16(bytes, path_offset + 2U, 200);
   writeLe16(bytes, path_offset + 4U, 300);
@@ -2120,8 +2425,112 @@ void testMissionObjects() {
   require(objects.objects()[0].patrol_path.size() == 2U &&
               objects.objects()[0].patrol_path[1].x == 400 &&
               objects.objects()[0].patrol_path[1].z == 600 &&
-              objects.objects()[0].linked_object == 1,
+              objects.objects()[0].linked_object == 1 &&
+              objects.objects()[0].handler_parameters ==
+                  std::array<std::int16_t, 4>{0x1234, -2, 0x3456, -1} &&
+              objects.objects()[0].handler_state == 0x2c,
           "Mission transition path was not decoded from its native node links");
+
+  auto sequel_bytes = bytes;
+  writeLe32(sequel_bytes, 0x00U, 0x00990318U);
+  writeLe32(sequel_bytes, 0x18U, 1U);
+  writeLe32(sequel_bytes, 0x1cU, definitions_offset);
+  writeLe32(sequel_bytes, 0x20U, table_offset);
+  writeLe32(sequel_bytes, 0x24U, rooms_offset);
+  const auto sequel_objects =
+      sf::assets::MissionObjects::parse(sequel_bytes);
+  require(sequel_objects.objects().size() == objects.objects().size() &&
+              sequel_objects.definitions().size() ==
+                  objects.definitions().size() &&
+              sequel_objects.roomCount() == objects.roomCount() &&
+              sequel_objects.playerIndex() == objects.playerIndex() &&
+              sequel_objects.player().transform.x ==
+                  objects.player().transform.x,
+          "SF2/SF3 mission-object header layout mismatch");
+}
+
+void testMissionScripts() {
+  std::vector<std::byte> bytes(0x60U);
+  writeLe32(bytes, 0U, 1U);
+  writeLe32(bytes, 4U, 8U);
+  writeLe32(bytes, 8U, 0x02010201U);
+  writeLe32(bytes, 12U, 3U);
+  constexpr std::array pointers{0x40U, 0x38U, 0x3cU,
+                                0x24U, 0x3cU, 0x50U};
+  for (std::size_t index = 0; index < pointers.size(); ++index) {
+    writeLe32(bytes, 16U + index * 4U, pointers[index]);
+  }
+  writeLe32(bytes, 8U + 0x20U, 0x50U);
+  writeLe16(bytes, 8U + 0x38U, 0x1111U);
+  writeLe16(bytes, 8U + 0x3aU, 0x2222U);
+  writeLe16(bytes, 8U + 0x3cU, 0xffffU);
+  writeLe16(bytes, 8U + 0x3eU, 9U);
+  constexpr std::string_view name{"OBJECTIVE_CHECK\0", 16U};
+  std::ranges::transform(name, bytes.begin() + 8U + 0x24U, [](char value) {
+    return static_cast<std::byte>(value);
+  });
+  writeLe16(bytes, 8U + 0x40U, 0xc104U);
+  writeLe16(bytes, 8U + 0x42U, 0x1234U);
+  writeLe16(bytes, 8U + 0x44U, 0xabcdU);
+  writeLe16(bytes, 8U + 0x46U, 0x5678U);
+  writeLe16(bytes, 8U + 0x48U, 0xff00U);
+
+  const auto scripts = sf::assets::MissionScriptArchive::parse(bytes);
+  require(scripts.programs().size() == 1U &&
+              scripts.programs()[0].offset == 8U &&
+              scripts.programs()[0].header_word_0 == 0x02010201U &&
+              scripts.programs()[0].header_word_1 == 3U &&
+              scripts.programs()[0].relative_pointers == pointers &&
+              scripts.programs()[0].format_version == 1U &&
+              scripts.programs()[0].variable_count == 2U &&
+              scripts.programs()[0].serialized_variable_begin == 1U &&
+              scripts.programs()[0].timer_count == 2U &&
+              scripts.programs()[0].initial_variables.size() == 2U &&
+              scripts.programs()[0].initial_variables[0] == 0x1111U &&
+              scripts.programs()[0].initial_variables[1] == 0x2222U &&
+              scripts.programs()[0].initial_timers.size() == 2U &&
+              scripts.programs()[0].initial_timers[0] == -1 &&
+              scripts.programs()[0].initial_timers[1] == 9 &&
+              scripts.programs()[0].serialized_size == 0x50U &&
+              scripts.programs()[0].serialized_bytes.size() == 0x50U &&
+              scripts.programs()[0].serialized_bytes[0x44U] ==
+                  std::byte{0xcd} &&
+              scripts.programs()[0].events.size() == 1U &&
+              scripts.programs()[0].events[0].relative_offset == 0x40U &&
+              scripts.programs()[0].events[0].encoded_header == 0xc104U &&
+              scripts.programs()[0].events[0].event_id == 1U &&
+              scripts.programs()[0].events[0].event_flags == 0xc0U &&
+              scripts.programs()[0].events[0].selector == 0x1234U &&
+              scripts.programs()[0].events[0].length_halfwords == 4U &&
+              scripts.programs()[0].events[0].action_halfwords ==
+                  std::vector<std::uint16_t>{0xabcdU, 0x5678U} &&
+              scripts.programs()[0].event_terminator_offset == 0x48U &&
+              scripts.programs()[0].name == "OBJECTIVE_CHECK",
+          "Sequel compiled mission-script container mismatch");
+
+  auto invalid_events = bytes;
+  writeLe16(invalid_events, 8U + 0x40U, 0xc101U);
+  try {
+    static_cast<void>(
+        sf::assets::MissionScriptArchive::parse(invalid_events));
+    throw std::runtime_error{
+        "Invalid mission-script event record was accepted"};
+  } catch (const sf::core::Error &error) {
+    require(error.code() == sf::core::ErrorCode::invalid_format,
+            "Invalid mission-script event returned the wrong error code");
+  }
+
+  auto invalid_variables = bytes;
+  writeLe32(invalid_variables, 8U + 0x0cU, 0x4fU);
+  try {
+    static_cast<void>(
+        sf::assets::MissionScriptArchive::parse(invalid_variables));
+    throw std::runtime_error{
+        "Out-of-range mission-script variable table was accepted"};
+  } catch (const sf::core::Error &error) {
+    require(error.code() == sf::core::ErrorCode::invalid_format,
+            "Invalid mission-script variable table returned the wrong error code");
+  }
 }
 
 void testInvalidAssets() {
@@ -2270,6 +2679,21 @@ void testRawSectorFile() {
 
   {
     auto disc = sf::disc::Iso9660Image::open(cue_path);
+    sf::game::DiscCdRomMedia media{disc};
+    std::array<std::byte, sf::psx::CdRomMedia::sector_size> data_sector{};
+    std::array<std::byte, sf::psx::CdRomMedia::raw_sector_size> raw_sector{};
+    require(media.sectorCount() == sector_count &&
+                media.readDataSector(19U, data_sector) &&
+                std::ranges::all_of(
+                    data_sector,
+                    [](std::byte value) { return value == std::byte{0xa5}; }) &&
+                media.readRawSector(20U, raw_sector) &&
+                std::ranges::all_of(
+                    raw_sector,
+                    [](std::byte value) { return value == std::byte{0x5a}; }) &&
+                !media.readDataSector(static_cast<std::uint32_t>(sector_count),
+                                      data_sector),
+            "Mounted-disc CD-ROM media sector bridge mismatch");
     const auto raw = disc.readRawSectorFile("movie.str");
     require(raw.sector_size == sector_size, "Raw sector size mismatch");
     require(raw.sector_count == 2, "Raw sector count mismatch");
@@ -2290,7 +2714,7 @@ void testRawSectorFile() {
 void testFunctionMap() {
   constexpr std::uint32_t base = 0x80010000U;
   constexpr std::uint32_t target = base + 0x20U;
-  std::array<std::byte, 64> text{};
+  std::array<std::byte, 96> text{};
   const auto jal = 0x0C000000U | ((target >> 2U) & 0x03FFFFFFU);
   writeLe32(text, 0, jal);
   writeLe32(text, 4, jal);
@@ -2301,6 +2725,60 @@ void testFunctionMap() {
           "Entry-point seed mismatch");
   require(functions[1].address == target && functions[1].static_call_count == 2,
           "JAL target seed mismatch");
+
+  writeLe32(text, 8, 0x03e00008U);
+  writeLe32(text, 12, 0U);
+  writeLe32(text, 0x20, 0x03e00008U);
+  writeLe32(text, 0x24, 0U);
+  const auto fingerprints =
+      sf::psx::fingerprintFunctionCandidates(text, base, base);
+  require(fingerprints.size() == 2U &&
+              fingerprints[0].instruction_count == 4U &&
+              fingerprints[0].direct_callee_count == 1U &&
+              fingerprints[0].has_return &&
+              fingerprints[1].instruction_count == 2U &&
+              fingerprints[1].has_return &&
+              fingerprints[0].exact_sha256 !=
+                  fingerprints[0].structural_sha256,
+          "Function fingerprint analysis mismatch");
+  const auto calls = sf::psx::discoverDirectCalls(text, base);
+  require(calls.size() == 2U && calls[0].site == base &&
+              calls[0].target == target && calls[0].target_in_text,
+          "Direct-call map mismatch");
+
+  writeLe32(text, 0x28, 0x27bdfff0U);
+  writeLe32(text, 0x2c, 0x03e00008U);
+  writeLe32(text, 0x30, 0U);
+  constexpr std::array additional_seeds{base + 0x34U};
+  const auto expanded = sf::psx::discoverFunctionCandidates(
+      text, base, base, true, additional_seeds);
+  require(std::ranges::any_of(expanded, [](const auto &candidate) {
+            return candidate.address == base + 0x28U;
+          }) &&
+              std::ranges::any_of(expanded, [](const auto &candidate) {
+                return candidate.address == base + 0x34U;
+              }),
+          "Prologue or externally referenced function seed was omitted");
+
+  constexpr auto prefixed_target = base + 0x38U;
+  const auto prefixed_jal =
+      0x0C000000U | ((prefixed_target >> 2U) & 0x03FFFFFFU);
+  writeLe32(text, 0x14, prefixed_jal);
+  writeLe32(text, 0x38, 0x3c028012U);
+  writeLe32(text, 0x3c, 0x8c42a574U);
+  writeLe32(text, 0x40, 0x27bdffe8U);
+  writeLe32(text, 0x44, 0x03e00008U);
+  writeLe32(text, 0x48, 0U);
+  const auto coalesced =
+      sf::psx::discoverFunctionCandidates(text, base, base, true);
+  require(std::ranges::any_of(coalesced, [](const auto &candidate) {
+            return candidate.address == prefixed_target &&
+                   candidate.static_call_count == 1U;
+          }) &&
+              std::ranges::none_of(coalesced, [](const auto &candidate) {
+                return candidate.address == base + 0x40U;
+              }),
+          "Straight-line pre-prologue function prefix was split");
 }
 
 class RecordingStateSink final : public sf::game::StateTransitionSink {
@@ -2379,12 +2857,30 @@ void testSystemBootOrder() {
 }
 
 void testPlayerInventory() {
+  require(sf::game::missionObjectBaseClass(0x5000eU) == 0x0eU &&
+              sf::game::missionObjectBaseClass(0x20034U) == 0x34U,
+          "Flagged sequel object class did not resolve to its base family");
+  require(sf::game::sf2WeaponForItem(3U) ==
+              sf::game::WeaponId::pistol_45 &&
+              sf::game::sf2WeaponForItem(4U) ==
+                  sf::game::WeaponId::m_16 &&
+              sf::game::sf2WeaponForItem(8U) ==
+                  sf::game::WeaponId::shotgun &&
+              sf::game::sf2WeaponForItem(19U) ==
+                  sf::game::WeaponId::taser &&
+              sf::game::sf2WeaponForItem(20U) ==
+                  sf::game::WeaponId::knife &&
+              sf::game::sf2WeaponForItem(22U) ==
+                  sf::game::WeaponId::fragmentation_grenade &&
+              !sf::game::sf2WeaponForItem(13U) &&
+              !sf::game::sf2WeaponForItem(17U),
+          "SF2/SF3 executable item table mapping mismatch");
   constexpr std::array<std::string_view, sf::game::weapon_slot_count>
       expected_names{
           "No Weapon",
           "Silenced 9mm",
           "9mm",
-          ".357",
+          "Knife",
           ".45",
           "G-18",
           "Combat Shotgun",
@@ -2505,6 +3001,7 @@ void testPlayerInventory() {
           "Invalid weapon ID was accepted by a checked lookup");
   const auto current_before_invalid_mutation = inventory.current();
   inventory.grant(invalid_weapon, 99U, 999U);
+  inventory.acquire(invalid_weapon, 99U, 999U);
   inventory.remove(invalid_weapon);
   require(!inventory.select(invalid_weapon) &&
               inventory.current() == current_before_invalid_mutation,
@@ -2553,6 +3050,20 @@ void testPlayerInventory() {
   require(inventory.currentState().magazine == 15U &&
               inventory.currentState().reserve == 75U,
           "Original 9mm ammunition limits were not enforced");
+  for (unsigned int round = 0; round < 10U; ++round) {
+    require(inventory.consumeRound(),
+            "Could not prepare additive pickup ammunition state");
+  }
+  inventory.acquire(sf::game::WeaponId::silenced_9mm, 3U, 4U);
+  require(inventory.currentState().magazine == 8U &&
+              inventory.currentState().reserve == 75U,
+          "Existing weapon pickup did not add and clamp ammunition");
+  inventory.remove(sf::game::WeaponId::m_16);
+  inventory.acquire(sf::game::WeaponId::m_16, 7U, 11U);
+  require(inventory.state(sf::game::WeaponId::m_16).owned &&
+              inventory.state(sf::game::WeaponId::m_16).magazine == 7U &&
+              inventory.state(sf::game::WeaponId::m_16).reserve == 11U,
+          "First weapon pickup did not preserve authored ammunition");
   const auto silenced_layers =
       sf::game::weaponDefinition(sf::game::WeaponId::silenced_9mm)
           .icon.layers();
@@ -2560,6 +3071,12 @@ void testPlayerInventory() {
               silenced_layers[0] == "PISTOL1A.TIM" &&
               silenced_layers[1] == "PISTOL1B.TIM",
           "9mm HUD icon mapping mismatch");
+  inventory.resetUnarmed();
+  require(inventory.current() == sf::game::WeaponId::unarmed &&
+              inventory.state(sf::game::WeaponId::unarmed).owned &&
+              !inventory.state(sf::game::WeaponId::silenced_9mm).owned &&
+              !inventory.state(sf::game::WeaponId::taser).owned,
+          "Unarmed sequel loadout retained SF1 equipment");
 }
 
 void testGameplayHud() {
@@ -3222,6 +3739,8 @@ int main() {
   try {
     testSha256();
     testSupportedGames();
+    testRuntimeProfiles();
+    testDiscSelectionTitles();
     testFogArchive();
     testInvalidFogArchive();
     testMissionCatalog();
@@ -3244,6 +3763,7 @@ int main() {
     testPolygonClipper();
     testLevelLayout();
     testMissionObjects();
+    testMissionScripts();
     testInvalidAssets();
     testExecutable();
     testInvalidExecutable();

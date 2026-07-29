@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sf/assets/tim_image.hpp"
+#include "sf/game/runtime_profile.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -101,6 +102,93 @@ void uploadTimBlock(const assets::TimBlock &block);
 hudResidentX(std::uint16_t source_x) noexcept {
   return static_cast<std::uint16_t>(hud_resident_vram_x + source_x -
                                     hud_source_vram_x);
+}
+
+struct HudResidentPlacement {
+  std::uint16_t x{};
+  std::uint16_t y{};
+
+  constexpr bool operator==(const HudResidentPlacement &) const = default;
+};
+
+// The sequels place several weapon/item icon layers in streamed lower VRAM
+// pages or across the resident CLUT rows. Pack those exact authored
+// rectangles into unused native framebuffer HUD-atlas space; every other
+// INTERFACE TIM retains the SF1/SF2 x-only relocation.
+[[nodiscard]] constexpr HudResidentPlacement
+hudResidentPlacement(const assets::TimBlock &block) noexcept {
+  if (block.x == 884U && block.y == 238U && block.width_words == 9U &&
+      block.height == 17U) {
+    return {170U, 0U}; // SF2 KEYCARDB
+  }
+  if (block.x == 792U && block.y == 240U && block.width_words == 16U &&
+      block.height == 16U) {
+    return {179U, 0U}; // SF2 SNIPER1C
+  }
+  if (block.x == 866U && block.y == 232U && block.width_words == 16U &&
+      block.height == 24U) {
+    return {195U, 0U}; // SF2 SUPER1A
+  }
+  if (block.x == 811U && block.y == 456U && block.width_words == 5U &&
+      block.height == 20U) {
+    return {0U, 227U}; // GASGRENA
+  }
+  if (block.x == 769U && block.y == 384U && block.width_words == 15U &&
+      block.height == 20U) {
+    return {5U, 227U}; // SHOT2A
+  }
+  if (block.x == 1009U && block.y == 300U && block.width_words == 15U &&
+      block.height == 20U) {
+    return {20U, 227U}; // SHOT2C
+  }
+  if (block.x == 1000U && block.y == 300U && block.width_words == 5U &&
+      block.height == 20U) {
+    return {35U, 227U}; // SNIFFER
+  }
+  if (block.x == 876U && block.y == 230U && block.width_words == 11U &&
+      block.height == 20U) {
+    return {40U, 227U}; // G3A
+  }
+  if (block.x == 768U && block.y == 336U && block.width_words == 16U &&
+      block.height == 16U) {
+    return {80U, 231U}; // SNIPER1C
+  }
+  if (block.x == 816U && block.y == 232U && block.width_words == 15U &&
+      block.height == 20U) {
+    return {96U, 227U}; // SHOT2B
+  }
+  return {hudResidentX(block.x), block.y};
+}
+
+[[nodiscard]] constexpr bool hudResidentRelocationSupported(
+    game::HudAtlasKind atlas, const assets::TimBlock &block) noexcept {
+  switch (atlas) {
+  case game::HudAtlasKind::sf1:
+    return false;
+  case game::HudAtlasKind::sf2:
+    return (block.x == 884U && block.y == 238U &&
+            block.width_words == 9U && block.height == 17U) ||
+           (block.x == 792U && block.y == 240U &&
+            block.width_words == 16U && block.height == 16U) ||
+           (block.x == 866U && block.y == 232U &&
+            block.width_words == 16U && block.height == 24U);
+  case game::HudAtlasKind::sf3:
+    return (block.x == 811U && block.y == 456U &&
+            block.width_words == 5U && block.height == 20U) ||
+           (block.x == 769U && block.y == 384U &&
+            block.width_words == 15U && block.height == 20U) ||
+           (block.x == 1009U && block.y == 300U &&
+            block.width_words == 15U && block.height == 20U) ||
+           (block.x == 1000U && block.y == 300U &&
+            block.width_words == 5U && block.height == 20U) ||
+           (block.x == 876U && block.y == 230U &&
+            block.width_words == 11U && block.height == 20U) ||
+           (block.x == 768U && block.y == 336U &&
+            block.width_words == 16U && block.height == 16U) ||
+           (block.x == 816U && block.y == 232U &&
+            block.width_words == 15U && block.height == 20U);
+  }
+  return false;
 }
 
 void uploadHudPixels(const assets::TimBlock &block);

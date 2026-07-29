@@ -21,8 +21,10 @@ constexpr std::array definitions{
         WeaponDamageKind::ballistic, 50U, 25U, 32000U, 4U, 1U, 0U, "GLOKSIL"},
     WeaponCombatDefinition{WeaponId::pistol_9mm, WeaponFireMode::semi_automatic,
         WeaponDamageKind::ballistic, 50U, 25U, 32000U, 12U, 1U, 0U, "GLOCK17"},
-    WeaponCombatDefinition{WeaponId::unused_357, WeaponFireMode::none,
-        WeaponDamageKind::none, 15U, 0U},
+    // SF2 KNIFE record: 100 close damage and no distant damage. Its retail
+    // reach is enforced by the short native trace rather than ammunition.
+    WeaponCombatDefinition{WeaponId::knife, WeaponFireMode::semi_automatic,
+        WeaponDamageKind::melee, 100U, 0U, 260U, 10U, 1U, 0U, "KNIFE"},
     WeaponCombatDefinition{WeaponId::pistol_45, WeaponFireMode::semi_automatic,
         WeaponDamageKind::ballistic, 150U, 75U, 32000U, 8U, 1U, 0U, "COLT45"},
     WeaponCombatDefinition{WeaponId::g_18, WeaponFireMode::automatic,

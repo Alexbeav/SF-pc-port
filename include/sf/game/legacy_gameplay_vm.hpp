@@ -861,6 +861,7 @@ struct LegacyGameplayVmSnapshot {
   std::array<std::byte, psx::R3000Runtime::scratchpad_size> scratchpad{};
   std::array<std::byte, psx::R3000Runtime::mmio_size> mmio{};
   std::uint32_t video_timing_baseline{};
+  std::array<std::uint32_t, 4U> bios_clear_root_counter_flags{};
   std::uint64_t audio_frame_tick{};
   std::array<std::uint32_t, interrupt_callback_count> interrupt_callbacks{};
   struct AttachedTextSource {
@@ -948,8 +949,21 @@ public:
                                  std::span<const std::byte> bytes) noexcept;
   void bindHostCall(std::uint32_t address, LegacyHostCall call);
   void bindPsxBiosRandomCalls();
+  void bindPsxBiosCoreVector();
   void bindPsxLibcStringCalls();
   void bindPsxVideoTimingCall();
+  void bindPsxVideoTimingCall(std::uint32_t vsync_address,
+                              std::uint32_t retrace_counter_address);
+  void bindPsxCdPendingCommandCall(std::uint32_t address,
+                                   std::uint32_t state_address,
+                                   std::uint32_t response_pointer_address,
+                                   std::uint32_t completion_state_address);
+  void bindPsxCdControlCall(std::uint32_t address);
+  void bindPsxCdReadyCallback(std::uint32_t callback_address,
+                              std::uint32_t result_address,
+                              std::uint32_t state_address,
+                              bool callback_is_pointer) noexcept;
+  [[nodiscard]] bool servicePsxCdReadyCallback();
   void bindPsxCriticalSectionCalls();
   void bindPsxGpuSubmissionCall();
   void bindSyphonFilterUsaV11VirtualCdCalls(
@@ -1097,6 +1111,11 @@ public:
   // guest loop after its initial entry has been established.
   [[nodiscard]] LegacyGameplayVmResult
   resumeCurrentPc(std::uint64_t execution_budget = 1'000'000U);
+  // Executable startup runs before a game's interrupt/event tables are ready.
+  // Keep hardware time stationary until the profile reaches its first
+  // scheduler-owned boundary.
+  [[nodiscard]] LegacyGameplayVmResult
+  resumeCurrentPcClockNeutral(std::uint64_t execution_budget = 1'000'000U);
   // Stop before dispatching the host call at boundary_address. A later
   // resumeCurrentPc() observes the same PC and dispatches that call normally.
   [[nodiscard]] LegacyGameplayVmResult
@@ -1202,15 +1221,21 @@ private:
   [[nodiscard]] LegacyHostCall *findHostCall(std::uint32_t address) noexcept;
   [[nodiscard]] const LegacyHostCall *
   findHostCall(std::uint32_t address) const noexcept;
+  [[nodiscard]] bool
+  servicePsxBiosSyscall(const psx::R3000RunResult &execution) noexcept;
   void recoverCdRomTransfer() noexcept;
 
   psx::R3000Runtime runtime_;
   psx::PsxMachine machine_;
   std::unordered_map<std::uint32_t, LegacyHostCall> host_calls_;
   std::vector<LegacyHostCall *> ram_host_calls_;
+  std::array<std::uint32_t, 4U> bios_clear_root_counter_flags_{};
   std::shared_ptr<LegacyVirtualCd> virtual_cd_;
   std::uint32_t executable_initial_pc_{};
   std::uint32_t video_timing_baseline_{};
+  std::uint32_t cd_ready_callback_address_{0x80114cc4U};
+  std::uint32_t cd_ready_result_address_{0x80125450U};
+  std::uint32_t cd_ready_state_address_{0x80114f9dU};
   std::uint64_t audio_frame_tick_{};
   std::array<std::uint32_t, LegacyGameplayVmSnapshot::interrupt_callback_count>
       interrupt_callbacks_{};
@@ -1229,6 +1254,7 @@ private:
       LegacyGameplayBridgeReadStage::none};
   std::uint64_t host_aim_ray_patch_count_{};
   std::uint64_t enemy_close_aim_patch_count_{};
+  bool cd_ready_callback_is_pointer_{true};
   bool video_timing_baseline_initialized_{};
   bool audio_frame_tick_initialized_{};
 };

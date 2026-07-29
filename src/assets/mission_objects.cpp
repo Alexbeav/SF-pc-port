@@ -19,6 +19,11 @@ constexpr std::size_t definition_table_offset = 0x10;
 constexpr std::size_t object_table_offset = 0x14;
 constexpr std::size_t player_index_offset = 0x1c;
 constexpr std::size_t room_table_offset = 0x18;
+constexpr std::uint32_t trilogy_sequel_header = 0x00990318U;
+constexpr std::size_t sequel_definition_table_offset = 0x1c;
+constexpr std::size_t sequel_object_table_offset = 0x20;
+constexpr std::size_t sequel_room_table_offset = 0x24;
+constexpr std::size_t sequel_player_index_offset = 0x18;
 constexpr std::size_t object_size = 0x4c;
 constexpr std::size_t definition_size = 0x14;
 constexpr std::size_t rotation_offset = 0x04;
@@ -29,6 +34,8 @@ constexpr std::size_t path_data_offset = 0x2c;
 constexpr std::size_t linked_object_offset = 0x30;
 constexpr std::size_t maximum_health_offset = 0x3e;
 constexpr std::size_t health_offset = 0x40;
+constexpr std::size_t handler_parameters_offset = 0x42;
+constexpr std::size_t handler_state_offset = 0x4a;
 constexpr std::size_t path_node_size = 12U;
 constexpr std::size_t path_next_offset = 8U;
 constexpr std::size_t path_marker_offset = 11U;
@@ -137,13 +144,26 @@ MissionObjects MissionObjects::parse(std::span<const std::byte> bytes) {
     if (bytes.size() < header_size) {
         throw core::Error{core::ErrorCode::invalid_format, "Mission-object header is truncated"};
     }
+    const auto sequel_layout = readLe32(bytes, 0U) == trilogy_sequel_header;
+    const auto active_definition_table_offset =
+        sequel_layout ? sequel_definition_table_offset : definition_table_offset;
+    const auto active_object_table_offset =
+        sequel_layout ? sequel_object_table_offset : object_table_offset;
+    const auto active_room_table_offset =
+        sequel_layout ? sequel_room_table_offset : room_table_offset;
+    const auto active_player_index_offset =
+        sequel_layout ? sequel_player_index_offset : player_index_offset;
     const auto room_count = static_cast<std::size_t>(readLe32(bytes, room_count_offset));
     const auto count = static_cast<std::size_t>(readLe32(bytes, object_count_offset));
     const auto definition_count = static_cast<std::size_t>(readLe32(bytes, definition_count_offset));
-    const auto definitions_offset = static_cast<std::size_t>(readLe32(bytes, definition_table_offset));
-    const auto table_offset = static_cast<std::size_t>(readLe32(bytes, object_table_offset));
-    const auto rooms_offset = static_cast<std::size_t>(readLe32(bytes, room_table_offset));
-    const auto player_index = static_cast<std::size_t>(readLe32(bytes, player_index_offset));
+    const auto definitions_offset = static_cast<std::size_t>(
+        readLe32(bytes, active_definition_table_offset));
+    const auto table_offset =
+        static_cast<std::size_t>(readLe32(bytes, active_object_table_offset));
+    const auto rooms_offset =
+        static_cast<std::size_t>(readLe32(bytes, active_room_table_offset));
+    const auto player_index =
+        static_cast<std::size_t>(readLe32(bytes, active_player_index_offset));
     if (room_count == 0 ||
         room_count > std::numeric_limits<std::uint16_t>::max() ||
         count == 0 || definition_count == 0 || player_index >= count ||
@@ -201,6 +221,14 @@ MissionObjects MissionObjects::parse(std::span<const std::byte> bytes) {
         object.maximum_health = static_cast<std::int16_t>(
             readLe16(bytes, offset + maximum_health_offset));
         object.health = static_cast<std::int16_t>(readLe16(bytes, offset + health_offset));
+        for (std::size_t parameter = 0;
+             parameter < object.handler_parameters.size(); ++parameter) {
+            object.handler_parameters[parameter] =
+                static_cast<std::int16_t>(readLe16(
+                    bytes, offset + handler_parameters_offset + parameter * 2U));
+        }
+        object.handler_state = static_cast<std::int16_t>(
+            readLe16(bytes, offset + handler_state_offset));
         objects.push_back(object);
     }
 

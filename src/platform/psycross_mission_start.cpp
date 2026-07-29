@@ -130,7 +130,11 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
                                     std::future_status::ready) {
       preloaded_gameplay_ = preload.get();
       animation_start = SDL_GetPerformanceCounter();
-      audio_clock_started = true;
+      // The native SF2 package is renderable before its executable audio
+      // callbacks are mapped. Keep the briefing responsive and enter the
+      // scene without advancing the SF1-only guest audio clock.
+      audio_clock_started =
+          mission.gameId() == game::GameId::syphon_filter;
       PsyX_Log_Info("Mission briefing: gameplay preload complete\n");
     }
 

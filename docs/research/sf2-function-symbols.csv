@@ -1,0 +1,180 @@
+sf2_address,descriptive_name,confidence,sf3_address,evidence
+0x80010654,FixedPoint_Multiply,confirmed,0x80010654,Byte-identical to the probed SF1 fixed-point multiply routine
+0x80010b14,Vector_NormalizeGte,confirmed,,Instruction semantics use GTE leading-zero and square operations on a three-component vector
+0x80029624,Game_Main,confirmed,0x80029ed8,Called directly by each sequel PS-X runtime entry after CRT initialization
+0x80029700,Game_RunStateLoop,confirmed,0x80029fb8,Called by Game_Main and dispatches the fourteen-entry application-state jump table
+0x8002a338,MissionArchive_Open,strong,,References the FOG path INIT.OVL and mission SLF path
+0x8002a518,Common_Init,strong,0x8002aeac,References MOVIE.OVL and INIT.OVL while constructing application state; fuzzy-normalized SF1 Common_Init match scores 0.799 and SF3 match scores 0.880
+0x8002b0d0,DiscPath_BuildCommonOrMission,confirmed,0x8002ba50,References both common and mission-qualified disc path formats
+0x8002b2a0,BinOverlay_Open,strong,,References the BIN overlay path format
+0x8002b4c4,BinOverlay_Load,strong,,References the BIN overlay path format
+0x8002b9a8,TitleMovieOverlay_Select,strong,,References TITLE.OVL and MOVIE.OVL
+0x8002bc44,ApplicationState_Push,confirmed,0x8002c6ec,Pushes a state number on the GP-relative application-state stack and selects its resident overlay; SF3 preserves the same sequence
+0x8002bc80,ApplicationState_Pop,confirmed,0x8002c728,Pops the GP-relative application-state stack and reselects the prior resident overlay; SF3 preserves the same sequence
+0x8002c95c,Campaign_AdvanceOrComplete,confirmed,0x8002d3f4,Restores retained player values increments the mission index and pushes state 1 while below the last mission; otherwise selects the campaign-completion path; SF3 preserves the role with its own final-mission branch
+0x800ad014,CampaignProgress_CommitMission,confirmed,0x800afb6c,Calls the player carry snapshot updates completed and highest-unlocked state and conditionally copies the mission 0x26-byte progress record
+0x800ad264,PlayerCarry_Snapshot,confirmed,0x800afdbc,Clamps carried health to at least 10 and copies armor equipped item ownership words and all inventory quantity pairs; SF2 copies 34 pairs while SF3 copies 40
+0x80022134,Input_Update,strong,0x800228d8,Normalized instruction sequence matches the verified SF1 input entry at 0.741 with a 0.428 runner-up margin and is structurally preserved in SF3
+0x8002ac88,MissionScheduler_FrameEvent,strong,0x8002b608,Normalized control flow matches the SF1 mission scheduler frame-event entry and the SF2/SF3 structural fingerprints are identical
+0x8002afa4,MissionScheduler_QueueDrain,confirmed,0x8002b924,Byte-structural equivalent of the verified SF1 queue drain and preserved structurally in SF3
+0x8002b8d0,LoadingOverlay_Frame,confirmed,0x8002c30c,Byte-structural equivalent of the verified SF1 loading-overlay frame entry and preserved structurally in SF3
+0x8002d3a8,Object_ResolveRuntimeRecord,confirmed,0x8002df1c,Bounds-checks an object index and returns its runtime pointer plus associated short field
+0x8002da38,MissionOutcome_RecordAndPresent,strong,,Updates distinct objective or parameter status bitsets then presents the corresponding authored text and optional scene speech
+0x8002df04,MissionObjective_RevealAndPresent,strong,,Guards duplicate objective presentation updates objective visibility and notification bitsets then queues the authored objective text
+0x8002e6e8,MissionObjective_Complete,strong,,Sets the objective completion notification bitsets and selects the authored completion presentation
+0x80038dd0,ObjectEventVolume_Handler,confirmed,0x80039c18,Handler-table target for class families 0x4c and 0x4d and dispatches their authored event IDs
+0x80042cf4,MissionEvent_DispatchByObject,strong,0x80043dc4,Called by event volumes and mission overlays with an object or source identifier plus authored event ID
+0x8005cc3c,ActorAuxiliaryResources_Reset,strong,0x8005e29c,Frees and clears five auxiliary handles for one actor or each of two global actors
+0x800570a0,WorldCollision_Scan,strong,0x80058608,Normalized instruction sequence matches the verified SF1 collision scan at 0.704 with a 0.489 runner-up margin and is structurally preserved in SF3
+0x80049940,ActorCameraRenderCollision_Update,provisional,0x8004ac88,The SF1 predecessor references the retail camera controller and calls two collision helpers that map uniquely to 0x80057480/0x80057540; caller and field traffic prove actor render/attachment preparation rather than the chase-camera controller; SF3 preserves the joint-caller relationship
+0x80063dc4,ActorDroppedItem_Detach,provisional,0x80066208,Normalized instruction sequence matches the verified SF1 dropped-item detach path at 0.550 with a 0.273 runner-up margin and is structurally preserved in SF3
+0x800639f4,PlayerHeldModel_Resolve,strong,0x80065e10,Owns the explicit missing player-held-model diagnostic
+0x80066b54,RenderViewQueue_Add,confirmed,0x80068fa8,Inserts the supplied view through its +0x18c link into the GP-relative list and sets view flag 0x1000
+0x80066be0,RenderViewQueue_Remove,confirmed,0x80069034,Unlinks the supplied view through its +0x18c link and clears view flag 0x1000
+0x80078c24,PlayerObject_Handler,confirmed,0x8007b168,Object handler-table target for class family 0x05
+0x8008244c,ActorObject_Handler,confirmed,0x80084a48,Object handler-table target shared by actor class families 0x01 0x02 and 0x03
+0x80081ebc,ActorDamageReaction_Process,strong,0x800844b8,Actor handler event 12 invokes this after the mission damage hook; it selects damage reaction authored event pain cue and scheduler work
+0x80082174,ActorDeathReaction_Process,strong,0x80084770,Actor handler event 9 invokes this after the mission death hook; it resolves death animation attachment body and class-specific state
+0x80086d4c,Actor_Activate,confirmed,0x80089434,Actor handler event 5 sets active bit 0x80 constructs player and actor state increments active bookkeeping and returns whether activation occurred
+0x80087194,Actor_Deactivate,confirmed,0x800897b8,Actor handler event 4 releases player attachment and actor state clears active bit 0x80 and decrements the global active-actor count
+0x80089298,MissionActorDamageCallback_Set,confirmed,0x8008b8d4,Swaps the mission callback invoked inside shared actor damage resolution and returns the prior callback
+0x800892a8,MissionActorDeathCallback_Set,confirmed,0x8008b8e4,Swaps the mission callback invoked by actor death finalization and returns the prior callback
+0x80089324,ActorDeath_Finalize,confirmed,0x8008b960,Schedules authored death work invokes the mission death callback then releases class-specific and player-owned state
+0x8008cafc,SceneXaArchive_Open,confirmed,0x8008f338,References SCENES%d.XA and TRASH.XA and opens the selected CD file
+0x8008cdd0,SpatialSound_Start,strong,0x8008f60c,Resolves source and listener transforms computes relative geometry and starts a positioned sound; structurally preserved in SF3
+0x8008d21c,SoundSceneCue_Play,strong,0x8008fa58,Resolves cue bank and cue IDs then allocates one of eight active sound records; normalized SF3 match scores 0.979
+0x8008dbe4,SceneSpeech_Start,strong,0x80090408,Starts the single active scene-speech stream with optional authored source positioning mode and volume fields; four script action variants call the aligned SF2/SF3 boundary
+0x8008df60,SceneSpeech_Stop,confirmed,0x800907a4,Stops the active stream schedules its completion event clears the source and cue state and restores sentinel defaults; aligned script action 0x6a calls it in both sequels
+0x800f9458,XaCue_ResolveAndPlay,confirmed,0x800fb7c8,Divides authored cue by the archive channel count selects a cumulative group LBA and passes the remainder as the XA channel
+0x800f957c,XaFilteredStream_Start,strong,0x800fb8ec,Programs CD filter seek mixer volume and playback state from the resolved group LBA and channel
+0x800f9a10,XaStream_Stop,confirmed,0x800fbd80,Clears active XA state disables the CD stream path and resets its scheduler state
+0x800974fc,ObjectEvent_Queue,strong,0x80099d14,Builds a fixed event record from object event parameters and submits it to the shared queue; the SF3 pickup handler selects the corresponding first of two identical wrappers
+0x800ac6a4,SpecialObjectHandler_Set,strong,0x800af1fc,Swaps a GP-relative callback pointer and returns its prior value; aligned initialization callers select the SF3 equivalent
+0x800ac9e0,PickupObject_Handler,confirmed,0x800af538,Object handler-table target shared by pickup and container class families 0x47 0x48 and 0x49
+0x800ab584,PackedItemSpec_Decode,confirmed,0x800ae0f4,Decodes the low six-bit item number and bit-six flag into two output halfwords; byte-identical in SF3
+0x800ab59c,PickupQuantity_Resolve,confirmed,0x800ae10c,Resolves pickup quantity from item metadata authored class and multiplier then clamps it to the item limit; structurally preserved in SF3
+0x800ab7e8,ActorPickupQueue_Append,confirmed,0x800ae358,Appends item source quantity and flags to one of the bounded ten-entry per-actor pickup queues; structurally preserved in SF3
+0x800ac048,ActorPickupQueue_Remove,confirmed,0x800aeba0,Removes one entry by shifting all parallel pickup-queue fields and clearing the tail; byte-identical in SF3
+0x800ab278,CollectedPickup_DetachFromWorldList,strong,0x800adde8,Finds the authored pickup in the owning actor world list removes it and schedules the collected-item event; structurally preserved in SF3
+0x800b2a6c,MissionScript_ContextPush,confirmed,0x800b5c5c,Saves current program and event context to a bounded stack before nested dispatch; structurally preserved in SF3
+0x800b2ac4,MissionScript_ContextPop,confirmed,0x800b5cb4,Restores current program and event context after nested dispatch; structurally preserved in SF3
+0x800b2b08,MissionScript_PredicateDecode,confirmed,0x800b5cf8,Decodes compact predicate expressions through the 64-entry descriptor table at 0x801150fc; structurally preserved in SF3
+0x800b3158,MissionScript_ActionDecode,confirmed,0x800b6330,Decodes action streams including FF termination FE predicates and descriptor-dispatched action opcodes; SF3 address proven by aligned event-dispatch call
+0x800b36a0,MissionScript_DispatchProgramEvent,confirmed,0x800b6894,Matches authored event records then executes their action streams and owns per-frame timer expiry dispatch; SF3 address proven by aligned activation calls
+0x800b38b0,MissionScript_DispatchActivePrograms,confirmed,0x800b6ae0,Walks the active program list and dispatches one event to each entry; structurally preserved in SF3
+0x800b3920,MissionScript_FindByName,confirmed,0x800b6b50,Walks the loaded program table and compares the name pointer at program offset 0x14; SF3 address proven by aligned LEVEL startup call
+0x800b39ac,MissionScript_FindActiveNode,confirmed,0x800b6bdc,Walks the active program linked list for a program pointer; structurally preserved in SF3
+0x800b39e4,MissionScript_Activate,confirmed,0x800b6c14,Adds an inactive program to the active list and dispatches activation event 1; structurally preserved in SF3
+0x800b3a30,MissionScript_Deactivate,confirmed,0x800b6c60,Removes an active program and dispatches deactivation event 2; structurally preserved in SF3
+0x800b3a84,MissionScript_ClearActive,confirmed,0x800b6cb4,Empties the active program list; SF3 address proven by aligned reset and startup call
+0x800b3ad0,MissionScript_SerializeState,confirmed,0x800b6d00,Serializes active flags selected mutable variables and timer tables; structurally preserved in SF3
+0x800b3c2c,MissionScript_RestoreState,confirmed,0x800b6e5c,Restores active programs mutable variables and timers then dispatches restore event 0x10; structurally preserved in SF3
+0x800b3d34,MissionScript_ResetAndStartLevel,confirmed,0x800b6f64,Resets program state finds the program named LEVEL and activates it; structurally preserved in SF3
+0x800b2088,MissionScript_ProgramActivateOp,confirmed,0x800b4f48,Descriptor handler shared by predicate slot 0x3b and action slot 0x0b; directly calls MissionScript_Activate in both sequels
+0x800b20bc,MissionScript_ProgramDeactivateOp,confirmed,0x800b4f7c,Descriptor handler shared by predicate slot 0x3c and action slot 0x0c; directly calls MissionScript_Deactivate in both sequels
+0x800b13b4,MissionScript_ActorActivationOp,strong,0x800b4168,Action 0x1b resolves an actor object and either clears its scripted state or sends authored object event 0x0b while changing activation flags; structurally preserved in SF3
+0x800b1e9c,MissionScript_ObjectiveRevealOp,strong,,Action 0x08 passes one objective index to the duplicate-guarded objective reveal and presentation routine
+0x800b1ec0,MissionScript_ObjectiveFailOp,strong,,Action 0x09 records and presents one objective failure through the shared mission-outcome routine
+0x800b1eec,MissionScript_ObjectiveCompleteAssignOp,strong,,Action 0x0a sets or clears one objective completion state and presents completion when set
+0x800b2000,MissionScript_ParameterFailOp,strong,,Action 0x1e records and presents one parameter failure through the parameter branch of the shared mission-outcome routine
+0x800b202c,MissionScript_ParameterBitSetOp,confirmed,,Action 0x1f sets one indexed bit in the mission progress record parameter-status word at offset 0x20
+0x800b198c,MissionScript_ObjectEvent1Op,confirmed,0x800b4740,Action 0x68 passes the decoded object selector to MissionEvent_DispatchByObject with fixed event 1; structurally preserved in SF3
+0x800b19b0,MissionScript_ObjectEventDispatchOp,confirmed,0x800b4764,Action 0x75 passes its decoded object selector and event operand directly to MissionEvent_DispatchByObject; aligned SF3 descriptor preserves the role
+0x800b285c,MissionScript_NightVisionSetOp,strong,0x800b563c,Action 0x31 maps boolean false/true to player events 0x80/0x7f; all retail uses align with night-vision and darkness program transitions
+0x800b26a0,MissionScript_SceneSpeechStopOp,confirmed,0x800b5524,Action 0x6a directly calls SceneSpeech_Stop without transforming arguments; aligned SF3 descriptor preserves the role
+0x800b20f0,MissionScript_PackageBitSetOp,confirmed,0x800b4fb0,Action 0x0d sets one indexed bit in the mission-package bitset loaded from package header offset 0x30
+0x800b2140,MissionScript_PackageBitClearOp,confirmed,0x800b5000,Action 0x0e clears one indexed bit in the mission-package bitset loaded from package header offset 0x30
+0x800b2194,MissionScript_VariableIncrementOp,confirmed,0x800b5054,Action 0x0f increments one current-or-parent program halfword variable selected by operand bit 15 and low byte
+0x800b21d8,MissionScript_VariableDecrementOp,confirmed,0x800b5098,Action 0x10 decrements one current-or-parent program halfword variable selected by operand bit 15 and low byte
+0x800b221c,MissionScript_VariableAddOp,confirmed,0x800b50dc,Action 0x5a adds its decoded value to a selected program halfword variable
+0x800b2260,MissionScript_VariableSubtractOp,confirmed,0x800b5120,Action 0x5b subtracts its decoded value from a selected program halfword variable
+0x800b22a4,MissionScript_VariableAssignOp,confirmed,0x800b5164,Action 0x01 assigns its decoded value to a selected program halfword variable and is shared with predicate slot 0x31
+0x800b22dc,MissionScript_VariableStoreResultOp,confirmed,0x800b519c,Aliased actions 0x5c and 0x61 store the VM result register into a selected program halfword variable
+0x800b2838,MissionScript_TimerAssignOp,confirmed,0x800b5618,Action 0x02 writes its second decoded operand to one halfword in the current program timer table at program offset 0x10
+0x800b2854,MissionScript_Action28Event11Marker,confirmed,0x800b5634,The handler is an intentional no-op marker recognized by the action decoder which redispatches event 11 to the current program with the decoded selector
+0x8007c7e0,ActorEquippedItem_Assign,confirmed,0x8007ed8c,Updates the actor item field detaches or refreshes the held model and dispatches the associated item-change events
+0x800b12ac,MissionScript_ActorEquippedItemOp,confirmed,0x800b4060,Action 0x2b forwards decoded actor and item operands to ActorEquippedItem_Assign
+0x800b1de4,MissionScript_ScheduleObjectPlayerEventOp,confirmed,0x800b4be4,Action 0x27 schedules its decoded event at priority 2 with selected-object and current-player/source routing
+0x800876c4,ActorMode_ApplyScriptedTransition,confirmed,0x80089d54,Mutates the actor mode bits and active-state flags and routes active actors through the shared transition helper
+0x800b0e20,MissionScript_ActorModeTransitionOp,confirmed,0x800b3ba8,Action 0x42 resolves one object and forwards its decoded mode to ActorMode_ApplyScriptedTransition
+0x8006b000,ObjectRelationship_Register,confirmed,0x8006d470,Builds a relationship record from optional source and destination objects and invokes the selected update callback
+0x8006ab40,ObjectRelationship_SpatialUpdate,strong,0x8006cfb0,Shared callback updates linked-object transforms collision and display state from the relationship record
+0x800b1d64,MissionScript_ObjectRelationshipOp,confirmed,0x800b4b64,Action 0x69 resolves two objects and registers the shared spatial relationship callback
+0x800b1f90,MissionScript_MissionSuccessRequestOp,confirmed,0x800b4d88,Action 0x30 validates mode and live player state starts the common transition and schedules the campaign-progress callback
+0x80087518,Actor_ActivateAndDisplay,confirmed,0x80089b88,Activates a nonterminal dormant actor clears object dormant bit 1 adds its display to the world list and increments display bookkeeping
+0x800b1730,MissionScript_ActorActivateAndDisplayOp,confirmed,0x800b44e4,Action 0x71 resolves one actor and calls Actor_ActivateAndDisplay
+0x800875e4,ActorRuntime_AssignByte12AndReset,confirmed,0x80089c74,Assigns runtime byte 0x12 and for active actors applies the shared movement transition and clears two target fields
+0x8008b484,ActorHealth_ApplyScriptedState,strong,0x8008dc04,Resolves actor class health and special-player cases writes scripted health state and dispatches reaction death and mission events
+0x800b1b8c,MissionScript_ActorHealthStateOp,confirmed,0x800b4940,Action 0x26 forwards decoded actor and signed state to the shared scripted health path with fixed reaction parameter 16
+0x80047e3c,PlayerObjectInteraction_Apply,strong,0x80048e70,Resolves player and selected-object transforms geometry and mission callbacks before applying the authored interaction value
+0x800b0c00,MissionScript_PlayerObjectInteractionOp,confirmed,0x800b38c0,Action 0x60 forwards current player selected object decoded value and fixed mode 1 to the shared interaction path
+0x80087910,ActorEventMode_Apply,confirmed,0x80089fa0,Maps modes 0 through 3 to actor events 0x63 0x92 0x91 and 0x5d while updating actor runtime event state
+0x800b0b3c,MissionScript_InventoryGrantOp,confirmed,0x800b37fc,Action 0x32 decodes item and quantity scales quantity by the selected retail item-table byte and calls InventoryItem_Acquire for the current player
+0x800b0bac,MissionScript_CurrentPlayerEvent81Or82Op,confirmed,0x800b386c,Action 0x55 dispatches event 0x81 when its decoded Boolean operand is nonzero and event 0x82 otherwise to the current player object
+0x800b2934,MissionScript_FullScreenTransitionOp,confirmed,0x800b56f8,Action 0x70 passes its decoded preset or type to the shared wrapper that constructs and starts a 512 by 240 application transition
+0x8002c558,FullScreenTransition_StartPreset,strong,0x8002d014,Constructs a fixed 512 by 240 transition descriptor from one preset byte and submits it to the common application transition path
+0x800b2318,MissionScript_VariableRandomOp,confirmed,0x800b51d8,Action 0x5d stores BIOS rand modulo its decoded bound into a selected program halfword variable
+0x800b2398,MissionScript_ObjectHealthReadOp,confirmed,0x800b5258,Action 0x23 reads signed object health into the VM result register
+0x800b1ac4,MissionScript_ObjectFlag1ClearAndScheduleOp,confirmed,0x800b4878,Action 0x24 clears object state byte 0x27 bit 1 then schedules object event 0x10 at priority 4
+0x800b1b28,MissionScript_ObjectFlag1SetAndScheduleOp,confirmed,0x800b48dc,Action 0x25 sets object state byte 0x27 bit 1 then schedules object event 0x11 at priority 4
+0x800b1bd8,MissionScript_ObjectFlag5SetOp,confirmed,0x800b498c,Action 0x36 selects shared set-or-clear helpers for object state byte 0x27 bit 5 and class-dependent bit 4
+0x800b1c0c,MissionScript_ObjectStateByte25AssignOp,confirmed,0x800b49c0,Action 0x38 assigns its decoded byte to object state offset 0x25
+0x800b1c2c,MissionScript_ObjectFlag1ClearOp,confirmed,0x800b4a2c,Action 0x45 clears object state byte 0x27 bit 1 without scheduling
+0x800b1c5c,MissionScript_ObjectFlag1SetOp,confirmed,0x800b4a5c,Action 0x46 sets object state byte 0x27 bit 1 without scheduling
+0x800b1c8c,MissionScript_ObjectFlagSetOp,confirmed,0x800b4a8c,Action 0x4f sets a decoded bit in object state byte 0x27
+0x800b1cbc,MissionScript_ObjectFlagClearOp,confirmed,0x800b4abc,Action 0x50 clears a decoded bit in object state byte 0x27
+0x800b1cf0,MissionScript_ObjectFlag0AssignOp,confirmed,0x800b4af0,Action 0x2d assigns boolean state to object byte 0x27 bit 0
+0x80062ff4,InventoryOwnedItem_Count,confirmed,0x80065494,Counts set ownership bits across two words at actor inventory state offsets 0x3c and 0x40
+0x80063044,InventoryItem_Acquire,confirmed,0x800654e4,Sets one ownership bit optionally routes quantity through the clamped writer and refreshes the first equipped item
+0x80063108,InventoryItem_Remove,confirmed,0x800655a8,Clears both per-item quantity halfwords and its ownership bit then repairs equipped selection
+0x800631d0,InventoryItem_Replace,confirmed,0x80065670,Acquires replacement with the old item's combined quantity then removes the old item
+0x800632e4,InventoryItem_AtCapacity,confirmed,0x80065700,Compares both per-item quantity halfwords against capacity derived from the retail item table
+0x80063378,InventoryQuantity_AddClamped,confirmed,0x80065794,Directly adds and clamps two per-item inventory halfwords against retail item-table limits
+0x800634e0,InventoryQuantity_AssignClamped,confirmed,0x800658fc,Clears both per-item quantity halfwords then calls InventoryQuantity_AddClamped
+0x800642f4,InventoryReload_Transfer,confirmed,0x80066738,Transfers min reserve and magazine-capacity-minus-loaded from the first per-item halfword to the second then refreshes equipped display
+0x80040ba4,ActorReload_Request,confirmed,0x80041c88,Resolves actor current item checks weapon state calls InventoryReload_Transfer and dispatches the resulting authored actor event
+0x80064398,ReloadSound_Dispatch,confirmed,0x800667dc,Resolves current actor item and selects shotgun or general reload sound-scene cue
+0x800ac0f0,ActorPickupQueue_Process,confirmed,0x800aec48,Consumes queued pickups through capacity acquire replace quantity presentation and queue-removal paths
+0x800f41f0,BIOS_rand,confirmed,0x800f6f60,BIOS A0 trampoline with function selector 0x2f and mission callers mask the return as random variation
+0x800f48f0,VSync,confirmed,0x800f7660,Executable profile and deterministic bootstrap probe
+0x800f703c,CdReadyCallback,confirmed,0x800f9e0c,Executable profile and deterministic CD callback probe
+0x800f8598,PsxRuntimeEntry,confirmed,0x800fb368,PS-X EXE header initial PC
+0x80103968,CdControl,confirmed,0x8010669c,Executable profile and deterministic CD command probe
+0x801047b0,CrtHeapInitialize,strong,0x801074e4,Called by the runtime entry before Game_Main with the cleared runtime heap range and structurally matched across sequels
+0x800aff4c,MissionScript_NpcResourceLifecycleOp,confirmed,0x800b2b70,Action 0x79 dispatches seven recovered modes covering overlay resource callback build load tracked-slot detach active-resource install and removal
+0x800b24f4,MissionScript_PlayerObjectInteractionStartOp,confirmed,0x800b53b8,All 62 action 0x29 selectors are valid mission object indices and the shared path queues player mode events then schedules completion event 5 back to that object
+0x80041054,PlayerObjectInteraction_Start,strong,0x80042138,Arms object completion state queues player event 0x5c or 0x62 for modes 0 and 1 and routes mode 2 through the special interaction resource path
+0x8008e194,ObjectInteractionCompletion_Arm,confirmed,0x800909d8,Stores selected object arms the 80-tick pending state and registers its completion callback at priority 100
+0x8008db48,ObjectInteractionCompletion_DispatchEvent5,confirmed,0x8009036c,Schedules event 5 back to the stored object selector then clears the pending interaction state
+0x8002a4ec,MissionScript_SchedulerDispatchCallback,confirmed,0x8002ae80,Decodes the scheduled record word high half as script event ID and low half as selector then dispatches it to every active mission program
+0x800b0e58,MissionScript_ActorRuntimeBit3AssignOp,confirmed,0x800b3be0,Action 0x05 assigns actor-runtime word 0x04 bit 3 from a Boolean operand
+0x800afe50,MissionScript_ObjectDisplayTemplateCopyOp,confirmed,0x800b2a74,Action 0x18 copies one 32-byte display template into a selected object and sets its fixed activation flags
+0x800b2058,MissionScript_ActiveRecordBitClearOp,confirmed,0x800b4e90,Action 0x20 clears one decoded bit in the active package or runtime record word at offset 0x20
+0x800b0d54,MissionScript_ActorHealthFixedModeOp,confirmed,0x800b3ab0,Action 0x2f calls ActorHealth_ApplyScriptedState with fixed mode 0x7d00 and decoded object and value
+0x800b0df0,MissionScript_NoOp37,confirmed,0x800b3b4c,Action 0x37 returns without side effects
+0x800b0ccc,MissionScript_ActorRuntimeBit16SetOp,confirmed,0x800b39b4,Action 0x39 sets actor-runtime word 0x04 bit 16 and clears the linked halfword
+0x800b0d10,MissionScript_ActorRuntimeBit16ClearOp,confirmed,0x800b3a6c,Action 0x3a clears actor-runtime word 0x04 bit 16 and clears the linked halfword
+0x800b26e0,MissionScript_ObjectWord04AssignOp,confirmed,0x800b49e0,Action 0x48 assigns the decoded value to selected object-record word 0x04
+0x800b2700,MissionScript_ScheduleType10Or11Op,confirmed,0x800b38f0,Action 0x49 schedules type 0x10 or 0x11 at priority 2 with fixed argument 0xfffe
+0x800b2748,MissionScript_ScheduleType0fBit8000Op,confirmed,0x800b5564,Action 0x4b schedules type 0x0f at priority 2 with argument bit 0x8000 set
+0x800b2784,MissionScript_ScheduleType0fBit2000Op,confirmed,0x800b55b4,Action 0x4c schedules type 0x0f at priority 2 with argument bit 0x2000 set
+0x800b27fc,MissionScript_ScheduleType0fBit0800Op,confirmed,0x800b3b54,Action 0x4e schedules type 0x0f at priority 2 with argument bit 0x0800 set
+0x800b28e8,MissionScript_SchedulePackedTrackedObjectOp,confirmed,0x800b56ac,Action 0x51 schedules type 0x0f for a valid tracked object with two decoded values packed into the argument
+0x800b0df8,MissionScript_ActorRuntimeByte13AssignOp,confirmed,0x800b3b80,Action 0x52 assigns actor-runtime byte 0x13
+0x800b0f30,MissionScript_ActorRuntimeBit27AndHalfword10Op,confirmed,0x800b3cb8,Action 0x53 sets actor-runtime word 0x04 bit 27 and assigns halfword 0x10
+0x800b11b4,MissionScript_ActorTableNibbleAssignOp,confirmed,0x800b3f3c,Action 0x64 assigns bits 8 through 11 of the selected actor runtime-table record after subtracting base value 7
+0x800649bc,InventoryQuantity_ReadPair,confirmed,0x80066da0,Writes the selected actor-item reserve and loaded halfwords through its two output pointers
+0x80064a48,InventoryQuantity_Total,confirmed,0x80066e2c,Calls InventoryQuantity_ReadPair and returns the sum of reserve and loaded quantities
+0x800b16b4,MissionScript_InventoryQuantityTotalOp,confirmed,0x800b4468,Action 0x65 stores the selected actor-item total quantity in the VM result register
+0x800b2974,MissionScript_ScheduleType12Op,confirmed,0x800b5738,Action 0x6c schedules type 0x12 at priority 5 with the decoded object and value pair
+0x800b29b0,MissionScript_ActorAuxiliaryResourcesResetOp,confirmed,0x800b5774,Action 0x6d resets the current global actor auxiliary resource handles
+0x8005cb60,ActorAuxiliaryResources_Configure,strong,0x8005e1e4,Configures five auxiliary fields and a callback for one actor or recursively for both global actors
+0x800b29d8,MissionScript_ActorAuxiliaryResourcesConfigureOp,confirmed,0x800b579c,Action 0x6e configures both global actors with the decoded signed mode zero secondary mode and fixed callback
+0x800afa4c,MissionScript_ObjectAttachmentTranslationCopyOp,confirmed,0x800b25b8,Action 0x72 copies one selected object position into another object attachment or display transform while preserving rotation and setting fixed transform flags
+0x800b19d0,MissionScript_ObjectDisplayBit26AssignOp,confirmed,0x800b4784,Action 0x76 assigns object-display word 0x04 bit 26 from a Boolean operand
+0x800b1210,MissionScript_ActorRuntimeBit28AssignOp,confirmed,0x800b3f98,Action 0x7a assigns actor-runtime word 0x04 bit 28 from a Boolean operand
+0x800b1770,MissionScript_ObjectByte00AssignOp,confirmed,0x800b4524,Action 0x3b assigns the decoded byte to offset zero of the selected object record
+0x800b1790,MissionScript_LinkedObjectHandlerStateClearOp,confirmed,0x800b4544,Action 0x3c resolves the selected object linked record and assigns minus one to handler-state halfword 0x4a
+0x800af9f0,ObjectPosition_ApproximateDistance,confirmed,0x800b255c,Resolves two object positions and computes largest absolute delta plus one quarter of the other two absolute deltas
+0x800b1d30,MissionScript_ObjectApproximateDistanceOp,confirmed,0x800b4b30,Action 0x63 stores the approximate distance between two decoded objects divided by 32 in the VM result register
+0x800afb68,MissionScript_IndexedOrientationScalarAssignOp,confirmed,0x800b26d4,Action 0x7f writes a fixed scalar or absolute object orientation component divided by 32 into one of two indexed halfword tables

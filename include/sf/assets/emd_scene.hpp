@@ -53,11 +53,18 @@ struct EmdSection {
 
 class EmdScene final {
 public:
-    [[nodiscard]] static EmdScene parse(std::span<const std::byte> bytes);
+    // SF1/SF2 encode transformed-vertex offsets in three-byte units. SF3
+    // changed that compact stream to two-byte units.
+    [[nodiscard]] static EmdScene parse(
+        std::span<const std::byte> bytes,
+        std::uint8_t vertex_index_stride = 3U);
 
     [[nodiscard]] std::uint32_t flags() const noexcept { return flags_; }
     [[nodiscard]] std::uint8_t textureBank() const noexcept {
-        return static_cast<std::uint8_t>((flags_ & 0xffU) >> 4U);
+        // Bit 4 selects VRAM1.HOG. Bits 5..7 are independent scene flags;
+        // treating the complete high nibble as a bank number breaks later
+        // SF2 rooms whose flags legitimately contain 0x20/0x40/0x80.
+        return static_cast<std::uint8_t>((flags_ >> 4U) & 1U);
     }
     [[nodiscard]] std::uint32_t texturePageMask() const noexcept { return texture_page_mask_; }
     [[nodiscard]] std::optional<std::uint32_t> resolvedTexturePageMask(

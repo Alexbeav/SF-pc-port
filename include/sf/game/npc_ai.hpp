@@ -105,6 +105,11 @@ struct NpcState {
   int route_direction{1};
   bool route_active{};
   bool route_finished{};
+  // Some authored sequel openings deliberately direct a hostile at an allied
+  // actor even when the player is closer. The retail source index remains
+  // stable across scene materialization and checkpoint copies.
+  std::optional<std::uint16_t> scripted_target_source;
+  bool scripted_target_until_damaged{};
   bool scripted_defuser{};
   bool scripted_intro_agent{};
   bool scripted_intro_spawned{};

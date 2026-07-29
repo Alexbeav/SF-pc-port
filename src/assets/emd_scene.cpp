@@ -54,16 +54,18 @@ EmdUv decodeUv(std::uint16_t packed) {
   };
 }
 
-std::uint16_t vertexIndex(std::uint32_t packed, unsigned int shift) {
+std::uint16_t vertexIndex(std::uint32_t packed, unsigned int shift,
+                          std::uint8_t stride) {
   const auto byte_offset = static_cast<std::uint8_t>(packed >> shift);
-  if (byte_offset % 3U != 0) {
+  if (stride == 0U || byte_offset % stride != 0) {
     throw core::Error{core::ErrorCode::invalid_format,
                       "EMD polygon has an unaligned vertex index"};
   }
-  return static_cast<std::uint16_t>(byte_offset / 3U);
+  return static_cast<std::uint16_t>(byte_offset / stride);
 }
 
-EmdPolygon parsePolygon(std::span<const std::byte> bytes, std::size_t offset) {
+EmdPolygon parsePolygon(std::span<const std::byte> bytes, std::size_t offset,
+                        std::uint8_t vertex_index_stride) {
   const auto word0 = readLe32(bytes, offset);
   const auto word1 = readLe32(bytes, offset + 4);
   const auto word2 = readLe32(bytes, offset + 8);
@@ -75,10 +77,14 @@ EmdPolygon parsePolygon(std::span<const std::byte> bytes, std::size_t offset) {
   // for triangles. Only the remaining compact material bits make a polygon
   // renderable.
   polygon.renderable = (word0 & 0x7fffffffU) != 0U;
-  polygon.vertex_indices[0] = vertexIndex(word1, 24U);
-  polygon.vertex_indices[1] = vertexIndex(word2, 16U);
-  polygon.vertex_indices[2] = vertexIndex(word2, 24U);
-  polygon.vertex_indices[3] = polygon.quad ? vertexIndex(word2, 0U) : 0;
+  polygon.vertex_indices[0] =
+      vertexIndex(word1, 24U, vertex_index_stride);
+  polygon.vertex_indices[1] =
+      vertexIndex(word2, 16U, vertex_index_stride);
+  polygon.vertex_indices[2] =
+      vertexIndex(word2, 24U, vertex_index_stride);
+  polygon.vertex_indices[3] =
+      polygon.quad ? vertexIndex(word2, 0U, vertex_index_stride) : 0;
   polygon.clut =
       static_cast<std::uint16_t>(((word0 >> 16U) & 0x7c0U) | 0x7830U);
   polygon.texture_page = static_cast<std::uint16_t>((word1 >> 16U) & 0xffU);
@@ -112,7 +118,8 @@ EmdPolygon parsePolygon(std::span<const std::byte> bytes, std::size_t offset) {
 }
 
 EmdSection parseSection(std::span<const std::byte> bytes,
-                        std::size_t section_offset, std::size_t section_end) {
+                        std::size_t section_offset, std::size_t section_end,
+                        std::uint8_t vertex_index_stride) {
   if (section_offset > section_end || section_end > bytes.size() ||
       section_end - section_offset < section_header_size) {
     throw core::Error{core::ErrorCode::invalid_format,
@@ -155,7 +162,8 @@ EmdSection parseSection(std::span<const std::byte> bytes,
   }
   section.polygons.reserve(polygon_count);
   for (std::size_t index = 0; index < polygon_count; ++index) {
-    auto polygon = parsePolygon(bytes, polygon_offset + index * polygon_size);
+    auto polygon = parsePolygon(bytes, polygon_offset + index * polygon_size,
+                                vertex_index_stride);
     const auto used_vertices = polygon.quad ? 4U : 3U;
     if (std::ranges::any_of(polygon.vertex_indices.begin(),
                             polygon.vertex_indices.begin() + used_vertices,
@@ -211,6 +219,15 @@ resolveEmdTexturePageSource(std::uint16_t raw_texture_page,
       (authored_page_mask & (1U << shifted)) != 0U) {
     return std::nullopt;
   }
+  // Only physical pages 6..11 can alias the six logical pages displaced by
+  // the native framebuffer reservation. Every other selector has exactly one
+  // possible source page. Some sequel object EMDs legitimately omit such a
+  // directly addressed page from both their advisory header mask and VLF
+  // preload (for example CHINBOSS/BOMB.EMD uses page 31 alongside its declared
+  // pages 22/23); the streamer can still load that page from VRAM.HOG.
+  if (!has_shifted) {
+    return direct;
+  }
   return resolve_from(vlf_page_mask);
 }
 
@@ -219,7 +236,8 @@ EmdScene::EmdScene(std::uint32_t flags, std::uint32_t texture_page_mask,
     : flags_(flags), texture_page_mask_(texture_page_mask),
       sections_(std::move(sections)) {}
 
-EmdScene EmdScene::parse(std::span<const std::byte> bytes) {
+EmdScene EmdScene::parse(std::span<const std::byte> bytes,
+                         std::uint8_t vertex_index_stride) {
   if (bytes.size() < header_size) {
     throw core::Error{core::ErrorCode::invalid_format,
                       "EMD header is truncated"};
@@ -249,7 +267,8 @@ EmdScene EmdScene::parse(std::span<const std::byte> bytes) {
   for (std::size_t index = 0; index < offsets.size(); ++index) {
     const auto end =
         index + 1U < offsets.size() ? offsets[index + 1U] : bytes.size();
-    sections.push_back(parseSection(bytes, offsets[index], end));
+    sections.push_back(
+        parseSection(bytes, offsets[index], end, vertex_index_stride));
   }
   return EmdScene{readLe32(bytes, 0), readLe32(bytes, 0x88),
                   std::move(sections)};

@@ -26,6 +26,8 @@ if(SF_BUILD_ROM_PROBES)
         apps/sf_retail_environment_probe.cpp)
     sf_add_game_probe(sf_retail_prop_state_probe
         apps/sf_retail_prop_state_probe.cpp)
+    sf_add_game_probe(sf_sf2_native_mission_probe
+        apps/sf_sf2_native_mission_probe.cpp)
 endif()
 
 function(sf_add_supported_rom_test name target labels timeout)

@@ -16,7 +16,8 @@ class LevelLayout final {
 public:
     [[nodiscard]] static LevelLayout parse(
         std::span<const std::byte> bytes,
-        std::size_t expected_model_count);
+        std::size_t expected_model_count,
+        std::size_t visibility_entry_size = 15U);
 
     [[nodiscard]] std::size_t modelCount() const noexcept { return rooms_.size(); }
     [[nodiscard]] std::uint16_t initialRoom() const noexcept { return initial_room_; }

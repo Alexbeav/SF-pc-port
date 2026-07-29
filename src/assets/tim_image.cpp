@@ -70,14 +70,19 @@ TimImage::TimImage(TimPixelMode mode, std::optional<TimBlock> clut, TimBlock pix
 TimImage TimImage::parse(std::span<const std::byte> bytes) {
     constexpr std::uint32_t signature = 0x10U;
     constexpr std::uint32_t has_clut_flag = 0x08U;
+    constexpr std::uint32_t sequel_metadata_mask = 0x84000000U;
     if (bytes.size() < 20 || readLe32(bytes, 0) != signature) {
         throw core::Error{core::ErrorCode::invalid_format, "TIM signature was not found"};
     }
 
     const auto flags = readLe32(bytes, 4);
     const auto raw_mode = flags & 0x07U;
-    if (raw_mode > static_cast<std::uint32_t>(TimPixelMode::direct24) || (flags & ~0x0fU) != 0) {
-        throw core::Error{core::ErrorCode::unsupported, "Unsupported TIM pixel flags"};
+    const auto metadata_flags = flags & ~0x0fU;
+    if (raw_mode > static_cast<std::uint32_t>(TimPixelMode::direct24) ||
+        (metadata_flags & ~sequel_metadata_mask) != 0U) {
+        throw core::Error{
+            core::ErrorCode::unsupported,
+            "Unsupported TIM pixel flags " + std::to_string(flags)};
     }
     const auto mode = static_cast<TimPixelMode>(raw_mode);
     const bool has_clut = (flags & has_clut_flag) != 0;

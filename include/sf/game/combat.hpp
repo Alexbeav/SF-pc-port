@@ -26,6 +26,7 @@ enum class WeaponDamageKind : std::uint8_t {
     fire,
     explosive,
     gas,
+    melee,
 };
 
 struct WeaponCombatDefinition {
@@ -62,6 +63,19 @@ struct WeaponCombatDefinition {
 // simulation ticks.
 [[nodiscard]] const WeaponCombatDefinition& weaponCombatDefinition(WeaponId id) noexcept;
 [[nodiscard]] PlayerWeaponStance weaponStance(WeaponId id) noexcept;
+
+// SF2's opening knife target has 200 health while the recovered KNIFE record
+// deals 100 close damage. A strike from the rear applies the contextual
+// takedown multiplier; ordinary knife attacks retain the packed item damage.
+[[nodiscard]] constexpr std::uint16_t contextualMeleeDamage(
+    std::uint16_t damage, std::int32_t signed_target_angle) noexcept {
+    const auto rear = signed_target_angle <= -1024 ||
+                      signed_target_angle >= 1024;
+    const auto result = static_cast<std::uint32_t>(damage) *
+                        (rear ? 2U : 1U);
+    return static_cast<std::uint16_t>(
+        result > 0xffffU ? 0xffffU : result);
+}
 
 struct DamageResult {
     std::uint16_t armor_damage{};

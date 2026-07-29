@@ -211,7 +211,19 @@ private:
     Spu &spu_;
   };
 
+  class NativeGpuDmaPort final : public DmaPort {
+  public:
+    [[nodiscard]] bool readDmaWord(std::uint32_t &value) noexcept override {
+      value = 0U;
+      return true;
+    }
+    [[nodiscard]] bool writeDmaWord(std::uint32_t) noexcept override {
+      return true;
+    }
+  };
+
   SpuDmaPort spu_dma_port_{spu_};
+  NativeGpuDmaPort native_gpu_dma_port_;
   std::array<DmaPort *, DmaController::channel_count> dma_ports_{};
 };
 
