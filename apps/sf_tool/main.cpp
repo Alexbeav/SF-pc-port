@@ -6976,6 +6976,12 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.last_rejected_renderer_list_root << "/"
             << diagnostics.last_rejected_renderer_list_cursor << "/"
             << diagnostics.last_rejected_renderer_list_tag << std::dec
+            << " rejected-sound-banks="
+            << diagnostics.rejected_sound_bank_lookups << ":0x"
+            << std::hex << std::uppercase
+            << diagnostics.last_rejected_sound_bank << "/"
+            << diagnostics.last_rejected_sound_bank_table << std::dec << "/"
+            << diagnostics.last_rejected_sound_bank_index
             << " room-textures="
             << diagnostics.room_texture_activations << "/"
             << diagnostics.room_texture_page_requests << "/"

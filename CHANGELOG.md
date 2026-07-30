@@ -3,6 +3,17 @@
 All notable public-test changes are documented here. The project currently uses
 pre-release tags rather than a stable semantic-versioning promise.
 
+## Unreleased
+
+### SF2 cross-mission bring-up
+
+- Boot-validated all eight USA Disc 1 mission packages through the retail
+  guest runtime; Missions 1 and 4–8 also pass deterministic quick-state
+  replay gates.
+- Prevented AIRBASE movement from faulting in a stale player sound-bank
+  payload by treating only unreadable retail variant tables as an empty sound
+  selection. Forward, combat and byte-exact F5/F9 stress routes now complete.
+
 ## 0.1.0-sf2-guest-alpha.2 - 2026-07-31
 
 ### Mission 3 playable alpha

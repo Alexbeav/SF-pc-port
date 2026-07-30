@@ -915,6 +915,13 @@ public:
         last_retail_load_image_caller_;
     result.last_retail_load_image_transfer =
         last_retail_load_image_transfer_;
+    result.rejected_sound_bank_lookups =
+        rejected_sound_bank_lookups_;
+    result.last_rejected_sound_bank = last_rejected_sound_bank_;
+    result.last_rejected_sound_bank_table =
+        last_rejected_sound_bank_table_;
+    result.last_rejected_sound_bank_index =
+        last_rejected_sound_bank_index_;
     for (const auto &packet : vram_setup_packets_) {
       if (packet.guest_address == 0U ||
           sf2GpuCommandKind(packet) !=
@@ -1466,6 +1473,32 @@ private:
                 " ra=0x" + hex(state.gpr[31U]) +
                 " sp=0x" + hex(state.gpr[29U]) +
                 " opening-sp=0x" + hex(opening_stack_);
+      if (boundary.execution.pc == 0x800fa750U) {
+        detail += " bank=";
+        for (auto offset = std::uint32_t{}; offset < 0x30U;
+             offset += sizeof(std::uint32_t)) {
+          std::uint32_t value{};
+          if (vm_.runtime().read32(state.gpr[4U] + offset, value)) {
+            detail += (offset == 0U ? "" : "/") + hex(value);
+          } else {
+            detail += (offset == 0U ? "" : "/") + std::string{"????????"};
+          }
+        }
+        detail += " table-window=";
+        const auto entries = state.gpr[2U];
+        const auto aligned_entries = entries & ~3U;
+        for (auto offset = std::int32_t{-16}; offset <= 16; offset += 4) {
+          std::uint32_t value{};
+          if (vm_.runtime().read32(
+                  aligned_entries + static_cast<std::uint32_t>(offset),
+                  value)) {
+            detail += (offset == -16 ? "" : "/") + hex(value);
+          } else {
+            detail += (offset == -16 ? "" : "/") +
+                      std::string{"????????"};
+          }
+        }
+      }
       if (boundary.execution.pc == 0x800b3cd8U) {
         std::uint32_t command{};
         std::uint32_t previous{};
@@ -2171,6 +2204,54 @@ private:
         0x8008dc9cU, [this](LegacyHostCallContext &context) {
           scene_speech_io_ready_ =
               static_cast<std::uint8_t>(context.registerValue(2U) != 0U);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800fa720U, [this](LegacyHostCallContext &context) {
+          // SoundBank_SelectVariants indexes an eight-byte table and then
+          // walks 24-byte variant records. AIRBASE retains a linked PL02
+          // bank whose allocation has already been repurposed during the
+          // authored opening; its stale table pointer is unaligned. Retail
+          // reaches it on the first sustained footstep request and would
+          // issue an unaligned LW. Treat only an unreadable table as an empty
+          // selection, matching the routine's existing out-of-range result.
+          constexpr std::uint32_t ram_begin = 0x80000000U;
+          constexpr std::uint32_t ram_end = 0x80200000U;
+          const auto bank = context.argument(0U);
+          const auto index = context.argument(1U);
+          std::uint16_t entry_count{};
+          std::uint32_t table{};
+          std::uint8_t variant_count{};
+          std::uint32_t variants{};
+          auto valid =
+              bank >= ram_begin && bank < ram_end &&
+              context.read16(bank + 0x1aU, entry_count) &&
+              index < entry_count &&
+              context.read32(bank + 0x24U, table) &&
+              (table & 3U) == 0U && table >= ram_begin &&
+              table <= ram_end - 8U;
+          const auto resolved_entry =
+              valid && index <=
+                           (std::numeric_limits<std::uint32_t>::max() -
+                            table) /
+                               8U
+                  ? table + index * 8U
+                  : 0U;
+          valid = valid && resolved_entry >= ram_begin &&
+                  resolved_entry <= ram_end - 8U &&
+                  context.read8(resolved_entry, variant_count) &&
+                  context.read32(resolved_entry + 4U, variants) &&
+                  (variant_count == 0U ||
+                   ((variants & 3U) == 0U && variants >= ram_begin &&
+                    variants <= ram_end - 0x18U));
+          if (!valid) {
+            ++rejected_sound_bank_lookups_;
+            last_rejected_sound_bank_ = bank;
+            last_rejected_sound_bank_table_ = table;
+            last_rejected_sound_bank_index_ = index;
+            context.setReturnValue(0U);
+            return;
+          }
           context.continueGuestInstruction();
         });
     constexpr std::array scene_speech_stages{
@@ -3140,6 +3221,10 @@ private:
   std::uint64_t retained_retail_load_images_{};
   std::array<std::uint64_t, 10U> retail_load_image_call_sites_{};
   std::uint64_t unknown_retail_load_image_call_sites_{};
+  std::uint64_t rejected_sound_bank_lookups_{};
+  std::uint32_t last_rejected_sound_bank_{};
+  std::uint32_t last_rejected_sound_bank_table_{};
+  std::uint32_t last_rejected_sound_bank_index_{};
   std::uint32_t last_room_texture_activation_{};
   std::uint32_t last_room_texture_page_{};
   std::uint32_t last_room_texture_bank_{};

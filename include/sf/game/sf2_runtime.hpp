@@ -242,6 +242,10 @@ struct Sf2GuestRuntimeDiagnostics {
   std::array<std::uint32_t, 20U> scene_speech_io_state{};
   std::uint64_t spatial_sound_starts{};
   std::uint64_t scene_sound_cue_plays{};
+  std::uint64_t rejected_sound_bank_lookups{};
+  std::uint32_t last_rejected_sound_bank{};
+  std::uint32_t last_rejected_sound_bank_table{};
+  std::uint32_t last_rejected_sound_bank_index{};
   std::array<std::uint32_t, 11U> interrupt_callbacks{};
   std::array<std::uint32_t, 5U> xa_globals{};
   std::uint32_t xa_status_source{};
