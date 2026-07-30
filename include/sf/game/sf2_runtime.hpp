@@ -90,6 +90,21 @@ struct Sf2GpuTransfer {
   std::span<const std::uint32_t> payload;
 };
 
+enum class Sf2GuestTimelineEventKind : std::uint8_t {
+  script_event5 = 1U,
+  scene_speech_start,
+  scene_speech_stop,
+  xa_stream_start,
+  xa_stream_stop,
+};
+
+struct Sf2GuestTimelineEvent {
+  Sf2GuestTimelineEventKind kind{};
+  std::uint64_t guest_frame{};
+  std::uint32_t system_clock{};
+  std::array<std::uint32_t, 4U> arguments{};
+};
+
 struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t pc{};
   std::uint32_t stack_pointer{};
@@ -98,10 +113,19 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t return_address{};
   std::uint32_t global_pointer{};
   std::uint32_t application_state{};
+  std::uint32_t selected_mission_index{};
   std::uint32_t system_clock{};
   std::uint32_t last_pad_caller{};
   std::uint32_t last_pad_index{};
   std::uint32_t player_instance{};
+  std::uint16_t guest_current_room{};
+  std::uint32_t guest_collision_room_count{};
+  std::uint32_t guest_collision_room_record{};
+  std::uint32_t guest_collision_list{};
+  std::uint64_t collision_room_fallbacks{};
+  std::uint16_t last_collision_room_fallback{};
+  std::uint64_t collision_request_fallbacks{};
+  std::uint16_t last_collision_request_fallback{};
   std::int32_t player_x{};
   std::int32_t player_y{};
   std::int32_t player_z{};
@@ -122,6 +146,51 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_player_damage_caller{};
   std::array<std::uint32_t, 8U> last_player_damage_request{};
   std::uint64_t player_damage_events{};
+  std::uint64_t world_collision_scans{};
+  std::uint32_t last_world_collision_caller{};
+  std::int32_t last_world_collision_object{};
+  std::int32_t last_world_collision_room{};
+  std::uint64_t player_floor_probes{};
+  std::uint64_t player_floor_probe_true{};
+  std::uint64_t player_floor_probe_false{};
+  std::uint32_t player_floor_false_streak{};
+  std::uint32_t maximum_player_floor_false_streak{};
+  std::uint64_t renderer_text_repairs{};
+  std::uint32_t last_renderer_text_repair_address{};
+  std::uint32_t last_renderer_text_expected{};
+  std::uint32_t last_renderer_text_actual{};
+  std::uint32_t last_renderer_text_writer_pc{};
+  std::uint32_t last_renderer_text_writer_instruction{};
+  std::uint64_t rejected_renderer_ordering_tables{};
+  std::uint32_t last_rejected_renderer_packet{};
+  std::uint32_t last_rejected_renderer_root{};
+  std::uint64_t last_rejected_renderer_frame{};
+  std::uint64_t rejected_renderer_vertex_entries{};
+  std::uint32_t last_rejected_renderer_vertex_cursor{};
+  std::uint32_t last_rejected_renderer_vertex_address{};
+  std::uint64_t clamped_renderer_ordering_table_entries{};
+  std::uint32_t last_renderer_ordering_table_requested{};
+  std::uint32_t last_renderer_ordering_table_clamped{};
+  std::uint32_t last_renderer_ordering_table_base{};
+  std::uint32_t last_renderer_ordering_table_buckets{};
+  std::uint64_t room_texture_activations{};
+  std::uint64_t room_texture_page_requests{};
+  std::uint64_t room_texture_upload_completions{};
+  std::uint64_t retail_load_image_calls{};
+  std::uint64_t retained_retail_load_images{};
+  std::array<std::uint64_t, 10U> retail_load_image_call_sites{};
+  std::uint64_t unknown_retail_load_image_call_sites{};
+  std::uint32_t last_room_texture_activation{};
+  std::uint32_t last_room_texture_page{};
+  std::uint32_t last_room_texture_bank{};
+  std::uint32_t last_retail_load_image_caller{};
+  Sf2GpuTransfer last_retail_load_image_transfer{};
+  std::uint32_t retained_retail_texture_page_mask{};
+  std::uint64_t retained_retail_upload_halfwords{};
+  std::uint32_t retained_retail_framebuffer_rectangles{};
+  std::uint32_t retained_retail_fullscreen_rectangles{};
+  std::uint32_t retained_retail_clut_rectangles{};
+  std::array<std::uint64_t, 8U> retained_retail_clut_transfers{};
   std::uint64_t spu_mixed_frames{};
   std::uint64_t spu_key_on_writes{};
   std::uint64_t spu_key_off_writes{};
@@ -151,14 +220,19 @@ struct Sf2GuestRuntimeDiagnostics {
   std::array<std::uint32_t, 2U> script_lookup_name_words{};
   std::uint64_t script_level_starts{};
   std::uint64_t script_dispatches{};
+  std::uint64_t script_event5_dispatches{};
+  std::array<std::uint32_t, 2U> last_script_dispatch_arguments{};
   std::uint64_t script_program_dispatches{};
   std::uint64_t script_activations{};
   std::uint64_t scene_xa_archive_opens{};
   std::uint64_t scene_speech_starts{};
   std::uint64_t scene_speech_callbacks{};
+  std::uint64_t scene_speech_stops{};
   std::uint8_t scene_speech_stage{};
   std::uint8_t scene_speech_io_ready{};
   std::array<std::uint32_t, 4U> last_scene_speech_arguments{};
+  std::array<std::uint32_t, 4U> last_scene_speech_callback_arguments{};
+  std::array<std::uint32_t, 4U> last_scene_speech_stop_arguments{};
   std::array<std::uint32_t, 20U> scene_speech_io_state{};
   std::uint64_t spatial_sound_starts{};
   std::uint64_t scene_sound_cue_plays{};
@@ -168,6 +242,9 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t xa_status_result{};
   std::uint64_t xa_cue_plays{};
   std::uint64_t xa_stream_starts{};
+  std::uint64_t xa_stream_stops{};
+  std::uint64_t timeline_event_count{};
+  std::array<Sf2GuestTimelineEvent, 64U> timeline_events{};
   std::uint64_t async_file_services{};
   std::uint64_t async_file_completions{};
   std::uint32_t last_async_completion_caller{};
@@ -203,6 +280,9 @@ private:
 // release.
 class Sf2WeaponSelectPulseQueue final {
 public:
+  static constexpr unsigned int maximum_pending =
+      static_cast<unsigned int>(sf2_inventory_item_count);
+
   explicit Sf2WeaponSelectPulseQueue(
       std::uint64_t initial_sample = 0U) noexcept;
   void enqueue(unsigned int count = 1U) noexcept;
@@ -216,12 +296,27 @@ private:
   bool may_press_{true};
 };
 
+// The retail Change Weapon action advances through owned, equipable item IDs in
+// ascending order and wraps. These helpers translate a signed host carousel
+// movement or a PC quick-slot index into the number of forward retail Select
+// edges required from the authoritative guest selection. A missing quick slot
+// is rejected instead of mutating guest inventory.
+[[nodiscard]] unsigned int sf2WeaponCyclePulseCount(
+    const Sf2GuestRuntimeDiagnostics &guest, std::int32_t steps) noexcept;
+[[nodiscard]] std::optional<unsigned int> sf2WeaponSlotPulseCount(
+    const Sf2GuestRuntimeDiagnostics &guest, std::size_t slot) noexcept;
+
 // Classifies one bounded DMA packet for the native presentation backend.
 // Drawing and draw-environment packets retain their exact GP0 words. VRAM
 // commands are exposed separately because PsyCross represents uploads with a
 // host pointer rather than the PSX packet's inline pixel payload.
 [[nodiscard]] Sf2GpuCommandKind
 sf2GpuCommandKind(const Sf2GpuPacket &packet) noexcept;
+
+// Returns the complete length of the first GP0 command, or nullopt when the
+// supplied stream ends inside that command.
+[[nodiscard]] std::optional<std::size_t>
+sf2Gp0CommandWordCount(std::span<const std::uint32_t> words) noexcept;
 
 [[nodiscard]] std::optional<Sf2GpuTransfer>
 sf2GpuTransfer(const Sf2GpuPacket &packet) noexcept;
@@ -238,7 +333,7 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
                             std::uint64_t sequence,
                             std::uint64_t guest_frame) noexcept;
 
-// Production owner for the verified Disc 1 TITLE -> HWAY transition. It keeps
+// Production owner for the Disc 1 TITLE -> mission transition. It keeps
 // executable, overlays, CD/SPU state, collision, scripts, HUD and effects in
 // the retail guest; the host supplies only a standard pad sample and consumes
 // immutable GPU/SPU output.
@@ -258,6 +353,21 @@ public:
   [[nodiscard]] bool faulted() const noexcept;
   [[nodiscard]] std::string_view faultDetail() const noexcept;
   void setHostPadState(const LegacyHostPadState &state) noexcept;
+  // Diagnostic-only authored event injection used by sf_tool to exercise
+  // mission transitions without an interactive traversal.
+  [[nodiscard]] bool
+  dispatchScriptEventForProbe(std::uint32_t event,
+                              std::uint32_t selector) noexcept;
+  [[nodiscard]] bool
+  activateScriptProgramForProbe(std::string_view name) noexcept;
+  [[nodiscard]] bool setPlayerPositionForProbe(
+      std::int32_t x, std::int32_t y, std::int32_t z) noexcept;
+  [[nodiscard]] bool
+  setPlayerRoomForProbe(std::uint16_t room) noexcept;
+  [[nodiscard]] bool
+  setPlayerHealthForProbe(std::uint16_t health) noexcept;
+  [[nodiscard]] bool
+  startPlayerObjectInteractionForProbe(std::uint32_t selector) noexcept;
   [[nodiscard]] bool advanceHostUpdate() noexcept;
   [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
   presentationFrame() const noexcept;
@@ -266,6 +376,11 @@ public:
   void clearPcm() noexcept;
   [[nodiscard]] std::uint64_t inputSampleCount() const noexcept;
   [[nodiscard]] Sf2GuestRuntimeDiagnostics diagnostics() const noexcept;
+  // Process-local testing checkpoint. Captures/restores the complete guest
+  // machine plus SF2 host scheduling and retained presentation state.
+  [[nodiscard]] bool captureQuickState() noexcept;
+  [[nodiscard]] bool restoreQuickState() noexcept;
+  [[nodiscard]] bool hasQuickState() const noexcept;
 
 private:
   class Impl;

@@ -100,7 +100,8 @@ void printUsage() {
       << "  sf_tool probe-sf2-mission-transition <game.cue> "
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
-         "[forward|combat|crouch]\n"
+         "[neutral|forward|combat|crouch|quickstate|objective|weapons] "
+         "[mission-index]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -124,6 +125,20 @@ std::uint32_t parseFrameCount(const char *text) {
                           "Legacy frame count must be in the range 1..10000"};
   }
   return count;
+}
+
+std::uint32_t parseSf2MissionIndex(const char *text) {
+  const std::string_view value{text};
+  std::uint32_t index{};
+  const auto *const value_end = value.data() + value.size();
+  const auto [end, error] =
+      std::from_chars(value.data(), value_end, index);
+  if (error != std::errc{} || end != value_end || index > 20U) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::invalid_format,
+        "SF2 mission index must be in the range 0..20"};
+  }
+  return index;
 }
 
 int inspect(const char *path) {
@@ -6446,9 +6461,12 @@ int probeSf2GuestBootstrap(const char *cue_path, std::uint64_t budget,
 }
 
 int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
-                           bool forward, bool combat, bool crouch) {
+                           bool forward, bool combat, bool crouch,
+                           bool quick_state, bool objective_event,
+                           bool weapon_cycle,
+                           std::uint32_t mission_index) {
   sf::game::Sf2GuestMissionRuntime runtime{
-      std::filesystem::path{cue_path}, 2U};
+      std::filesystem::path{cue_path}, mission_index};
   if (!runtime.ready()) {
     std::cerr << "SF2 product runtime failed: " << runtime.faultDetail()
               << '\n';
@@ -6489,7 +6507,72 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   auto first_xa_frame = std::uint32_t{};
   auto maximum_cd_lba = std::uint32_t{};
   auto maximum_relative_cd_lba = std::uint32_t{};
+  auto last_guest_room = runtime.diagnostics().guest_current_room;
+  std::vector<std::pair<std::uint32_t, std::uint16_t>>
+      guest_room_transitions;
+  guest_room_transitions.emplace_back(0U, last_guest_room);
+  auto collision_residency_gap_frames = std::uint32_t{};
+  auto first_collision_residency_gap_frame = std::uint32_t{};
+  auto quick_state_saved = sf::game::Sf2GuestRuntimeDiagnostics{};
+  auto quick_state_restored = false;
+  const auto quick_save_frame = frames / 3U;
+  const auto quick_load_frame = frames * 2U / 3U;
+  auto objective_previous_x = runtime.diagnostics().player_x;
+  auto objective_previous_z = runtime.diagnostics().player_z;
+  auto objective_heading = 0.0;
+  auto objective_heading_known = false;
+  auto objective_minimum_distance =
+      std::numeric_limits<double>::infinity();
+  auto objective_minimum_distance_frame = std::uint32_t{};
+  auto objective_waypoint = std::size_t{};
+  auto objective_looted = false;
+  auto objective_loot_frame = std::uint32_t{};
+  auto weapon_select =
+      sf::game::Sf2WeaponSelectPulseQueue{runtime.inputSampleCount()};
+  auto weapon_pulses_queued = false;
+  auto last_equipped_item = runtime.diagnostics().player_equipped_item;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>>
+      equipped_item_transitions;
+  equipped_item_transitions.emplace_back(0U, last_equipped_item);
+  auto observed_renderer_repairs =
+      runtime.diagnostics().renderer_text_repairs;
+  constexpr std::array<std::array<double, 2U>, 6U>
+      objective_waypoints{{
+          {3448.0, -25485.0},
+          {2423.0, -21363.0},
+          {1680.0, -18916.0},
+          {2423.0, -21363.0},
+          {3448.0, -25485.0},
+          {4206.0, -25824.0},
+      }};
   for (std::uint32_t frame = 0U; frame < frames; ++frame) {
+    if (quick_state && frame == quick_load_frame) {
+      if (!runtime.restoreQuickState()) {
+        std::cerr << "SF2 quick-state probe could not restore\n";
+        return 10;
+      }
+      const auto restored = runtime.diagnostics();
+      quick_state_restored =
+          restored.system_clock == quick_state_saved.system_clock &&
+          restored.player_x == quick_state_saved.player_x &&
+          restored.player_y == quick_state_saved.player_y &&
+          restored.player_z == quick_state_saved.player_z &&
+          restored.guest_current_room ==
+              quick_state_saved.guest_current_room;
+      if (!quick_state_restored) {
+        std::cerr << "SF2 quick-state probe did not restore the saved "
+                     "clock/player/room\n";
+        return 10;
+      }
+    }
+    if (quick_state && frame > quick_save_frame &&
+        frame < quick_load_frame) {
+      pad.buttons = 0x0010U;
+      pad.left_y = 0x00U;
+    } else if (quick_state) {
+      pad.buttons = 0U;
+      pad.left_y = 0x80U;
+    }
     if (combat && frame >= 1'000U) {
       sf::game::PlayerInput input;
       input.run = true;
@@ -6509,6 +6592,89 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
       }
     }
+    if (objective_event && frame >= 800U) {
+      if (!runtime.setPlayerHealthForProbe(1000U)) {
+        std::cerr << "SF2 objective-event probe could not retain diagnostic "
+                     "player health\n";
+        return 10;
+      }
+      const auto player = runtime.diagnostics();
+      if (!objective_looted &&
+          (player.player_armor != 0U ||
+           player.player_owned_items[0U] != 0x00100000U)) {
+        objective_looted = true;
+        objective_loot_frame = frame;
+        objective_waypoint = 3U;
+      }
+      const auto velocity_x =
+          static_cast<double>(player.player_x - objective_previous_x);
+      const auto velocity_z =
+          static_cast<double>(player.player_z - objective_previous_z);
+      if (std::hypot(velocity_x, velocity_z) >= 2.0) {
+        objective_heading = std::atan2(velocity_z, velocity_x);
+        objective_heading_known = true;
+      }
+      objective_previous_x = player.player_x;
+      objective_previous_z = player.player_z;
+      auto delta_x =
+          objective_waypoints[objective_waypoint][0U] - player.player_x;
+      auto delta_z =
+          objective_waypoints[objective_waypoint][1U] - player.player_z;
+      auto distance = std::hypot(delta_x, delta_z);
+      if (distance <= 300.0 &&
+          objective_waypoint + 1U < objective_waypoints.size() &&
+          (objective_looted || objective_waypoint + 1U < 3U)) {
+        ++objective_waypoint;
+        delta_x =
+            objective_waypoints[objective_waypoint][0U] - player.player_x;
+        delta_z =
+            objective_waypoints[objective_waypoint][1U] - player.player_z;
+        distance = std::hypot(delta_x, delta_z);
+      }
+      if (distance < objective_minimum_distance) {
+        objective_minimum_distance = distance;
+        objective_minimum_distance_frame = frame;
+      }
+      auto navigation = sf::game::PlayerInput{};
+      navigation.run = true;
+      navigation.move = distance > 260.0 ? 1.0 : 0.0;
+      if (objective_heading_known) {
+        constexpr auto pi = 3.14159265358979323846;
+        auto error =
+            std::atan2(delta_z, delta_x) - objective_heading;
+        while (error > pi) {
+          error -= 2.0 * pi;
+        }
+        while (error < -pi) {
+          error += 2.0 * pi;
+        }
+        navigation.turn = -std::clamp(error, -1.0, 1.0);
+      }
+      navigation.interact =
+          !objective_looted && objective_waypoint == 2U &&
+          distance <= 340.0 && (frame % 30U) < 6U;
+      if (objective_looted && frame - objective_loot_frame < 12U) {
+        // Cross skips the short interaction scene in retail. Hold it across
+        // enough 60 Hz submissions for one 20 Hz PAD sample, then begin the
+        // return traversal that previously exposed the manual crash.
+        navigation.kneel = true;
+        navigation.move = 0.0;
+      }
+      pad = sf::game::legacyPadStateFromPlayerInput(navigation);
+    }
+    if (weapon_cycle && objective_looted &&
+        frame >= objective_loot_frame + 120U) {
+      if (!weapon_pulses_queued) {
+        // Select is the retail Change Weapon action. Queue enough separated
+        // sampled edges to observe a complete wrap through the post-truck
+        // inventory without writing guest inventory or selection state.
+        weapon_select.enqueue(12U);
+        weapon_pulses_queued = true;
+      }
+      if (weapon_select.update(runtime.inputSampleCount())) {
+        pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
+      }
+    }
     runtime.setHostPadState(pad);
     if (!runtime.advanceHostUpdate()) {
       std::cerr << "SF2 product runtime stopped at frame " << frame << ": "
@@ -6520,6 +6686,52 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       inspect_pcm(count);
     }
     const auto frame_diagnostics = runtime.diagnostics();
+    if (frame_diagnostics.player_equipped_item != last_equipped_item) {
+      last_equipped_item = frame_diagnostics.player_equipped_item;
+      equipped_item_transitions.emplace_back(frame + 1U, last_equipped_item);
+    }
+    if (frame_diagnostics.renderer_text_repairs !=
+        observed_renderer_repairs) {
+      std::cerr << "SF2 probe renderer repair at frame " << frame + 1U
+                << ": count="
+                << frame_diagnostics.renderer_text_repairs
+                << " address=0x" << std::hex << std::uppercase
+                << frame_diagnostics.last_renderer_text_repair_address
+                << " expected=0x"
+                << frame_diagnostics.last_renderer_text_expected
+                << " actual=0x"
+                << frame_diagnostics.last_renderer_text_actual
+                << " writer=0x"
+                << frame_diagnostics.last_renderer_text_writer_pc
+                << "/0x"
+                << frame_diagnostics.last_renderer_text_writer_instruction
+                << std::dec << '\n';
+      observed_renderer_repairs =
+          frame_diagnostics.renderer_text_repairs;
+    }
+    if (quick_state && frame == quick_save_frame) {
+      quick_state_saved = frame_diagnostics;
+      if (!runtime.captureQuickState()) {
+        std::cerr << "SF2 quick-state probe could not capture\n";
+        return 10;
+      }
+    }
+    if (frame_diagnostics.guest_current_room != last_guest_room) {
+      last_guest_room = frame_diagnostics.guest_current_room;
+      guest_room_transitions.emplace_back(frame + 1U, last_guest_room);
+    }
+    const auto current_room_is_valid =
+        frame_diagnostics.guest_current_room != 0xffffU &&
+        frame_diagnostics.guest_current_room <
+            frame_diagnostics.guest_collision_room_count;
+    if (current_room_is_valid &&
+        (frame_diagnostics.guest_collision_room_record == 0U ||
+         frame_diagnostics.guest_collision_list == 0U)) {
+      ++collision_residency_gap_frames;
+      if (first_collision_residency_gap_frame == 0U) {
+        first_collision_residency_gap_frame = frame + 1U;
+      }
+    }
     minimum_player_health =
         std::min(minimum_player_health, frame_diagnostics.player_health);
     maximum_active_spu_voices =
@@ -6599,11 +6811,27 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                               packet.gp0_words.begin(),
                               packet.gp0_words.end());
   }
+  const auto input_mode =
+      weapon_cycle   ? "weapons"
+      : combat       ? "combat"
+      : forward      ? "forward"
+      : crouch       ? "crouch"
+      : quick_state  ? "quickstate"
+      : objective_event ? "objective"
+                        : "neutral";
   std::cout << "SF2 product runtime completed: frames=" << frames
-            << " input="
-            << (combat ? "combat"
-                       : (forward ? "forward"
-                                  : (crouch ? "crouch" : "neutral")))
+            << " input=" << input_mode
+            << (objective_event
+                    ? " objective-nearest=" +
+                          std::to_string(
+                              static_cast<unsigned int>(
+                                  std::lround(objective_minimum_distance))) +
+                          "@" +
+                          std::to_string(objective_minimum_distance_frame) +
+                          "/wp" + std::to_string(objective_waypoint) +
+                          "/loot@" +
+                          std::to_string(objective_loot_frame)
+                    : std::string{})
             << " guest-frame=" << presentation->guest_frame
             << " packets=" << presentation->packets.size()
             << " words=" << presentation->gp0_word_count
@@ -6616,15 +6844,98 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.last_pad_caller << std::dec
             << " pad-index=" << diagnostics.last_pad_index
             << " state=" << diagnostics.application_state
+            << " mission=" << diagnostics.selected_mission_index
             << " clock=" << diagnostics.system_clock
             << " player=0x" << std::hex << std::uppercase
             << diagnostics.player_instance << std::dec << ":"
             << diagnostics.player_x << "/" << diagnostics.player_y << "/"
-            << diagnostics.player_z << ":"
+            << diagnostics.player_z << ":room="
+            << diagnostics.guest_current_room << "/"
+            << diagnostics.guest_collision_room_count << ":collision=0x"
+            << std::hex << diagnostics.guest_collision_room_record << "/"
+            << diagnostics.guest_collision_list << std::dec << ":"
             << diagnostics.player_health << "/" << diagnostics.player_armor
             << ":item=" << diagnostics.player_equipped_item << ":owned=0x"
             << std::hex << diagnostics.player_owned_items[0] << "/"
             << diagnostics.player_owned_items[1] << std::dec
+            << " weapon-cycle=";
+  for (const auto &[frame, item] : equipped_item_transitions) {
+    std::cout << frame << ":" << item << "/";
+  }
+  std::cout << " room-fallbacks="
+            << diagnostics.collision_room_fallbacks << ":"
+            << diagnostics.last_collision_room_fallback
+            << "/request:"
+            << diagnostics.collision_request_fallbacks << ":"
+            << diagnostics.last_collision_request_fallback
+            << " renderer-repairs=" << diagnostics.renderer_text_repairs
+            << ":0x" << std::hex << std::uppercase
+            << diagnostics.last_renderer_text_repair_address << "/"
+            << diagnostics.last_renderer_text_expected << "/"
+            << diagnostics.last_renderer_text_actual << "/"
+            << diagnostics.last_renderer_text_writer_pc << "/"
+            << diagnostics.last_renderer_text_writer_instruction
+            << std::dec
+            << " rejected-renderer-ots="
+            << diagnostics.rejected_renderer_ordering_tables
+            << ":0x" << std::hex << std::uppercase
+            << diagnostics.last_rejected_renderer_packet << "/"
+            << diagnostics.last_rejected_renderer_root << std::dec << "/"
+            << diagnostics.last_rejected_renderer_frame
+            << " rejected-renderer-vertices="
+            << diagnostics.rejected_renderer_vertex_entries << ":0x"
+            << std::hex << std::uppercase
+            << diagnostics.last_rejected_renderer_vertex_cursor << "/"
+            << diagnostics.last_rejected_renderer_vertex_address << std::dec
+            << " clamped-renderer-ots="
+            << diagnostics.clamped_renderer_ordering_table_entries
+            << ":0x" << std::hex << std::uppercase
+            << diagnostics.last_renderer_ordering_table_requested << "/"
+            << diagnostics.last_renderer_ordering_table_clamped << "/"
+            << diagnostics.last_renderer_ordering_table_base << std::dec
+            << "/"
+            << diagnostics.last_renderer_ordering_table_buckets
+            << " room-textures="
+            << diagnostics.room_texture_activations << "/"
+            << diagnostics.room_texture_page_requests << "/"
+            << diagnostics.room_texture_upload_completions << "/"
+            << diagnostics.retail_load_image_calls << "/"
+            << diagnostics.retained_retail_load_images << ":"
+            << diagnostics.last_room_texture_activation << "/"
+            << diagnostics.last_room_texture_page << "/"
+            << diagnostics.last_room_texture_bank
+            << " loadimage-sites=";
+  for (const auto count : diagnostics.retail_load_image_call_sites) {
+    std::cout << count << "/";
+  }
+  std::cout << diagnostics.unknown_retail_load_image_call_sites
+            << ":0x" << std::hex << std::uppercase
+            << diagnostics.last_retail_load_image_caller << std::dec
+            << "/" << diagnostics.last_retail_load_image_transfer.x
+            << "," << diagnostics.last_retail_load_image_transfer.y
+            << "," << diagnostics.last_retail_load_image_transfer.width
+            << "," << diagnostics.last_retail_load_image_transfer.height
+            << ":mask=0x" << std::hex << std::uppercase
+            << diagnostics.retained_retail_texture_page_mask << std::dec
+            << "/halfwords="
+            << diagnostics.retained_retail_upload_halfwords
+            << "/fb="
+            << diagnostics.retained_retail_framebuffer_rectangles
+            << "/full="
+            << diagnostics.retained_retail_fullscreen_rectangles
+            << "/clut="
+            << diagnostics.retained_retail_clut_rectangles << ":";
+  for (const auto packed :
+       diagnostics.retained_retail_clut_transfers) {
+    if (packed == 0U) {
+      continue;
+    }
+    std::cout << static_cast<std::uint16_t>(packed) << ","
+              << static_cast<std::uint16_t>(packed >> 16U) << ","
+              << static_cast<std::uint16_t>(packed >> 32U) << ","
+              << static_cast<std::uint16_t>(packed >> 48U) << "/";
+  }
+  std::cout
             << " checkpoint-restores="
             << diagnostics.checkpoint_restores
             << " first-restore-frame=" << first_restore_frame
@@ -6651,6 +6962,23 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cout << word << "/";
   }
   std::cout << std::dec
+            << " collision=" << diagnostics.world_collision_scans << ":0x"
+            << std::hex << std::uppercase
+            << diagnostics.last_world_collision_caller << std::dec << ":"
+            << diagnostics.last_world_collision_object << "/"
+            << diagnostics.last_world_collision_room
+            << " floor=" << diagnostics.player_floor_probes << ":"
+            << diagnostics.player_floor_probe_true << "/"
+            << diagnostics.player_floor_probe_false << ":"
+            << diagnostics.player_floor_false_streak << "/"
+            << diagnostics.maximum_player_floor_false_streak
+            << " collision-gaps="
+            << collision_residency_gap_frames << "/"
+            << first_collision_residency_gap_frame << " rooms=";
+  for (const auto &[frame, room] : guest_room_transitions) {
+    std::cout << frame << ":" << room << "/";
+  }
+  std::cout
             << " audio=" << diagnostics.spu_mixed_frames << ":"
             << diagnostics.active_spu_voices << "/max:"
             << maximum_active_spu_voices << "/"
@@ -6681,6 +7009,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.script_program_count << "/"
             << diagnostics.script_level_starts << "/"
             << diagnostics.script_dispatches << "/"
+            << diagnostics.script_event5_dispatches << "/"
             << diagnostics.script_program_dispatches << "/"
             << diagnostics.script_activations
             << " level=0x" << std::hex << std::uppercase
@@ -6692,7 +7021,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.script_lookup_name_words[1U] << std::dec
             << " xa-calls=" << diagnostics.scene_xa_archive_opens << "/"
             << diagnostics.scene_speech_starts << "/"
-            << diagnostics.scene_speech_callbacks << ":"
+            << diagnostics.scene_speech_callbacks << "/"
+            << diagnostics.scene_speech_stops << ":"
             << static_cast<unsigned int>(diagnostics.scene_speech_stage) << "/"
             << static_cast<unsigned int>(diagnostics.scene_speech_io_ready)
             << ":" << diagnostics.spatial_sound_starts << "/"
@@ -6707,6 +7037,19 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cout << value << "/";
   }
   std::cout << ":";
+  for (const auto value :
+       diagnostics.last_scene_speech_callback_arguments) {
+    std::cout << value << "/";
+  }
+  std::cout << ":";
+  for (const auto value : diagnostics.last_scene_speech_stop_arguments) {
+    std::cout << value << "/";
+  }
+  std::cout << ":script=";
+  for (const auto value : diagnostics.last_script_dispatch_arguments) {
+    std::cout << value << "/";
+  }
+  std::cout << ":";
   for (const auto value : diagnostics.scene_speech_io_state) {
     std::cout << value << "/";
   }
@@ -6717,7 +7060,29 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   std::cout << diagnostics.xa_status_source << "/"
             << diagnostics.xa_status_result << std::dec << "/"
             << diagnostics.xa_cue_plays << "/"
-            << diagnostics.xa_stream_starts
+            << diagnostics.xa_stream_starts << "/"
+            << diagnostics.xa_stream_stops
+            << " timeline=" << diagnostics.timeline_event_count << ":";
+  const auto first_timeline_event =
+      diagnostics.timeline_event_count >
+              diagnostics.timeline_events.size()
+          ? diagnostics.timeline_event_count -
+                diagnostics.timeline_events.size()
+          : 0U;
+  for (auto serial = first_timeline_event;
+       serial < diagnostics.timeline_event_count; ++serial) {
+    const auto &event =
+        diagnostics.timeline_events[serial %
+                                    diagnostics.timeline_events.size()];
+    std::cout << static_cast<unsigned int>(event.kind) << "@"
+              << event.guest_frame << "." << event.system_clock << "("
+              << std::hex << std::uppercase;
+    for (const auto argument : event.arguments) {
+      std::cout << argument << "/";
+    }
+    std::cout << std::dec << "),";
+  }
+  std::cout
             << " async-file=" << diagnostics.async_file_services << "/"
             << diagnostics.async_file_completions << ":0x"
             << std::hex
@@ -6756,6 +7121,17 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                 << opcode_counts[opcode] << '/';
     }
   }
+  std::cout << " copies=";
+  for (const auto &packet : presentation->packets) {
+    if (sf::game::sf2GpuCommandKind(packet) !=
+        sf::game::Sf2GpuCommandKind::copy_vram) {
+      continue;
+    }
+    for (const auto word : packet.gp0_words) {
+      std::cout << std::hex << std::uppercase << word << '/';
+    }
+    std::cout << std::dec << ',';
+  }
   std::cout << " display-envs=";
   for (std::size_t index = 0U; index < display_environments.size(); ++index) {
     std::cout << (index == 0U ? "" : ",");
@@ -6778,6 +7154,20 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cerr << "SF2 playable-alpha gate failed: PCM, SPU voices, player, "
                  "PAD cadence, or post-checkpoint stability is missing\n";
     return 8;
+  }
+  if (quick_state && !quick_state_restored) {
+    std::cerr << "SF2 quick-state probe did not cross a restore\n";
+    return 10;
+  }
+  if (objective_event && !objective_looted) {
+    std::cerr << "SF2 objective-event probe did not loot the truck\n";
+    return 10;
+  }
+  if (weapon_cycle &&
+      (!weapon_pulses_queued || equipped_item_transitions.size() < 4U)) {
+    std::cerr << "SF2 weapon-cycle probe did not observe enough retail "
+                 "selection transitions\n";
+    return 10;
   }
   return 0;
 }
@@ -11065,18 +11455,23 @@ int main(int argc, char **argv) {
                                     std::string_view{argv[1]} ==
                                         "probe-sf2-mission-transition");
     }
-    if ((argc >= 3 && argc <= 5) &&
+    if ((argc >= 3 && argc <= 6) &&
         std::string_view{argv[1]} == "probe-sf2-product-runtime") {
-      const auto mode =
-          argc == 5 ? std::string_view{argv[4]} : std::string_view{};
-      if (!mode.empty() && mode != "forward" && mode != "combat" &&
-          mode != "crouch") {
+      const auto mode = argc >= 5 ? std::string_view{argv[4]}
+                                  : std::string_view{};
+      if (!mode.empty() && mode != "neutral" && mode != "forward" &&
+          mode != "combat" && mode != "crouch" &&
+          mode != "objective" && mode != "weapons" &&
+          mode != "quickstate") {
         printUsage();
         return 1;
       }
       return probeSf2ProductRuntime(
           argv[2], argc >= 4 ? parseFrameCount(argv[3]) : 64U,
-          mode == "forward", mode == "combat", mode == "crouch");
+          mode == "forward", mode == "combat", mode == "crouch",
+          mode == "quickstate",
+          mode == "objective" || mode == "weapons", mode == "weapons",
+          argc == 6 ? parseSf2MissionIndex(argv[5]) : 2U);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {
       return probeLegacyCd(argv[2]);

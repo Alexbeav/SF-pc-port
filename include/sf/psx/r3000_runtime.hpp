@@ -121,9 +121,18 @@ public:
     void setExternalInterrupt(bool active) noexcept;
     void setWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
     void addWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
+    void setBreakOnWriteWatch(bool enabled) noexcept {
+        break_on_write_watch_ = enabled;
+    }
+    void setSuppressWriteWatch(bool enabled) noexcept {
+        suppress_write_watch_ = enabled;
+    }
     void clearWriteWatchHit() noexcept { write_watch_hit_ = {}; }
     [[nodiscard]] const R3000WriteWatchHit& writeWatchHit() const noexcept {
         return write_watch_hit_;
+    }
+    [[nodiscard]] bool writeWatchBreakPending() const noexcept {
+        return break_on_write_watch_ && write_watch_hit_.width != 0U;
     }
 
     [[nodiscard]] bool interruptPending() const noexcept;
@@ -172,8 +181,9 @@ private:
     void flushLoadDelay() noexcept;
     void clearLoadDelay() noexcept;
     void takeInterrupt() noexcept;
-    void recordWriteWatch(std::uint32_t address, std::uint8_t width,
-                          std::uint32_t value) noexcept;
+    [[nodiscard]] bool recordWriteWatch(std::uint32_t address,
+                                        std::uint8_t width,
+                                        std::uint32_t value) noexcept;
 
     std::vector<std::byte> ram_;
     std::array<std::byte, scratchpad_size> scratchpad_{};
@@ -186,6 +196,8 @@ private:
     std::uint32_t executing_pc_{};
     std::uint32_t executing_instruction_{};
     R3000WriteWatchHit write_watch_hit_{};
+    bool break_on_write_watch_{};
+    bool suppress_write_watch_{};
 };
 
 } // namespace sf::psx

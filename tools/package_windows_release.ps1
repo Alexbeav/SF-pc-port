@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-public-test.8",
+    [string]$Version = "0.1.0-sf2-guest-alpha.2",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -139,18 +139,22 @@ not expose this experimental SF2 path. Do not select an SF2 image there.
 CURRENT SCOPE
 =============
 
-- Mission 3 (I-70) is the only interactively validated mission.
-- The retail intro, controls, combat, doors, climbing, weapons, dialogue,
-  sound effects, death and checkpoint restart are functional.
-- The HUD is a partial native projection. Some weapon artwork is absent.
-- Music, campaign transitions, saves and the complete mission set are not
-  validated.
-- A later scripted conversation may fail to release player control.
-- Deep-room texture residency has a new fix which needs broader testing.
+- Mission 3 (I-70) is verified finishable from its in-engine opening through
+  the save menu and following cinematic.
+- Controls, combat, doors, climbing, weapons, dialogue, sound effects, death,
+  checkpoint restart and in-session F5/F9 quick states are functional.
+- The HUD and weapon artwork are substantially restored, but a few UI atlas
+  regions and initialization transitions remain imperfect.
+- Music and the complete mission set are not validated.
+- A later scripted conversation can pause unevenly or fail to release player
+  control; C skips it.
+- Collision/room residency can still intermittently allow Gabe to fall
+  through the floor. The room-14 floor-request guard in this build needs
+  broader interactive testing.
 
 Controls use the existing PC bindings. Mouse aiming works in first person;
-A/D strafe and C crouches. Use the configured weapon-cycle bindings or mouse
-wheel to change weapons.
+A/D strafe and C crouches. Mouse wheel and bracket keys select previous/next
+weapons, middle click advances once, and number keys select owned weapon slots.
 
 BUG REPORTS
 ===========

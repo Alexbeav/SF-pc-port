@@ -7261,6 +7261,16 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
   };
 
   for (std::uint64_t operation = 0; operation < execution_budget; ++operation) {
+    if (runtime_.writeWatchBreakPending()) {
+      const auto &hit = runtime_.writeWatchHit();
+      return LegacyGameplayVmResult{
+          {psx::R3000StopReason::breakpoint, instructions, hit.pc,
+           hit.instruction},
+          runtime_.state().gpr[2],
+          host_calls,
+          std::nullopt,
+      };
+    }
     if (runtime_.atReturnSentinel()) {
       runtime_.settleLoadDelay();
       return LegacyGameplayVmResult{

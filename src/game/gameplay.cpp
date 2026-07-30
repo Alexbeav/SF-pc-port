@@ -6479,6 +6479,19 @@ void GameplaySession::synchronizeGuestResidency(double x, double y, double z) {
   }
 }
 
+bool GameplaySession::synchronizeGuestRoom(std::uint16_t room) {
+  if (room >= models_.size() || room == current_room_) {
+    return false;
+  }
+  const auto resident_models = mission_.layout().residentModels();
+  if (std::ranges::find(resident_models, room) != resident_models.end()) {
+    return false;
+  }
+  current_room_ = room;
+  rebuildActiveModels();
+  return true;
+}
+
 std::uint8_t
 GameplaySession::objectTextureBank(std::uint16_t index) const noexcept {
   if (current_room_ >= models_.size()) {

@@ -3,6 +3,47 @@
 All notable public-test changes are documented here. The project currently uses
 pre-release tags rather than a stable semantic-versioning promise.
 
+## 0.1.0-sf2-guest-alpha.2 - 2026-07-31
+
+### Mission 3 playable alpha
+
+- Verified Mission 3 end to end, from its retail in-engine opening through
+  objectives, combat, dialogue, checkpoint death/restart, mission completion,
+  the save menu and the following cinematic.
+- Restored retail HUD and TIM/CLUT uploads for health, armor, ammunition,
+  reticles, weapon icons, checkpoint/head-shot notices and pickup messages.
+- Added persistent in-session F5/F9 quick states with coherent guest RAM,
+  CD/XA, SPU, streamed VRAM and fresh ordering-table presentation.
+- Added directional weapon selection, mouse-wheel switching and number-key
+  owned-weapon slots without bypassing retail inventory or equip behavior.
+- Improved modern PC input, including crouch-only C, A/D strafing and retained
+  first-person mouse motion across the retail 20 Hz input sampler.
+- Stabilized guest renderer ordering-table bounds, streamed texture residency,
+  checkpoint audio continuity and malformed presentation edges encountered
+  during full-mission play.
+- Increased SF2 OpenAL startup/recovery buffering while retaining the bounded
+  PCM timeline, reducing cadence starvation without adding guest-side latency.
+- Added a player-floor request guard and diagnostics for the captured room-14
+  fall-through path.
+
+### Alpha limitations
+
+- Mission 3 is the only interactively completed mission; other mission
+  packages remain unvalidated.
+- Collision or room residency can still intermittently allow Gabe to fall
+  through the floor. The new request guard needs broader playtesting.
+- The explosives-truck/Chance dialogue can pause unevenly and may require C to
+  skip.
+- Some UI atlas regions and initial/post-checkpoint HUD timing remain
+  imperfect.
+- Music is not yet present, and first-person mouse sensitivity needs tuning.
+
+### Release artifact
+
+- File: `SyphonFilterPC-0.1.0-sf2-guest-alpha.2-win64.zip`
+- Checksum: supplied in the accompanying `.zip.sha256` file.
+- Required disc: *Syphon Filter 2* USA Disc 1, BIN/CUE.
+
 ## 0.1.0-sf2-guest-alpha.1 - 2026-07-30
 
 ### Experimental Syphon Filter 2 runtime

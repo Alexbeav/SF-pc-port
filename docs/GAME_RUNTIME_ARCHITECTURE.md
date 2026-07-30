@@ -315,6 +315,18 @@ The GP0 side-effect stream retains incomplete VRAM-upload packets between
 updates and compacts consumed words, so long product sessions do not grow an
 unbounded capture buffer.
 
+Retail `LoadImage` at `0x800F1598` is also an explicit HLE observation
+boundary. The room streamer and the resident TIM helper can submit their pixel
+payload through GPU DMA without leaving a reconstructible raw GP0 stream at
+the public display boundary. The bridge therefore validates each rectangle
+against 1024x512 PS1 VRAM, bounds and copies its payload from guest RAM, and
+retains only the latest upload for a destination rectangle. Mission 3
+initialization yields 543 valid TIM/CLUT uploads across 206 current
+destinations; none overlap the native framebuffer. Retail ZCLUT writes at
+`(768,480)..(1023,511)` are additionally mirrored through the live
+bank-specific row map into the native framebuffer-safe CLUT residency at
+`(0,192)`, matching the relocation applied to guest draw packets.
+
 Native replay preserves the retail `E5` draw offset and therefore submits raw
 ordering-table coordinates without adding a second host centre offset. Retail
 `E1` draw mode is also normalized only at the presentation boundary: its
@@ -345,7 +357,12 @@ direct TITLE-to-HWAY path, so the product projects live guest health, armor,
 equipped item, ownership and ammunition into the existing native SF2 HUD atlas
 after the authored opening. PC adaptation maps A/D to retail L2/R2 strafe,
 accumulates relative mouse motion until the 20 Hz PAD sample consumes it, and
-emits sampled Select edges for middle-click, wheel and bracket weapon actions.
+emits sampled Select edges for middle-click, wheel, bracket, and number-key
+weapon actions. A post-truck guest probe establishes the retail Mission 3
+selection ring as item `20 -> 2 -> 4 -> 8 -> 20` (knife, pistol, M16,
+shotgun). The adapter plans only forward retail Select edges over the
+ascending owned-item ring, so previous selection and signed wheel movement
+preserve direction while the guest remains the sole inventory owner.
 The guest remains authoritative for all resulting movement, aim, inventory
 and combat mutations.
 
@@ -371,12 +388,16 @@ slices would re-enter sound/resource globals at a boundary retail never uses.
 A 7,200-update probe crosses retail restore at update 6,834 and continues with
 23 peak active voices, 4,166 key-on writes, nonzero PCM, and the sound callback
 still installed. This restores retail SPU sound effects without replacing
-voice allocation or mixing; music still requires an interactive audit.
+voice allocation or mixing. SF2 produces 735 PCM frames per 60 Hz presentation
+update, so its OpenAL callback uses a 12-block (~35 ms) recovery threshold
+rather than starting from a single 10 ms device quantum; this prevents the
+producer cadence from repeatedly starving an otherwise healthy continuous
+stream. Music still requires an interactive audit.
 
 The SF2 pistol HUD uses the embedded `PISTOL2A/B` assets rather than the
-intentionally empty SF1 definition. The attempted knife-layer relocation was
-withdrawn after a clean-run visual regression; the knife icon remains absent
-until it has isolated host-atlas residency.
+intentionally empty SF1 definition. Four host-only alias pages isolate the
+complete native HUD atlas from guest framebuffers and mission textures; this
+also makes the full-height `KNIFEA/B` placement safe.
 
 Mission failure contains a resident `VSync(-1)` polling loop which submits no
 ordering table while it waits for two retraces. The product advances hardware
@@ -394,3 +415,11 @@ and depth targets are cleared without modifying emulated VRAM. This is
 required after collapsing retail's alternating PS1 display pages onto one
 host framebuffer; omitting the begin/clear accumulated snow and world pixels
 across swaps as mouse-trail ghosting.
+
+The renderer's two calls to the resident `AddPrim` helper are guarded by the
+live ordering-table base and bucket count. Retail can transiently pass an
+unclamped depth bucket (observed as `0x925C` for a 16-entry table); the
+resulting KSEG address crosses the 2 MiB RAM mirror and aliases resident
+renderer code. The presentation bridge clamps only those two call sites to
+the final valid bucket. This prevents the upstream alias rather than repairing
+executable words after corruption.

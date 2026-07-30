@@ -6633,6 +6633,41 @@ void testGuestPadBridge() {
           "Native quick-weapon command suppressed an independent strafe");
 }
 
+void testWriteWatchSuppression() {
+  sf::psx::R3000Runtime runtime;
+  constexpr auto protected_address = 0x8001d5dcU;
+  constexpr auto original = 0x08007553U;
+  require(runtime.write32(protected_address, original),
+          "Could not seed protected R3000 word");
+  runtime.setWriteWatch(protected_address, protected_address + 4U);
+  runtime.setSuppressWriteWatch(true);
+
+  require(runtime.write32(protected_address, 0x081697b0U) &&
+              runtime.write16(protected_address, 0x1234U),
+          "Suppressed R3000 write reported a guest memory fault");
+  constexpr std::array<std::byte, 4U> bulk_write{
+      std::byte{0xdeU}, std::byte{0xadU},
+      std::byte{0xbeU}, std::byte{0xefU}};
+  require(runtime.loadBytes(protected_address, bulk_write),
+          "Suppressed R3000 bulk write reported a memory fault");
+  std::uint32_t retained{};
+  require(runtime.read32(protected_address, retained) &&
+              retained == original,
+          "Write-watch suppression allowed protected RAM to change through "
+          "a scalar or bulk write");
+  const auto hit = runtime.writeWatchHit();
+  require(hit.address == protected_address && hit.width == 4U &&
+              hit.value == 0x081697b0U,
+          "Write-watch suppression did not retain the first attempted write");
+
+  runtime.clearWriteWatchHit();
+  runtime.setSuppressWriteWatch(false);
+  require(runtime.write32(protected_address, 0x01020304U) &&
+              runtime.read32(protected_address, retained) &&
+              retained == 0x01020304U,
+          "Disabling write-watch suppression did not restore normal writes");
+}
+
 } // namespace
 
 int main() {
@@ -6657,6 +6692,7 @@ int main() {
     testGuestPadBridge();
     testLegacyGameplayVmBoundary();
     testLegacyGameplayVmContinuousPump();
+    testWriteWatchSuppression();
     std::cout << "R3000 runtime tests passed\n";
     return 0;
   } catch (const std::exception &error) {

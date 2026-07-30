@@ -18,14 +18,23 @@ inline constexpr unsigned int psx_texture_page_count = 32U;
 inline constexpr unsigned int extended_texture_page_count = 63U;
 inline constexpr unsigned int resident_texture_page_count =
     psx_texture_page_count + extended_texture_page_count;
+// Keep the four-page native HUD atlas in host-only texture storage. Raw TIM
+// uploads into PS1 framebuffer pages leaked weapon-source rectangles into the
+// displayed scene (most visibly the shotgun at rows 109..180).
+inline constexpr unsigned int hud_resident_texture_page_count = 4U;
+inline constexpr unsigned int hud_resident_first_texture_page =
+    resident_texture_page_count - hud_resident_texture_page_count;
 inline constexpr unsigned int maximum_scene_texture_identities =
     psx_texture_page_count * 2U + 1U;
-static_assert(resident_texture_page_count - 6U >=
+static_assert(resident_texture_page_count - 6U -
+                  hud_resident_texture_page_count >=
               maximum_scene_texture_identities);
 inline constexpr unsigned int resident_texture_page_token_bits = 7U;
 static_assert((1U << resident_texture_page_token_bits) >=
               resident_texture_page_count);
 inline constexpr std::size_t clut_bytes = 256U * 32U * 2U;
+inline constexpr std::uint16_t mission_clut_source_x = 768U;
+inline constexpr std::uint16_t mission_clut_source_y = 480U;
 inline constexpr std::uint16_t mission_clut_resident_x = 0U;
 inline constexpr std::uint16_t mission_clut_resident_y = 192U;
 inline constexpr std::uint16_t hud_source_vram_x = 768U;
@@ -111,19 +120,61 @@ struct HudResidentPlacement {
   constexpr bool operator==(const HudResidentPlacement &) const = default;
 };
 
+struct MissionClutResidentRow {
+  bool valid{};
+  std::uint16_t x{};
+  std::uint16_t y{};
+  std::uint16_t width{};
+
+  constexpr bool operator==(const MissionClutResidentRow &) const = default;
+};
+
+// Convert one row of a bounded retail ZCLUT upload to the corresponding
+// framebuffer-safe native residency row. The caller supplies the live
+// bank-specific row mapping selected by TextureStreamer.
+[[nodiscard]] constexpr MissionClutResidentRow
+missionClutResidentRow(std::uint16_t source_x, std::uint16_t source_y,
+                       std::uint16_t width, std::uint16_t height,
+                       std::uint16_t local_row,
+                       unsigned int mapped_row) noexcept {
+  const auto right = static_cast<std::uint32_t>(source_x) + width;
+  const auto bottom = static_cast<std::uint32_t>(source_y) + height;
+  if (width == 0U || height == 0U || local_row >= height ||
+      source_x < mission_clut_source_x ||
+      right > mission_clut_source_x + 256U ||
+      source_y < mission_clut_source_y ||
+      bottom > mission_clut_source_y + 32U || mapped_row >= 32U) {
+    return {};
+  }
+  return {
+      .valid = true,
+      .x = static_cast<std::uint16_t>(
+          mission_clut_resident_x + source_x - mission_clut_source_x),
+      .y = static_cast<std::uint16_t>(
+          mission_clut_resident_y + mapped_row),
+      .width = width,
+  };
+}
+
 // The sequels place several weapon/item icon layers in streamed lower VRAM
 // pages or across the resident CLUT rows. Pack those exact authored
 // rectangles into unused native framebuffer HUD-atlas space; every other
 // INTERFACE TIM retains the SF1/SF2 x-only relocation.
 [[nodiscard]] constexpr HudResidentPlacement
 hudResidentPlacement(const assets::TimBlock &block) noexcept {
+  if (block.x == 808U && block.y == 240U && block.width_words == 16U &&
+      block.height == 16U) {
+    // SF2 KNIFEB ends at source V=256. An FT4 exclusive far edge wraps that
+    // byte to zero and stretches the icon across unrelated atlas rows.
+    return {192U, 32U};
+  }
   if (block.x == 884U && block.y == 238U && block.width_words == 9U &&
       block.height == 17U) {
     return {170U, 0U}; // SF2 KEYCARDB
   }
   if (block.x == 792U && block.y == 240U && block.width_words == 16U &&
       block.height == 16U) {
-    return {179U, 0U}; // SF2 SNIPER1C
+    return {144U, 0U}; // SF2 SNIPER1C
   }
   if (block.x == 866U && block.y == 232U && block.width_words == 16U &&
       block.height == 24U) {

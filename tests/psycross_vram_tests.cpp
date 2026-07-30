@@ -30,6 +30,8 @@ int main() {
       hudResidentPlacement(sf::assets::TimBlock{816U, 232U, 15U, 20U, {}});
   const auto sf2_keycard =
       hudResidentPlacement(sf::assets::TimBlock{884U, 238U, 9U, 17U, {}});
+  const auto sf2_knife_b =
+      hudResidentPlacement(sf::assets::TimBlock{808U, 240U, 16U, 16U, {}});
   const auto sf2_sniper =
       hudResidentPlacement(sf::assets::TimBlock{792U, 240U, 16U, 16U, {}});
   const auto sf2_super =
@@ -39,8 +41,9 @@ int main() {
       sf3_sniper != HudResidentPlacement{80U, 231U} ||
       sf3_g3 != HudResidentPlacement{40U, 227U} ||
       sf3_shot2b != HudResidentPlacement{96U, 227U} ||
+      sf2_knife_b != HudResidentPlacement{192U, 32U} ||
       sf2_keycard != HudResidentPlacement{170U, 0U} ||
-      sf2_sniper != HudResidentPlacement{179U, 0U} ||
+      sf2_sniper != HudResidentPlacement{144U, 0U} ||
       sf2_super != HudResidentPlacement{195U, 0U}) {
     std::cerr << "Resident HUD atlas mapping changed\n";
     return 15;
@@ -62,10 +65,12 @@ int main() {
   }
 
   static_assert(extended_texture_page_count == 63U);
-  static_assert(resident_texture_page_count - 6U >=
+  static_assert(resident_texture_page_count - 6U -
+                    hud_resident_texture_page_count >=
                 maximum_scene_texture_identities);
   if constexpr (extended_texture_page_count != 63U ||
-                resident_texture_page_count - 6U <
+                resident_texture_page_count - 6U -
+                        hud_resident_texture_page_count <
                     maximum_scene_texture_identities) {
     std::cerr << "Resident texture pool cannot cover a complete scene\n";
     return 9;
@@ -188,6 +193,18 @@ int main() {
       texturePageNeedsAuthoredReload(animated_page, authored_page, true)) {
     std::cerr << "Mutable SCRIM residency reload policy changed\n";
     return 7;
+  }
+
+  if (missionClutResidentRow(768U, 480U, 256U, 32U, 31U, 7U) !=
+          MissionClutResidentRow{true, 0U, 199U, 256U} ||
+      missionClutResidentRow(800U, 483U, 16U, 1U, 0U, 12U) !=
+          MissionClutResidentRow{true, 32U, 204U, 16U} ||
+      missionClutResidentRow(767U, 480U, 16U, 1U, 0U, 0U).valid ||
+      missionClutResidentRow(1008U, 480U, 17U, 1U, 0U, 0U).valid ||
+      missionClutResidentRow(768U, 511U, 256U, 2U, 0U, 0U).valid ||
+      missionClutResidentRow(768U, 480U, 256U, 32U, 32U, 0U).valid) {
+    std::cerr << "Retail ZCLUT upload relocation changed\n";
+    return 14;
   }
 
   std::cout << "PsyCross VRAM tests passed\n";

@@ -310,7 +310,19 @@ void uploadTimBlock(const assets::TimBlock &block) {
 
 void uploadHudPixels(const assets::TimBlock &block) {
   const auto placement = hudResidentPlacement(block);
-  uploadTimBlockAt(block, placement.x, placement.y);
+  const auto local_x =
+      static_cast<unsigned int>(placement.x & 63U);
+  if (local_x + block.width_words > 64U ||
+      static_cast<unsigned int>(placement.y) + block.height > 256U) {
+    throw core::Error{
+        core::ErrorCode::unsupported,
+        "HUD TIM crosses its reserved host texture page",
+    };
+  }
+  uploadTexturePageBlockAt(
+      hud_resident_first_texture_page +
+          static_cast<unsigned int>(placement.x / 64U),
+      block, local_x, placement.y);
 }
 
 } // namespace sf::platform::detail

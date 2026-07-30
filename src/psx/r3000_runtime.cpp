@@ -110,9 +110,11 @@ bool R3000Runtime::loadBytes(
         ++candidate;
     }
     for (const auto byte : bytes) {
-        recordWriteWatch(
+        const auto watched = recordWriteWatch(
             address, 1U, std::to_integer<std::uint8_t>(byte));
-        *memoryByte(address) = byte;
+        if (!watched || !suppress_write_watch_) {
+            *memoryByte(address) = byte;
+        }
         ++address;
     }
     return true;
@@ -389,7 +391,10 @@ bool R3000Runtime::read32(std::uint32_t address, std::uint32_t& value) const noe
 bool R3000Runtime::write8(std::uint32_t address, std::uint8_t value) noexcept {
     std::uint32_t physical{};
     if (physicalAddress(address, physical) && physical < ram_mirror_end) {
-        recordWriteWatch(address, 1U, value);
+        if (recordWriteWatch(address, 1U, value) &&
+            suppress_write_watch_) {
+            return true;
+        }
         ram_[physical & static_cast<std::uint32_t>(ram_size - 1U)] =
             static_cast<std::byte>(value);
         return true;
@@ -411,7 +416,10 @@ bool R3000Runtime::write16(std::uint32_t address, std::uint16_t value) noexcept 
     }
     std::uint32_t physical{};
     if (physicalAddress(address, physical) && physical < ram_mirror_end) {
-        recordWriteWatch(address, 2U, value);
+        if (recordWriteWatch(address, 2U, value) &&
+            suppress_write_watch_) {
+            return true;
+        }
         const auto offset =
             physical & static_cast<std::uint32_t>(ram_size - 1U);
         ram_[offset] = static_cast<std::byte>(value);
@@ -437,7 +445,10 @@ bool R3000Runtime::write32(std::uint32_t address, std::uint32_t value) noexcept 
     }
     std::uint32_t physical{};
     if (physicalAddress(address, physical) && physical < ram_mirror_end) {
-        recordWriteWatch(address, 4U, value);
+        if (recordWriteWatch(address, 4U, value) &&
+            suppress_write_watch_) {
+            return true;
+        }
         const auto offset =
             physical & static_cast<std::uint32_t>(ram_size - 1U);
         ram_[offset] = static_cast<std::byte>(value);
@@ -533,15 +544,15 @@ void R3000Runtime::addWriteWatch(std::uint32_t begin,
     ++write_watch_count_;
 }
 
-void R3000Runtime::recordWriteWatch(std::uint32_t address,
-                                    std::uint8_t width,
-                                    std::uint32_t value) noexcept {
-    if (write_watch_hit_.width != 0U || write_watch_count_ == 0U) {
-        return;
+bool R3000Runtime::recordWriteWatch(std::uint32_t address,
+                                   std::uint8_t width,
+                                   std::uint32_t value) noexcept {
+    if (write_watch_count_ == 0U) {
+        return false;
     }
     std::uint32_t physical{};
     if (!physicalAddress(address, physical)) {
-        return;
+        return false;
     }
     auto watched = false;
     for (auto index = std::size_t{}; index < write_watch_count_; ++index) {
@@ -552,15 +563,18 @@ void R3000Runtime::recordWriteWatch(std::uint32_t address,
         }
     }
     if (!watched) {
-        return;
+        return false;
     }
-    write_watch_hit_ = R3000WriteWatchHit{
-        .address = address,
-        .value = value,
-        .pc = executing_pc_,
-        .instruction = executing_instruction_,
-        .width = width,
-    };
+    if (write_watch_hit_.width == 0U) {
+        write_watch_hit_ = R3000WriteWatchHit{
+            .address = address,
+            .value = value,
+            .pc = executing_pc_,
+            .instruction = executing_instruction_,
+            .width = width,
+        };
+    }
+    return true;
 }
 
 bool R3000Runtime::interruptPending() const noexcept {

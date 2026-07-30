@@ -660,6 +660,10 @@ public:
   // position. The SF2 guest owns gameplay, but TextureStreamer still needs
   // the matching active-room set and texture-bank provenance.
   void synchronizeGuestResidency(double x, double y, double z);
+  // Selects the exact retail guest room when it is known. Unlike the
+  // coordinate fallback above, this cannot oscillate between overlapping
+  // sequel room bounds.
+  [[nodiscard]] bool synchronizeGuestRoom(std::uint16_t room);
   [[nodiscard]] std::uint8_t
   objectTextureBank(std::uint16_t index) const noexcept;
   [[nodiscard]] std::uint8_t

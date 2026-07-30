@@ -240,6 +240,28 @@ void testSf2PresentationFrameCapture() {
   require(!sf::game::sf2GpuTransfer(truncated_upload),
           "SF2 presentation accepted a truncated GP0 VRAM upload");
 
+  const std::array gp0_stream{
+      0x3c808080U, 0x00010002U, 0x00030004U, 0x00050006U,
+      0x00070008U, 0x0009000aU, 0x000b000cU, 0x000d000eU,
+      0x000f0010U, 0x00110012U, 0x00130014U, 0x00150016U,
+      0x80000000U, 0x00020001U, 0x00040003U, 0x00060005U,
+  };
+  require(sf::game::sf2Gp0CommandWordCount(gp0_stream) ==
+              std::optional<std::size_t>{12U} &&
+              sf::game::sf2Gp0CommandWordCount(
+                  std::span{gp0_stream}.subspan(12U)) ==
+                  std::optional<std::size_t>{4U},
+          "SF2 GP0 scanner mistook polygon payload bytes for commands");
+  const std::array upload_stream{
+      0xa0000000U, 0x00020001U, 0x00010003U,
+      0x12345678U, 0x00a00000U,
+  };
+  require(sf::game::sf2Gp0CommandWordCount(upload_stream) ==
+              std::optional<std::size_t>{5U} &&
+              !sf::game::sf2Gp0CommandWordCount(
+                  std::span{upload_stream}.first(4U)),
+          "SF2 GP0 scanner accepted an incomplete image upload");
+
   sf::game::GameplayHud sf2_hud;
   sf::game::Sf2GuestRuntimeDiagnostics guest_hud{
       .player_health = 75U,
@@ -290,8 +312,37 @@ void testSf2PresentationFrameCapture() {
               !weapon_select.update(23U),
           "SF2 weapon Select impulses were not separated by sampled releases");
   weapon_select.enqueue(100U);
-  require(weapon_select.pending() == 16U,
+  require(weapon_select.pending() ==
+              sf::game::Sf2WeaponSelectPulseQueue::maximum_pending,
           "SF2 weapon pulse queue exceeded its bounded capacity");
+
+  sf::game::Sf2GuestRuntimeDiagnostics weapon_cycle;
+  weapon_cycle.player_owned_items[0U] =
+      (1U << 2U) | (1U << 4U) | (1U << 8U) | (1U << 20U);
+  weapon_cycle.player_equipped_item = 20U;
+  require(sf::game::sf2WeaponCyclePulseCount(weapon_cycle, 1) == 1U &&
+              sf::game::sf2WeaponCyclePulseCount(weapon_cycle, -1) == 3U &&
+              sf::game::sf2WeaponCyclePulseCount(weapon_cycle, 2) == 2U &&
+              sf::game::sf2WeaponCyclePulseCount(weapon_cycle, -2) == 2U,
+          "SF2 signed weapon cycle did not preserve retail wrap direction");
+  const auto pistol_slot =
+      sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 0U);
+  const auto shotgun_slot =
+      sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 2U);
+  require(pistol_slot && *pistol_slot == 1U && shotgun_slot &&
+              *shotgun_slot == 3U &&
+              !sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 4U),
+          "SF2 direct weapon slots did not target the owned retail item ring");
+  weapon_cycle.player_equipped_item = 4U;
+  const auto current_slot =
+      sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 1U);
+  require(current_slot && *current_slot == 0U &&
+              sf::game::sf2WeaponCyclePulseCount(weapon_cycle, -1) == 3U,
+          "SF2 direct/current or previous selection pulse count mismatch");
+  weapon_cycle.player_owned_items = {};
+  require(sf::game::sf2WeaponCyclePulseCount(weapon_cycle, 1) == 0U &&
+              !sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 0U),
+          "SF2 weapon adapter manufactured a selection without inventory");
 
 }
 

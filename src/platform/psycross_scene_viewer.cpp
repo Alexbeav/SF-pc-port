@@ -77,8 +77,6 @@ constexpr double near_clip_depth = static_cast<double>(near_plane) + 2.0;
 constexpr double first_person_near_clip_depth = near_clip_depth;
 double active_near_clip_depth = near_clip_depth;
 constexpr std::uint32_t retail_flashlight_source = 0x8012f9b8U;
-constexpr std::uint16_t mission_clut_source_x = 768U;
-constexpr std::uint16_t mission_clut_source_y = 480U;
 // Mission residency starts with physical pages 6..31 and spills into the
 // host-only extension. Keep the PC HUD copy in framebuffer pages 0..3 instead
 // of restoring its retail page-12 atlas over streamed wall textures.
@@ -103,6 +101,24 @@ constexpr std::uint16_t pickup_resident_x = 336U;
 constexpr std::uint16_t pickup_resident_y = 224U;
 constexpr std::string_view armor_pickup_texture = "VEST2.TIM";
 constexpr std::uint16_t environment_resident_clut_y = 251U;
+constexpr std::array<std::string_view, 2U> sf2_pistol_icon_layers{
+    "PISTOL2A.TIM", "PISTOL2B.TIM"};
+constexpr std::array<std::string_view, 2U> sf2_knife_icon_layers{
+    "KNIFEA.TIM", "KNIFEB.TIM"};
+
+std::span<const std::string_view>
+hudWeaponIconLayers(game::HudAtlasKind atlas,
+                    game::WeaponId weapon) noexcept {
+  if (atlas == game::HudAtlasKind::sf2) {
+    if (weapon == game::WeaponId::pistol_9mm) {
+      return sf2_pistol_icon_layers;
+    }
+    if (weapon == game::WeaponId::knife) {
+      return sf2_knife_icon_layers;
+    }
+  }
+  return game::weaponDefinition(weapon).icon.layers();
+}
 
 [[nodiscard]] bool textureDiagnosticsEnabled() noexcept {
   static const auto enabled = [] {
@@ -825,14 +841,21 @@ public:
       }
       auto requirement_context = std::string{"unclassified"};
       const auto alias_pages = [] {
-        std::array<unsigned int, resident_texture_page_count - 6U> result{};
+        std::array<
+            unsigned int,
+            resident_texture_page_count - 6U -
+                hud_resident_texture_page_count>
+            result{};
         constexpr std::array native_order{
             16U, 17U, 18U, 19U, 20U, 21U, 6U,  7U,  8U,
             9U,  10U, 11U, 12U, 13U, 14U, 15U, 22U, 23U,
             24U, 25U, 26U, 27U, 28U, 29U, 30U, 31U,
         };
         std::ranges::copy(native_order, result.begin());
-        for (auto extension = 0U; extension < extended_texture_page_count;
+        for (auto extension = 0U;
+             extension <
+             extended_texture_page_count -
+                 hud_resident_texture_page_count;
              ++extension) {
           result[native_order.size() + extension] =
               psx_texture_page_count + extension;
@@ -2219,9 +2242,10 @@ class HudTextureAtlas final {
 public:
   explicit HudTextureAtlas(const game::MissionPackage &mission) {
     const auto hud_atlas = mission.runtimeProfile().hud_atlas;
+    hud_atlas_ = hud_atlas;
     const auto is_sf1 = hud_atlas == game::HudAtlasKind::sf1;
     std::vector<HudTextureAsset> retail_fonts;
-    const auto required = [is_sf1](std::string_view name) {
+    const auto required = [is_sf1, hud_atlas](std::string_view name) {
       // The three font sheets and SYMBOL are shared by the original
       // gameplay and pause interfaces. Keep them in the same restored
       // VRAM atlas as the weapon silhouettes.
@@ -2235,6 +2259,11 @@ public:
       }
       if (std::ranges::find(nightvision_scope_layers, name) !=
           nightvision_scope_layers.end()) {
+        return true;
+      }
+      if (hud_atlas == game::HudAtlasKind::sf2 &&
+          (std::ranges::find(sf2_knife_icon_layers, name) !=
+           sf2_knife_icon_layers.end())) {
         return true;
       }
       for (std::size_t index = 0; index < game::weapon_slot_count; ++index) {
@@ -2283,13 +2312,18 @@ public:
           std::ranges::find(nightvision_scope_layers, entry.name) !=
           nightvision_scope_layers.end();
       const auto hud_placement = hudResidentPlacement(image.pixels());
-      const auto resident_hud_limit =
-          is_sf1 ? mission_clut_resident_y : pickup_resident_clut_y;
+      // HUD pixels now live in dedicated host-only pages, so their complete
+      // 256-row texture space is available. The old 248/254-row limit only
+      // protected CLUT rows when pixels shared native framebuffer VRAM.
+      constexpr auto resident_hud_limit = 256U;
       const auto regular_hud_layout =
           image.pixels().x >= 768U && image.pixels().y < 256U &&
           static_cast<unsigned int>(hud_placement.x) +
                   image.pixels().width_words <=
               256U &&
+          static_cast<unsigned int>(hud_placement.x & 63U) +
+                  image.pixels().width_words <=
+              64U &&
           static_cast<unsigned int>(hud_placement.y) + image.pixels().height <=
               resident_hud_limit;
       const auto relocated_sequel_hud_layout =
@@ -2298,6 +2332,9 @@ public:
           static_cast<unsigned int>(hud_placement.x) +
                   image.pixels().width_words <=
               256U &&
+          static_cast<unsigned int>(hud_placement.x & 63U) +
+                  image.pixels().width_words <=
+              64U &&
           static_cast<unsigned int>(hud_placement.y) + image.pixels().height <=
               resident_hud_limit;
       const auto nightvision_layout =
@@ -2431,6 +2468,12 @@ public:
     gameplay_palette_resident_ = false;
   }
 
+  void invalidateGuestWritablePalette() const noexcept {
+    // Guest ordering tables can rewrite native VRAM CLUT rows, but cannot
+    // address the host-only alias pages which own HUD pixels.
+    gameplay_palette_resident_ = false;
+  }
+
   void restoreGameplay(
       const game::GameplayHud &hud, bool first_person_aim,
       std::span<const game::LegacyDroppedItemBridgeState> dropped_items,
@@ -2467,6 +2510,8 @@ public:
         dropped_item_mask,
         projectile_mask,
     };
+    const auto state_changed =
+        !gameplay_state_ || *gameplay_state_ != state;
     if (gameplay_state_ && *gameplay_state_ == state &&
         gameplay_font_resident_ && gameplay_palette_resident_) {
       return;
@@ -2501,54 +2546,58 @@ public:
       }
       gameplay_font_resident_ = true;
     }
-    const auto &definition = hud.inventory().currentDefinition();
-    for (const auto layer : definition.icon.layers()) {
-      upload(layer);
-    }
-    if (menu_visible) {
-      for (const auto menu_weapon : state.menu_window) {
+    if (state_changed) {
+      for (const auto layer :
+           hudWeaponIconLayers(hud_atlas_, weapon)) {
+        upload(layer);
+      }
+      if (menu_visible) {
+        for (const auto menu_weapon : state.menu_window) {
+          for (const auto layer :
+               hudWeaponIconLayers(hud_atlas_, menu_weapon)) {
+            upload(layer);
+          }
+        }
+      }
+      for (std::size_t item = 0U; item < game::weapon_slot_count; ++item) {
+        if ((dropped_item_mask & (std::uint32_t{1U} << item)) == 0U) {
+          continue;
+        }
         for (const auto layer :
-             game::weaponDefinition(menu_weapon).icon.layers()) {
+             game::droppedItemIconLayers(static_cast<std::uint16_t>(item))) {
           upload(layer);
         }
       }
-    }
-    for (std::size_t item = 0U; item < game::weapon_slot_count; ++item) {
-      if ((dropped_item_mask & (std::uint32_t{1U} << item)) == 0U) {
-        continue;
+      if ((dropped_item_mask &
+           (std::uint32_t{1U} << game::weapon_slot_count)) != 0U) {
+        upload(armor_pickup_texture);
+        uploadTimBlockAt(armor_pickup_palette_, hud_resident_clut_x,
+                         pickup_resident_clut_y);
       }
-      for (const auto layer :
-           game::droppedItemIconLayers(static_cast<std::uint16_t>(item))) {
-        upload(layer);
-      }
-    }
-    if ((dropped_item_mask & (std::uint32_t{1U} << game::weapon_slot_count)) !=
-        0U) {
-      upload(armor_pickup_texture);
-      uploadTimBlockAt(armor_pickup_palette_, hud_resident_clut_x,
-                       pickup_resident_clut_y);
-    }
-    for (std::size_t weapon_index = 0U; weapon_index < game::weapon_slot_count;
-         ++weapon_index) {
-      if ((projectile_mask & (std::uint32_t{1U} << weapon_index)) == 0U) {
-        continue;
-      }
-      for (const auto layer :
-           game::weaponDefinition(static_cast<game::WeaponId>(weapon_index))
-               .icon.layers()) {
-        upload(layer);
-      }
-    }
-    if (state.scoped) {
-      if (weapon == game::WeaponId::nightvision_rifle) {
-        for (std::size_t index = 0; index < nightvision_scope_layers.size();
-             ++index) {
-          upload_nightvision(index);
+      for (std::size_t weapon_index = 0U;
+           weapon_index < game::weapon_slot_count; ++weapon_index) {
+        if ((projectile_mask &
+             (std::uint32_t{1U} << weapon_index)) == 0U) {
+          continue;
         }
-      } else {
-        upload("SCOPED.TIM");
-        for (const auto bearing : scope_bearings) {
-          upload(bearing);
+        for (const auto layer :
+             game::weaponDefinition(
+                 static_cast<game::WeaponId>(weapon_index))
+                 .icon.layers()) {
+          upload(layer);
+        }
+      }
+      if (state.scoped) {
+        if (weapon == game::WeaponId::nightvision_rifle) {
+          for (std::size_t index = 0;
+               index < nightvision_scope_layers.size(); ++index) {
+            upload_nightvision(index);
+          }
+        } else {
+          upload("SCOPED.TIM");
+          for (const auto bearing : scope_bearings) {
+            upload(bearing);
+          }
         }
       }
     }
@@ -2660,6 +2709,7 @@ private:
   };
 
   std::vector<HudTextureAsset> assets_;
+  game::HudAtlasKind hud_atlas_{};
   std::unique_ptr<PsyCrossFontTexture> native_font_;
   std::unique_ptr<PsyCrossFontTexture> retail_english_font_;
   assets::TimBlock armor_pickup_pixels_;
@@ -9947,11 +9997,15 @@ void drawMapFade(std::uint8_t intensity) {
 
 void drawHudSpriteAtResident(const assets::TimImage &image,
                              std::uint16_t resident_x, std::uint16_t resident_y,
-                             int x, int y, std::uint8_t brightness = 128U) {
+                             int x, int y, std::uint8_t brightness = 128U,
+                             bool host_alias = true) {
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
   const auto page_y =
-      static_cast<int>(resident_y & static_cast<std::uint16_t>(~255U));
+      host_alias
+          ? 0
+          : static_cast<int>(
+                resident_y & static_cast<std::uint16_t>(~255U));
   const auto pixels_per_word =
       image.mode() == assets::TimPixelMode::indexed4   ? 4
       : image.mode() == assets::TimPixelMode::indexed8 ? 2
@@ -9961,8 +10015,14 @@ void drawHudSpriteAtResident(const assets::TimImage &image,
   const auto v0 = static_cast<int>(resident_y) - page_y;
   const auto width = static_cast<int>(image.displayWidth());
   const auto height = static_cast<int>(image.displayHeight());
-  const auto texture_page =
+  auto texture_page =
       GetTPage(texturePageMode(image.mode()), 0, page_x, page_y);
+  if (host_alias) {
+    texture_page = encodeResidentTexturePage(
+        static_cast<std::uint16_t>(texture_page),
+        hud_resident_first_texture_page +
+            static_cast<unsigned int>(resident_x / 64U));
+  }
 
   DR_TPAGE page{};
   SetDrawTPage(&page, 1, 0, texture_page);
@@ -10003,18 +10063,19 @@ void drawHudSpriteScaled(const assets::TimImage &image, float x, float y,
   const auto resident_y = placement.y;
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
-  const auto page_y =
-      static_cast<int>(resident_y & static_cast<std::uint16_t>(~255U));
   const auto pixels_per_word =
       image.mode() == assets::TimPixelMode::indexed4   ? 4
       : image.mode() == assets::TimPixelMode::indexed8 ? 2
                                                        : 1;
   const auto u0 = (static_cast<int>(resident_x) - page_x) * pixels_per_word;
-  const auto v0 = static_cast<int>(resident_y) - page_y;
+  const auto v0 = static_cast<int>(resident_y);
   const auto source_width = static_cast<int>(image.displayWidth());
   const auto source_height = static_cast<int>(image.displayHeight());
-  const auto texture_page =
-      GetTPage(texturePageMode(image.mode()), 0, page_x, page_y);
+  const auto texture_page = encodeResidentTexturePage(
+      static_cast<std::uint16_t>(
+          GetTPage(texturePageMode(image.mode()), 0, page_x, 0)),
+      hud_resident_first_texture_page +
+          static_cast<unsigned int>(resident_x / 64U));
 
   DR_TPAGE page{};
   SetDrawTPage(&page, 1, 0, texture_page);
@@ -10130,16 +10191,17 @@ void renderProjectileSprites(const HudTextureAtlas &textures,
       const auto resident_y = placement.y;
       const auto page_x =
           static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
-      const auto page_y =
-          static_cast<int>(resident_y & static_cast<std::uint16_t>(~255U));
       const auto pixels_per_word =
           image.mode() == assets::TimPixelMode::indexed4   ? 4
           : image.mode() == assets::TimPixelMode::indexed8 ? 2
                                                            : 1;
       const auto u0 = (static_cast<int>(resident_x) - page_x) * pixels_per_word;
-      const auto v0 = static_cast<int>(resident_y) - page_y;
-      const auto texture_page =
-          GetTPage(texturePageMode(image.mode()), 0, page_x, page_y);
+      const auto v0 = static_cast<int>(resident_y);
+      const auto texture_page = encodeResidentTexturePage(
+          static_cast<std::uint16_t>(
+              GetTPage(texturePageMode(image.mode()), 0, page_x, 0)),
+          hud_resident_first_texture_page +
+              static_cast<unsigned int>(resident_x / 64U));
       const auto left = projected_x + (offsets[layer] - group_center) * scale;
       const auto top = projected_y - heights[layer] * scale * 0.5;
       const auto right = left + widths[layer] * scale;
@@ -10199,10 +10261,11 @@ void drawHudSpriteRegionTintScaled(const assets::TimImage &page_image, float x,
   const auto resident_x = placement.x;
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
-  const auto page_y =
-      static_cast<int>(placement.y & static_cast<std::uint16_t>(~255U));
-  const auto texture_page =
-      GetTPage(texturePageMode(page_image.mode()), 0, page_x, page_y);
+  const auto texture_page = encodeResidentTexturePage(
+      static_cast<std::uint16_t>(
+          GetTPage(texturePageMode(page_image.mode()), 0, page_x, 0)),
+      hud_resident_first_texture_page +
+          static_cast<unsigned int>(resident_x / 64U));
 
   DR_TPAGE page{};
   SetDrawTPage(&page, 1, 0, texture_page);
@@ -11145,7 +11208,7 @@ void drawOriginalNightvisionScope(const HudTextureAtlas &textures, int offset_x,
   const auto draw_layer = [&](std::size_t index, int x, int y) {
     drawHudSpriteAtResident(textures.image(nightvision_scope_layers[index]),
                             nightvision_resident_x[index],
-                            nightvision_resident_y, x, y);
+                            nightvision_resident_y, x, y, 128U, false);
   };
 
   // Resource group 0x2e is two concentric authored rings: the dense INFRA
@@ -11184,16 +11247,6 @@ void drawOriginalScope(const HudTextureAtlas &textures, game::WeaponId weapon,
   } else {
     drawOriginalSniperScope(textures, heading, head_target, offset_x, offset_y);
   }
-}
-
-std::span<const std::string_view>
-sf2HudWeaponIconLayers(game::WeaponId weapon) noexcept {
-  static constexpr std::array<std::string_view, 2U> pistol{
-      "PISTOL2A.TIM", "PISTOL2B.TIM"};
-  if (weapon == game::WeaponId::pistol_9mm) {
-    return pistol;
-  }
-  return game::weaponDefinition(weapon).icon.layers();
 }
 
 void drawOriginalWeaponMenu(const HudTextureAtlas &textures,
@@ -11262,7 +11315,9 @@ void drawOriginalWeaponMenu(const HudTextureAtlas &textures,
   const auto weapons = hud.weaponMenuWindow();
   for (std::size_t slot = 0; slot < weapons.size(); ++slot) {
     const auto layers =
-        sf2_icons ? sf2HudWeaponIconLayers(weapons[slot])
+        sf2_icons
+            ? hudWeaponIconLayers(game::HudAtlasKind::sf2,
+                                  weapons[slot])
                   : game::weaponDefinition(weapons[slot]).icon.layers();
     if (layers.empty()) {
       continue;
@@ -11870,17 +11925,18 @@ void drawPauseFontRegion(const assets::TimImage &image, int source_x,
   const auto resident_x = placement.x;
   const auto page_x =
       static_cast<int>(resident_x & static_cast<std::uint16_t>(~63U));
-  const auto page_y =
-      static_cast<int>(placement.y & static_cast<std::uint16_t>(~255U));
   const auto pixels_per_word =
       image.mode() == assets::TimPixelMode::indexed4   ? 4
       : image.mode() == assets::TimPixelMode::indexed8 ? 2
                                                        : 1;
   const auto u0 =
       (static_cast<int>(resident_x) - page_x) * pixels_per_word + source_x;
-  const auto v0 = static_cast<int>(placement.y) - page_y + source_y;
-  const auto texture_page =
-      GetTPage(texturePageMode(image.mode()), 0, page_x, page_y);
+  const auto v0 = static_cast<int>(placement.y) + source_y;
+  const auto texture_page = encodeResidentTexturePage(
+      static_cast<std::uint16_t>(
+          GetTPage(texturePageMode(image.mode()), 0, page_x, 0)),
+      hud_resident_first_texture_page +
+          static_cast<unsigned int>(resident_x / 64U));
 
   POLY_FT4 polygon{};
   setPolyFT4(&polygon);
@@ -12957,6 +13013,13 @@ void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
     text("%x save   %t back", game::PauseAcdLayout::hint, normal);
   }
   DrawSync(0);
+  // Native HUD drawing leaves a host-alias TPAGE selected. Retail SPRT
+  // packets carry no TPAGE of their own and may precede the next E1 draw-mode
+  // packet, so never leak the alias selector across the guest-frame boundary.
+  DR_TPAGE guest_page{};
+  SetDrawTPage(&guest_page, 1, 0, GetTPage(0, 0, 0, 0));
+  DrawPrim(&guest_page);
+  DrawSync(0);
 }
 
 void PsyCrossCampaignSaveRenderer::drawLoadSlots(
@@ -13031,6 +13094,57 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
         &rectangle,
         reinterpret_cast<u_long *>(
             const_cast<std::uint32_t *>(transfer->payload.data())));
+    // Native mission residency moves the retail ZCLUT block from
+    // (768,480)..(1023,511) into framebuffer-safe rows beginning at
+    // (0,192), and draw packets relocate their CLUT selectors accordingly.
+    // Direct retail LoadImage calls still target the authored source block.
+    // Mirror those rows through the live bank/row map so palette animation,
+    // weapon selection and streamed-room completion update the same physical
+    // CLUT which guest polygons and sprites sample.
+    const auto transfer_right =
+        static_cast<std::uint32_t>(transfer->x) + transfer->width;
+    const auto transfer_bottom =
+        static_cast<std::uint32_t>(transfer->y) + transfer->height;
+    if (transfer->x >= mission_clut_source_x &&
+        transfer_right <= mission_clut_source_x + 256U &&
+        transfer->y >= mission_clut_source_y &&
+        transfer_bottom <= mission_clut_source_y + 32U) {
+      const auto bank = std::min<std::size_t>(texture_bank, 1U);
+      std::vector<u_long> row_pixels(
+          (static_cast<std::size_t>(transfer->width) + 1U) / 2U);
+      const auto halfword_at = [&](std::size_t index) {
+        const auto word = transfer->payload[index / 2U];
+        return static_cast<std::uint16_t>(
+            index % 2U == 0U ? word : word >> 16U);
+      };
+      for (auto row = std::uint16_t{}; row < transfer->height; ++row) {
+        std::ranges::fill(row_pixels, 0U);
+        for (auto column = std::uint16_t{}; column < transfer->width;
+             ++column) {
+          const auto source_index =
+              static_cast<std::size_t>(row) * transfer->width + column;
+          row_pixels[column / 2U] |=
+              static_cast<u_long>(halfword_at(source_index))
+              << ((column & 1U) * 16U);
+        }
+        const auto source_row =
+            static_cast<std::size_t>(transfer->y -
+                                     mission_clut_source_y + row);
+        const auto placement = missionClutResidentRow(
+            transfer->x, transfer->y, transfer->width, transfer->height,
+            row, streamed_clut_row_remap[bank][source_row]);
+        if (!placement.valid) {
+          continue;
+        }
+        RECT16 resident{
+            static_cast<short>(placement.x),
+            static_cast<short>(placement.y),
+            static_cast<short>(placement.width),
+            1,
+        };
+        LoadImage(&resident, row_pixels.data());
+      }
+    }
     return;
   }
   if (kind == game::Sf2GpuCommandKind::copy_vram &&
@@ -13250,6 +13364,73 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       DrawPrim(&primitive);
       return;
     }
+    if (base_opcode == 0x60U && words.size() == 3U) {
+      TILE primitive{};
+      setTile(&primitive);
+      // TILE ignores the raw-texture bit on retail hardware. PsyCross uses
+      // that bit while dispatching and otherwise rejects 0x61/0x63 as a
+      // zero-length primitive.
+      primitive.code = static_cast<std::uint8_t>(opcode & 0xfeU);
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY0(&primitive, x(1U), y(1U));
+      setWH(&primitive, static_cast<std::uint16_t>(words[2U]),
+            static_cast<std::uint16_t>(words[2U] >> 16U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x68U && words.size() == 2U) {
+      TILE_1 primitive{};
+      setTile1(&primitive);
+      primitive.code = static_cast<std::uint8_t>(opcode & 0xfeU);
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY0(&primitive, x(1U), y(1U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x70U && words.size() == 2U) {
+      TILE_8 primitive{};
+      setTile8(&primitive);
+      primitive.code = static_cast<std::uint8_t>(opcode & 0xfeU);
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY0(&primitive, x(1U), y(1U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x78U && words.size() == 2U) {
+      TILE_16 primitive{};
+      setTile16(&primitive);
+      primitive.code = static_cast<std::uint8_t>(opcode & 0xfeU);
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY0(&primitive, x(1U), y(1U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if ((base_opcode == 0x74U || base_opcode == 0x7cU) &&
+        words.size() == 3U) {
+      const auto draw_fixed_sprite = [&](auto &primitive) {
+        if (base_opcode == 0x74U) {
+          setSprt8(&primitive);
+        } else {
+          setSprt16(&primitive);
+        }
+        primitive.code = opcode;
+        setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+        setXY0(&primitive, x(1U), y(1U));
+        setUV0(&primitive, static_cast<std::uint8_t>(words[2U]),
+               static_cast<std::uint8_t>(words[2U] >> 8U));
+        primitive.clut = relocateClut(
+            static_cast<std::uint16_t>(words[2U] >> 16U), 0U, texture_bank);
+        DrawPrim(&primitive);
+      };
+      if (base_opcode == 0x74U) {
+        SPRT_8 primitive{};
+        draw_fixed_sprite(primitive);
+      } else {
+        SPRT_16 primitive{};
+        draw_fixed_sprite(primitive);
+      }
+      return;
+    }
   }
 
   // PsyCross's host primitive header contains a native pointer and optional
@@ -13309,6 +13490,13 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
     drawSf2GuestPacket(packet, texture_bank);
   }
   DrawSync(0);
+  // Native HUD sprites select host-only alias TPAGEs. Retail SPRT packets do
+  // not carry a TPAGE of their own and can be encountered before the next
+  // guest E1 packet, so never leak the HUD page into the following frame.
+  DR_TPAGE guest_page{};
+  SetDrawTPage(&guest_page, 1, 0, GetTPage(0, 0, 0, 0));
+  DrawPrim(&guest_page);
+  DrawSync(0);
 }
 
 void beginSf2GuestFrame() {
@@ -13319,20 +13507,33 @@ void beginSf2GuestFrame() {
   // framebuffer without this clear accumulates old snow/world pixels and
   // produces mouse-trail ghosting. PsyX_BeginScene clears the render target;
   // unlike ClearImage, it does not erase the emulated VRAM HUD atlas.
-  DRAWENV environment{};
-  SetDefDrawEnv(&environment, 0, 0, screen_width, screen_height);
-  environment.isbg = 1;
-  setRGB0(&environment, 0U, 0U, 0U);
-  PutDrawEnv(&environment);
+  // Retail ordering tables do not repeat E3/E4/E5 on every submission; the
+  // PS1 GPU retains that state. Preserve it while selecting a native
+  // full-target environment solely for the host clear, then restore it
+  // before replaying the next OT. Leaving the clear environment active makes
+  // lists that rely on retained centre-origin state draw the world offscreen,
+  // producing alternating black-world/native-HUD frames.
+  DRAWENV guest_environment{};
+  GetDrawEnv(&guest_environment);
+  DRAWENV clear_environment{};
+  SetDefDrawEnv(&clear_environment, 0, 0, screen_width, screen_height);
+  clear_environment.isbg = 1;
+  setRGB0(&clear_environment, 0U, 0U, 0U);
+  PutDrawEnv(&clear_environment);
   static_cast<void>(PsyX_BeginScene());
+  PutDrawEnv(&guest_environment);
 }
 
 void drawSf2GuestHud(const HudTextureAtlas &textures,
                      const game::GameplayHud &hud) {
   DrawSync(0);
+  DRAWENV guest_environment{};
+  GetDrawEnv(&guest_environment);
   // The guest frame leaves its centre-origin E5 draw offset active. Native
   // HUD helpers use top-left 384x240 coordinates, so establish an isolated
   // display-sized draw environment before emitting any overlay primitive.
+  // Preserve the complete retail environment: restoring only TPAGE loses the
+  // guest clip, offset, texture mode, and exact SPRT page for the next frame.
   DRAWENV environment{};
   SetDefDrawEnv(&environment, 0, 0, screen_width, screen_height);
   PutDrawEnv(&environment);
@@ -13361,7 +13562,8 @@ void drawSf2GuestHud(const HudTextureAtlas &textures,
       static_cast<int>(hud.weaponSwitchFrames()) * 98 /
       static_cast<int>(game::GameplayHud::weapon_switch_duration);
   const auto horizontal_slide = reveal_slide + switch_slide;
-  const auto icon_layers = sf2HudWeaponIconLayers(definition.id);
+  const auto icon_layers =
+      hudWeaponIconLayers(game::HudAtlasKind::sf2, definition.id);
   if (!icon_layers.empty()) {
     std::array<int, game::maximum_weapon_icon_layers> widths{};
     std::array<int, game::maximum_weapon_icon_layers> heights{};
@@ -13388,6 +13590,7 @@ void drawSf2GuestHud(const HudTextureAtlas &textures,
     drawOriginalHudText(textures, ammo, ammo_x + horizontal_slide, ammo_y);
   }
   DrawSync(0);
+  PutDrawEnv(&guest_environment);
 }
 
 SceneViewerResult runSf2GuestScene(
@@ -13412,7 +13615,12 @@ SceneViewerResult runSf2GuestScene(
   HudTextureAtlas hud_textures{mission};
   game::GameplayHud guest_hud;
   guest_hud.inventory().resetUnarmed();
-  PsyCrossAudioOutput audio;
+  // SF2 publishes 735 native-rate PCM frames per 60 Hz host update. A single
+  // 10 ms OpenAL callback quantum necessarily drains before the next producer
+  // update and caused repeated audible starvation/recovery cycles in long
+  // mission play. Keep roughly two presentation intervals of headroom while
+  // retaining the bounded half-second callback ring.
+  PsyCrossAudioOutput audio{12U, "sf2-gameplay"};
   RelativeMouseCapture mouse_capture;
   mouse_capture.set(true);
   // One runtime update is one complete retail display submission. SF2 owns
@@ -13425,19 +13633,46 @@ SceneViewerResult runSf2GuestScene(
   auto previous_counter = SDL_GetPerformanceCounter();
   const auto frequency = SDL_GetPerformanceFrequency();
   auto pause_was_down = false;
+  auto quick_save_was_down = false;
+  auto quick_load_was_down = false;
   auto previous_quick_weapon = false;
   auto previous_next_weapon = false;
   auto previous_previous_weapon = false;
+  auto previous_weapon_menu_previous = false;
+  auto previous_weapon_menu_next = false;
+  std::array<bool, quick_weapon_slot_count> previous_quick_weapon_keys{};
   game::Sf2WeaponSelectPulseQueue weapon_select{
       runtime.inputSampleCount()};
   game::Sf2SampledMouseAccumulator mouse_motion{
       runtime.inputSampleCount()};
   auto hud_input_sample = runtime.inputSampleCount();
   auto checkpoint_restores = runtime.diagnostics().checkpoint_restores;
+  auto guest_room = runtime.diagnostics().guest_current_room;
+  auto collision_room_record =
+      runtime.diagnostics().guest_collision_room_record;
+  auto collision_list = runtime.diagnostics().guest_collision_list;
+  auto reported_floor_zero_streak =
+      runtime.diagnostics().maximum_player_floor_false_streak;
+  auto collision_room_fallbacks =
+      runtime.diagnostics().collision_room_fallbacks;
+  auto collision_request_fallbacks =
+      runtime.diagnostics().collision_request_fallbacks;
+  auto renderer_text_repairs =
+      runtime.diagnostics().renderer_text_repairs;
+  auto rejected_renderer_ordering_tables =
+      runtime.diagnostics().rejected_renderer_ordering_tables;
+  auto rejected_renderer_vertex_entries =
+      runtime.diagnostics().rejected_renderer_vertex_entries;
+  auto clamped_renderer_ordering_table_entries =
+      runtime.diagnostics().clamped_renderer_ordering_table_entries;
+  auto timeline_event_count =
+      runtime.diagnostics().timeline_event_count;
   auto texture_room = native_residency.currentRoom();
   auto texture_bank = static_cast<unsigned int>(
       native_residency.textureBankAt(runtime.diagnostics().player_x,
                                      runtime.diagnostics().player_z));
+  auto pending_texture_room = std::uint16_t{0xffffU};
+  auto pending_texture_room_frames = 0U;
   auto presented_frames = std::uint64_t{};
   auto screenshot_captured = false;
   const auto screenshot_frame = [] {
@@ -13453,7 +13688,8 @@ SceneViewerResult runSf2GuestScene(
   std::array<psx::SpuPcmFrame, 4096U> pcm{};
 
   PsyX_Log_Info(
-      "SF2 guest alpha: retail TITLE->HWAY runtime, direct GP0/SPU handoff\n");
+      "SF2 guest alpha: retail TITLE->mission runtime, direct GP0/SPU "
+      "handoff\n");
   for (;;) {
     const auto counter = SDL_GetPerformanceCounter();
     const auto elapsed = std::clamp(
@@ -13472,6 +13708,62 @@ SceneViewerResult runSf2GuestScene(
     const auto held = static_cast<std::uint16_t>(~buttons);
     int keyboard_count{};
     const auto *keyboard = SDL_GetKeyboardState(&keyboard_count);
+    const auto key_down = [&](SDL_Scancode scancode) {
+      const auto index = static_cast<int>(scancode);
+      return keyboard != nullptr && index >= 0 && index < keyboard_count &&
+             keyboard[index] != 0U;
+    };
+    const auto quick_save_down = key_down(SDL_SCANCODE_F5);
+    const auto quick_load_down = key_down(SDL_SCANCODE_F9);
+    if (quick_save_down && !quick_save_was_down) {
+      if (runtime.captureQuickState()) {
+        const auto saved = runtime.diagnostics();
+        PsyX_Log_Info(
+            "SF2 quick state saved: frame=%llu clock=%u "
+            "player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                runtime.presentationFrame()
+                    ? runtime.presentationFrame()->guest_frame
+                    : 0U),
+            saved.system_clock, saved.player_x, saved.player_y,
+            saved.player_z, saved.guest_current_room);
+      } else {
+        PsyX_Log_Error("SF2 quick-state capture failed\n");
+      }
+    }
+    if (quick_load_down && !quick_load_was_down) {
+      if (runtime.restoreQuickState()) {
+        audio.reset("sf2-quick-load");
+        simulation_accumulator = 0.0;
+        weapon_select =
+            game::Sf2WeaponSelectPulseQueue{runtime.inputSampleCount()};
+        mouse_motion =
+            game::Sf2SampledMouseAccumulator{runtime.inputSampleCount()};
+        hud_input_sample = runtime.inputSampleCount();
+        const auto restored = runtime.diagnostics();
+        checkpoint_restores = restored.checkpoint_restores;
+        guest_room = restored.guest_current_room;
+        collision_room_record = restored.guest_collision_room_record;
+        collision_list = restored.guest_collision_list;
+        timeline_event_count = restored.timeline_event_count;
+        hud_textures.invalidate();
+        PsyX_Log_Info(
+            "SF2 quick state loaded: frame=%llu clock=%u "
+            "player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                runtime.presentationFrame()
+                    ? runtime.presentationFrame()->guest_frame
+                    : 0U),
+            restored.system_clock, restored.player_x, restored.player_y,
+            restored.player_z, restored.guest_current_room);
+      } else if (!runtime.hasQuickState()) {
+        PsyX_Log_Info("SF2 quick load ignored: press F5 first\n");
+      } else {
+        PsyX_Log_Error("SF2 quick-state restore failed\n");
+      }
+    }
+    quick_save_was_down = quick_save_down;
+    quick_load_was_down = quick_load_down;
     const auto keyboard_pad_mask =
         keyboardOriginPadMask(keyboard, keyboard_count, g_cfg_keyboardMapping);
     // PADRAW includes PsyCross's legacy keyboard-to-pad emulation. SF2 also
@@ -13515,18 +13807,47 @@ SceneViewerResult runSf2GuestScene(
     const auto add_weapon_pulses = [&weapon_select](unsigned int count) {
       weapon_select.enqueue(count);
     };
-    if ((raw.quick_weapon && !previous_quick_weapon) ||
-        (raw.next_weapon && !previous_next_weapon) ||
-        (raw.previous_weapon && !previous_previous_weapon)) {
-      add_weapon_pulses(1U);
+    const auto weapon_state = runtime.diagnostics();
+    auto direct_weapon_slot = std::optional<std::size_t>{};
+    for (auto slot = std::size_t{}; slot < raw.quick_weapon_keys.size();
+         ++slot) {
+      if (raw.quick_weapon_keys[slot] &&
+          !previous_quick_weapon_keys[slot] && !direct_weapon_slot) {
+        direct_weapon_slot = slot;
+      }
     }
-    if (raw.weapon_cycle_delta != 0) {
-      add_weapon_pulses(static_cast<unsigned int>(std::min<std::int64_t>(
-          std::abs(static_cast<std::int64_t>(raw.weapon_cycle_delta)), 16)));
+    if (direct_weapon_slot) {
+      if (const auto pulses =
+              game::sf2WeaponSlotPulseCount(weapon_state,
+                                            *direct_weapon_slot)) {
+        add_weapon_pulses(*pulses);
+      }
+    } else {
+      auto cycle_steps = raw.weapon_cycle_delta;
+      if (raw.next_weapon && !previous_next_weapon) {
+        ++cycle_steps;
+      }
+      if (raw.previous_weapon && !previous_previous_weapon) {
+        --cycle_steps;
+      }
+      if (raw.weapon_menu_next && !previous_weapon_menu_next) {
+        ++cycle_steps;
+      }
+      if (raw.weapon_menu_previous && !previous_weapon_menu_previous) {
+        --cycle_steps;
+      }
+      add_weapon_pulses(
+          game::sf2WeaponCyclePulseCount(weapon_state, cycle_steps));
+      if (raw.quick_weapon && !previous_quick_weapon) {
+        add_weapon_pulses(1U);
+      }
     }
     previous_quick_weapon = raw.quick_weapon;
     previous_next_weapon = raw.next_weapon;
     previous_previous_weapon = raw.previous_weapon;
+    previous_weapon_menu_previous = raw.weapon_menu_previous;
+    previous_weapon_menu_next = raw.weapon_menu_next;
+    previous_quick_weapon_keys = raw.quick_weapon_keys;
     const auto weapon_select_down =
         weapon_select.update(current_input_sample);
     const auto pc_move =
@@ -13613,6 +13934,29 @@ SceneViewerResult runSf2GuestScene(
         // The guest snapshot owns its SPU/CD generation, while samples
         // already submitted to OpenAL belong to the retired generation.
         // Drop that host tail atomically before accepting restarted PCM.
+        const auto restore = runtime.diagnostics();
+        PsyX_Log_Info(
+            "SF2 guest checkpoint restore: count=%llu caller=0x%08X "
+            "pre=(%d,%d,%d) health=%u room=%u "
+            "residency=0x%08X/0x%08X collision=%llu\n",
+            static_cast<unsigned long long>(
+                restore.checkpoint_restores),
+            restore.last_restore_caller, restore.pre_restore_player_x,
+            restore.pre_restore_player_y, restore.pre_restore_player_z,
+            restore.pre_restore_player_health,
+            restore.guest_current_room,
+            restore.guest_collision_room_record,
+            restore.guest_collision_list,
+            static_cast<unsigned long long>(
+                restore.world_collision_scans));
+        PsyX_Log_Info(
+            "SF2 guest checkpoint floor probes: total=%llu byte=%llu/%llu "
+            "zero-streak=%u/max=%u\n",
+            static_cast<unsigned long long>(restore.player_floor_probes),
+            static_cast<unsigned long long>(restore.player_floor_probe_true),
+            static_cast<unsigned long long>(restore.player_floor_probe_false),
+            restore.player_floor_false_streak,
+            restore.maximum_player_floor_false_streak);
         audio.reset("sf2-checkpoint-restore");
         checkpoint_restores = completed_restores;
       }
@@ -13623,24 +13967,186 @@ SceneViewerResult runSf2GuestScene(
     audio.update();
     if (const auto &frame = runtime.presentationFrame()) {
       const auto diagnostics = runtime.diagnostics();
-      native_residency.synchronizeGuestResidency(
-          static_cast<double>(diagnostics.player_x),
-          static_cast<double>(diagnostics.player_y),
-          static_cast<double>(diagnostics.player_z));
-      textures.ensure(native_residency);
-      const auto next_texture_room = native_residency.currentRoom();
-      const auto next_texture_bank = static_cast<unsigned int>(
-          native_residency.textureBankAt(
-              static_cast<double>(diagnostics.player_x),
-              static_cast<double>(diagnostics.player_z)));
-      if (next_texture_room != texture_room ||
-          next_texture_bank != texture_bank) {
+      if (diagnostics.renderer_text_repairs != renderer_text_repairs) {
         PsyX_Log_Info(
-            "SF2 guest texture residency: room=%u bank=%u player=(%d,%d,%d)\n",
-            next_texture_room, next_texture_bank, diagnostics.player_x,
-            diagnostics.player_y, diagnostics.player_z);
-        texture_room = next_texture_room;
-        texture_bank = next_texture_bank;
+            "SF2 resident renderer repaired: count=%llu address=0x%08X "
+            "expected=0x%08X actual=0x%08X writer=0x%08X/0x%08X "
+            "player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                diagnostics.renderer_text_repairs),
+            diagnostics.last_renderer_text_repair_address,
+            diagnostics.last_renderer_text_expected,
+            diagnostics.last_renderer_text_actual,
+            diagnostics.last_renderer_text_writer_pc,
+            diagnostics.last_renderer_text_writer_instruction,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z, diagnostics.guest_current_room);
+        renderer_text_repairs = diagnostics.renderer_text_repairs;
+      }
+      if (diagnostics.rejected_renderer_ordering_tables !=
+          rejected_renderer_ordering_tables) {
+        PsyX_Log_Info(
+            "SF2 malformed renderer OT rejected: count=%llu packet=0x%08X "
+            "root=0x%08X guest-frame=%llu\n",
+            static_cast<unsigned long long>(
+                diagnostics.rejected_renderer_ordering_tables),
+            diagnostics.last_rejected_renderer_packet,
+            diagnostics.last_rejected_renderer_root,
+            static_cast<unsigned long long>(
+                diagnostics.last_rejected_renderer_frame));
+        rejected_renderer_ordering_tables =
+            diagnostics.rejected_renderer_ordering_tables;
+      }
+      if (diagnostics.collision_room_fallbacks !=
+          collision_room_fallbacks) {
+        PsyX_Log_Info(
+            "SF2 collision room fallback: count=%llu retained-room=%u "
+            "player=(%d,%d,%d)\n",
+            static_cast<unsigned long long>(
+                diagnostics.collision_room_fallbacks),
+            diagnostics.last_collision_room_fallback,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z);
+        collision_room_fallbacks = diagnostics.collision_room_fallbacks;
+      }
+      if (diagnostics.collision_request_fallbacks !=
+          collision_request_fallbacks) {
+        PsyX_Log_Info(
+            "SF2 player floor request fallback: count=%llu "
+            "retained-room=%u player=(%d,%d,%d)\n",
+            static_cast<unsigned long long>(
+                diagnostics.collision_request_fallbacks),
+            diagnostics.last_collision_request_fallback,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z);
+        collision_request_fallbacks =
+            diagnostics.collision_request_fallbacks;
+      }
+      if (diagnostics.rejected_renderer_vertex_entries !=
+          rejected_renderer_vertex_entries) {
+        PsyX_Log_Info(
+            "SF2 malformed renderer vertex entry rejected: count=%llu "
+            "cursor=0x%08X address=0x%08X player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                diagnostics.rejected_renderer_vertex_entries),
+            diagnostics.last_rejected_renderer_vertex_cursor,
+            diagnostics.last_rejected_renderer_vertex_address,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z, diagnostics.guest_current_room);
+        rejected_renderer_vertex_entries =
+            diagnostics.rejected_renderer_vertex_entries;
+      }
+      if (diagnostics.clamped_renderer_ordering_table_entries !=
+          clamped_renderer_ordering_table_entries) {
+        PsyX_Log_Info(
+            "SF2 renderer OT entry clamped: count=%llu "
+            "requested=0x%08X clamped=0x%08X base=0x%08X buckets=%u\n",
+            static_cast<unsigned long long>(
+                diagnostics.clamped_renderer_ordering_table_entries),
+            diagnostics.last_renderer_ordering_table_requested,
+            diagnostics.last_renderer_ordering_table_clamped,
+            diagnostics.last_renderer_ordering_table_base,
+            diagnostics.last_renderer_ordering_table_buckets);
+        clamped_renderer_ordering_table_entries =
+            diagnostics.clamped_renderer_ordering_table_entries;
+      }
+      if (diagnostics.timeline_event_count != timeline_event_count) {
+        const auto first_event = std::max(
+            timeline_event_count,
+            diagnostics.timeline_event_count >
+                    diagnostics.timeline_events.size()
+                ? diagnostics.timeline_event_count -
+                      diagnostics.timeline_events.size()
+                : 0U);
+        for (auto serial = first_event;
+             serial < diagnostics.timeline_event_count; ++serial) {
+          const auto &event =
+              diagnostics.timeline_events[
+                  serial % diagnostics.timeline_events.size()];
+          PsyX_Log_Info(
+              "SF2 guest timeline: kind=%u frame=%llu clock=%u "
+              "args=%08X/%08X/%08X/%08X\n",
+              static_cast<unsigned int>(event.kind),
+              static_cast<unsigned long long>(event.guest_frame),
+              event.system_clock, event.arguments[0U],
+              event.arguments[1U], event.arguments[2U],
+              event.arguments[3U]);
+        }
+        timeline_event_count = diagnostics.timeline_event_count;
+      }
+      if (diagnostics.guest_current_room != guest_room ||
+          diagnostics.guest_collision_room_record !=
+              collision_room_record ||
+          diagnostics.guest_collision_list != collision_list) {
+        PsyX_Log_Info(
+            "SF2 guest room: %u -> %u player=(%d,%d,%d) "
+            "residency=0x%08X/0x%08X collision=%llu "
+            "last=0x%08X:%d/%d\n",
+            guest_room, diagnostics.guest_current_room,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z,
+            diagnostics.guest_collision_room_record,
+            diagnostics.guest_collision_list,
+            static_cast<unsigned long long>(
+                diagnostics.world_collision_scans),
+            diagnostics.last_world_collision_caller,
+            diagnostics.last_world_collision_object,
+            diagnostics.last_world_collision_room);
+        guest_room = diagnostics.guest_current_room;
+        collision_room_record =
+            diagnostics.guest_collision_room_record;
+        collision_list = diagnostics.guest_collision_list;
+      }
+      if (diagnostics.player_floor_false_streak >= 24U &&
+          diagnostics.player_floor_false_streak >=
+              reported_floor_zero_streak + 12U) {
+        PsyX_Log_Info(
+            "SF2 guest prolonged floor-zero result: streak=%u max=%u "
+            "player=(%d,%d,%d) room=%u residency=0x%08X/0x%08X\n",
+            diagnostics.player_floor_false_streak,
+            diagnostics.maximum_player_floor_false_streak,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z, diagnostics.guest_current_room,
+            diagnostics.guest_collision_room_record,
+            diagnostics.guest_collision_list);
+        reported_floor_zero_streak =
+            diagnostics.player_floor_false_streak;
+      }
+      // The guest owns room traversal and publishes the corresponding VRAM
+      // uploads with its ordering tables, but the native seed atlas still
+      // supplies room VLF pages that the emulated GPU does not retain.
+      // Coordinate-based ownership oscillated between overlapping sequel
+      // rooms and thrashed that atlas. Follow the exact retail room instead,
+      // after it remains stable for two 20 Hz logic ticks.
+      if (diagnostics.guest_current_room <
+          diagnostics.guest_collision_room_count) {
+        if (diagnostics.guest_current_room == pending_texture_room) {
+          ++pending_texture_room_frames;
+        } else {
+          pending_texture_room = diagnostics.guest_current_room;
+          pending_texture_room_frames = 1U;
+        }
+        constexpr auto texture_room_debounce_frames = 6U;
+        if (pending_texture_room_frames >=
+                texture_room_debounce_frames &&
+            pending_texture_room != texture_room &&
+            native_residency.synchronizeGuestRoom(
+                pending_texture_room)) {
+          textures.ensure(native_residency);
+          texture_room = native_residency.currentRoom();
+          texture_bank = static_cast<unsigned int>(
+              native_residency.textureBankAt(
+                  static_cast<double>(diagnostics.player_x),
+                  static_cast<double>(diagnostics.player_z)));
+          PsyX_Log_Info(
+              "SF2 guest texture residency: room=%u bank=%u "
+              "player=(%d,%d,%d)\n",
+              texture_room, texture_bank, diagnostics.player_x,
+              diagnostics.player_y, diagnostics.player_z);
+        }
+      } else {
+        pending_texture_room = 0xffffU;
+        pending_texture_room_frames = 0U;
       }
       game::projectSf2GuestHud(guest_hud, diagnostics);
       const auto current_hud_sample = runtime.inputSampleCount();
@@ -13654,14 +14160,14 @@ SceneViewerResult runSf2GuestScene(
       beginSf2GuestFrame();
       drawSf2GuestFrame(*frame, texture_bank);
       // The authored opening lasts roughly fifteen seconds. The retail HUD
-      // callback is absent in this direct TITLE->HWAY path, so keep the
+      // callback is absent in this direct TITLE-to-mission path, so keep the
       // read-only native overlay hidden until the camera handoff.
       if (diagnostics.system_clock >= 300U) {
         // The guest world publication replays its authored VRAM setup before
         // every draw. It can overwrite the native HUD residency without
         // changing the HUD's logical weapon/font state, so invalidate that
         // cache and restore the small overlay atlas after the guest frame.
-        hud_textures.invalidate();
+        hud_textures.invalidateGuestWritablePalette();
         hud_textures.restoreGameplay(
             guest_hud, raw.aim,
             std::span<const game::LegacyDroppedItemBridgeState>{},
@@ -13698,7 +14204,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
     preloaded_gameplay = std::make_unique<game::GameplaySession>(mission);
   }
   if (mission.gameId() == game::GameId::syphon_filter_2 &&
-      mission.definition().index == 2U) {
+      mission.definition().index < 8U) {
     return runSf2GuestScene(mission, pad, previous_buttons, cue_path, input_,
                             *preloaded_gameplay);
   }

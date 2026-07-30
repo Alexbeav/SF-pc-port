@@ -8,6 +8,7 @@
 #include "sf/platform/host.hpp"
 
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -20,6 +21,29 @@
 #include <vector>
 
 namespace {
+
+void preservePreviousSceneLog() noexcept {
+  std::error_code error;
+  const auto source =
+      std::filesystem::path{"Syphon Filter PC - scene test.log"};
+  if (!std::filesystem::is_regular_file(source, error) || error) {
+    return;
+  }
+  const auto destination_directory = std::filesystem::path{"logs"};
+  std::filesystem::create_directories(destination_directory, error);
+  if (error) {
+    return;
+  }
+  const auto timestamp =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  const auto destination =
+      destination_directory /
+      ("sf2-scene-" + std::to_string(timestamp) + ".log");
+  std::filesystem::copy_file(source, destination,
+                             std::filesystem::copy_options::none, error);
+}
 
 std::optional<int> parseInteger(std::string_view text) {
   int value{};
@@ -309,6 +333,10 @@ int main(int argc, char **argv) {
           std::move(mission_cue_path), std::move(supported_game_serial),
           graphics, input, retail_cheats);
     } else if (launch->mode == LaunchMode::scene_test) {
+      // PsyX rewrites the fixed window-title log on every launch. Preserve the
+      // previous run first so a short follow-up test cannot destroy the only
+      // useful crash/fall-through trace.
+      preservePreviousSceneLog();
       auto mission = sf::game::MissionPackage::load(disc, mission_index);
       const auto &definition = mission.definition();
       std::cout << "Disc verified. Starting native scene test at mission "

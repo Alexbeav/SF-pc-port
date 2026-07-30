@@ -2,6 +2,7 @@
 /out/
 /dist/
 /tmp/
+/logs/
 /.vs/
 /CMakeUserPresets.json
 *.user
