@@ -3,6 +3,37 @@
 All notable public-test changes are documented here. The project currently uses
 pre-release tags rather than a stable semantic-versioning promise.
 
+## 0.1.0-sf2-guest-alpha.1 - 2026-07-30
+
+### Experimental Syphon Filter 2 runtime
+
+- Added a product-owned R3000A guest runtime for the USA sequel executable and
+  a direct retail TITLE-to-HWAY Mission 3 bootstrap.
+- Replayed retail GPU submissions through PsyCross with authored textures,
+  frame clearing, streamed texture-bank residency and a partial native HUD.
+- Routed keyboard, mouse and controller input into retail gameplay, including
+  first-person mouse aim, strafing, crouch and sampled weapon selection.
+- Routed retail XA dialogue and SPU sound effects into native PCM output.
+- Preserved retail death and checkpoint reload behavior while keeping host
+  audio, callbacks and CD scheduling coherent across restarts.
+- Added deterministic probes, runtime diagnostics, guarded guest-memory writes
+  and extensive executable/script/audio research documentation.
+
+### Alpha limitations
+
+- Mission 3 is the only interactively validated mission.
+- Campaign transitions, saves, music and the complete mission set are not yet
+  supported as a public gameplay path.
+- Some HUD weapon artwork is absent, and a later scripted conversation may
+  fail to release player control.
+- Deep-room texture residency has a new correction that needs wider testing.
+
+### Release artifact
+
+- File: `SyphonFilterPC-0.1.0-sf2-guest-alpha.1-win64.zip`
+- Checksum: supplied in the accompanying `.zip.sha256` file.
+- Required disc: *Syphon Filter 2* USA Disc 1, BIN/CUE.
+
 ## 0.1.0-public-test.8 - 2026-07-27
 
 ### Gameplay and presentation

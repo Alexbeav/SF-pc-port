@@ -1,6 +1,7 @@
 ﻿param(
     [string]$Version = "0.1.0-public-test.8",
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [switch]$Sf2GuestAlpha
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,7 +110,64 @@ foreach ($entry in $licenseSources.GetEnumerator()) {
 
 $buildDate = Get-Date -Format "yyyy-MM-dd"
 
-$readme = @"
+$readme = if ($Sf2GuestAlpha) {
+@"
+SYPHON FILTER 2 PC — $Version
+EXPERIMENTAL GUEST-RUNTIME ALPHA
+Windows x64, $buildDate
+
+This package does not contain the game or a disc image. It requires a legally
+obtained Syphon Filter 2 USA Disc 1 BIN/CUE image.
+
+INSTALLATION
+============
+
+1. Extract the complete ZIP into a new writable directory.
+2. Keep every BIN file beside the CUE file according to the CUE contents.
+3. Open PowerShell in the extracted directory.
+4. Create the required empty developer marker:
+
+   New-Item -ItemType File -Path .\syphon_filter_cheats
+
+5. Start the validated Mission 3 alpha, replacing the example path:
+
+   .\syphon_filter.exe --no-launcher --mission=3 --scene-test "D:\PS1\Syphon Filter 2 (USA) (Disc 1).cue"
+
+The ordinary launcher remains the Syphon Filter 1 product launcher and does
+not expose this experimental SF2 path. Do not select an SF2 image there.
+
+CURRENT SCOPE
+=============
+
+- Mission 3 (I-70) is the only interactively validated mission.
+- The retail intro, controls, combat, doors, climbing, weapons, dialogue,
+  sound effects, death and checkpoint restart are functional.
+- The HUD is a partial native projection. Some weapon artwork is absent.
+- Music, campaign transitions, saves and the complete mission set are not
+  validated.
+- A later scripted conversation may fail to release player control.
+- Deep-room texture residency has a new fix which needs broader testing.
+
+Controls use the existing PC bindings. Mouse aiming works in first person;
+A/D strafe and C crouches. Use the configured weapon-cycle bindings or mouse
+wheel to change weapons.
+
+BUG REPORTS
+===========
+
+Include reproduction steps, approximate location, the last dialogue line,
+screenshots and the generated log beside the executable. Do not upload or send
+BIN/CUE files or other copyrighted game data.
+
+Settings are stored under %LOCALAPPDATA%\SyphonFilterPC. The empty
+syphon_filter_cheats marker enables developer-only launch overrides; remove it
+when returning to an ordinary SF1 installation if both packages share a folder.
+
+This is an unofficial compatibility-runtime experiment. It is not affiliated
+with or endorsed by Sony Interactive Entertainment or Bend Studio.
+"@
+} else {
+@"
 SYPHON FILTER PC — $Version
 Windows x64, $buildDate
 
@@ -130,28 +188,55 @@ hardware information, screenshots and generated logs that contain no game data.
 This is an unofficial compatibility runtime. It is not affiliated with or
 endorsed by Sony Interactive Entertainment or Bend Studio.
 "@
+}
 
-$notes = @"
+$notes = if ($Sf2GuestAlpha) {
+@"
+EXPERIMENTAL SF2 GUEST ALPHA $Version
+=====================================
+
+This build runs retail Syphon Filter 2 R3000A gameplay inside the native PC
+runtime and presents the guest GPU/SPU output through PsyCross. Mission 3 is
+playable but this is a focused testing build, not a complete SF2 campaign port.
+
+The archive contains no game image, save, settings, extracted game assets or
+syphon_filter_cheats marker. Read README_FIRST.txt before launching.
+"@
+} else {
+@"
 PUBLIC TEST $Version
 ====================
 
 This source-only distribution excludes localization packs, game-derived
 assets, character artwork, dossier screens, saves and game images.
 "@
+}
 
 $commit = try { (& git -C $repoRoot rev-parse --short HEAD 2>$null).Trim() } catch { "unknown" }
 if (-not $commit) { $commit = "unknown" }
 
+$channel = if ($Sf2GuestAlpha) { "Experimental SF2 Guest Alpha" } else { "Public Test" }
+$supportedDisc = if ($Sf2GuestAlpha) {
+    "Syphon Filter 2 USA Disc 1, BIN/CUE"
+} else {
+    "Syphon Filter USA v1.1, SCUS-94240, BIN/CUE"
+}
+$launcher = if ($Sf2GuestAlpha) {
+    "SF2 alpha uses the documented direct command line"
+} else {
+    "integrated; no CMD bootstrap"
+}
+
 $buildInfo = @"
 Product: Syphon Filter PC
-Channel: Public Test
+Channel: $channel
 Version: $Version
 Platform: Windows x64
 Build type: $Configuration
 Build date: $buildDate
 Source revision: $commit
-Supported disc: Syphon Filter USA v1.1, SCUS-94240, BIN/CUE
-Launcher: integrated; no CMD bootstrap
+Supported disc: $supportedDisc
+Launcher: $launcher
 Game image included: no
 Save data included: no
 Cheat marker included: no
