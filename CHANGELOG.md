@@ -13,6 +13,14 @@ pre-release tags rather than a stable semantic-versioning promise.
 - Prevented AIRBASE movement from faulting in a stale player sound-bank
   payload by treating only unreadable retail variant tables as an empty sound
   selection. Forward, combat and byte-exact F5/F9 stress routes now complete.
+- Fixed WRECK's clean-start parachute sequence by publishing the retail
+  checkpoint-present flag only after the first real checkpoint capture.
+  Mission 8 now lands and enters gameplay instead of falling into a
+  129-frame restart loop.
+- Limited the experimental collision-room containment to the captured HWAY
+  room-14 case. Follow-up disassembly showed that the earlier request-level
+  "player floor" classification was shared actor logic, so that unproven
+  request rewrite and its misleading probe were retired.
 
 ## 0.1.0-sf2-guest-alpha.2 - 2026-07-31
 

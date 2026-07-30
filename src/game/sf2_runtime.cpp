@@ -1641,6 +1641,13 @@ private:
   }
 
   void stabilizeCollisionRoom() noexcept {
+    // This containment is backed by the captured HWAY room-14 failure. Other
+    // missions can legitimately publish no current room during authored
+    // traversal states (notably WRECK's airborne opening), so do not rewrite
+    // their collision ownership without equivalent evidence.
+    if (mission_index_ != 2U) {
+      return;
+    }
     constexpr std::uint32_t collision_owner_handle_address = 0x8012a654U;
     constexpr std::uint32_t collision_room_count_address = 0x8011f660U;
     constexpr std::uint32_t owner_room_offset = 0x1a0U;
@@ -1671,25 +1678,6 @@ private:
       ++collision_room_fallbacks_;
       last_collision_room_fallback_ = last_valid_collision_room_;
     }
-  }
-
-  void stabilizePlayerCollisionRequest(
-      LegacyHostCallContext &context, std::uint32_t request) noexcept {
-    constexpr std::uint32_t request_room_offset = 0x0cU;
-    constexpr std::uint32_t collision_room_count_address = 0x8011f660U;
-    std::uint32_t request_room{};
-    std::uint32_t room_count{};
-    if (last_valid_collision_room_ == 0xffffU ||
-        !context.read32(request + request_room_offset, request_room) ||
-        (request_room != 0xffffU && request_room != 0xffffffffU) ||
-        !context.read32(collision_room_count_address, room_count) ||
-        last_valid_collision_room_ >= room_count ||
-        !context.write32(request + request_room_offset,
-                         last_valid_collision_room_)) {
-      return;
-    }
-    ++collision_request_fallbacks_;
-    last_collision_request_fallback_ = last_valid_collision_room_;
   }
 
   struct OpenFile {
@@ -1857,23 +1845,15 @@ private:
         });
     vm_.bindHostCall(
         0x800570a0U, [this](LegacyHostCallContext &context) {
-          // A room resolver can transiently publish 0xFFFF and call the
-          // floor scanner again before execution returns to a public display
-          // boundary. Repair at the collision call edge as well as at the
-          // boundary so that same-slice scan cannot observe an empty room
-          // and begin a fall through otherwise valid floor geometry.
+          // HWAY can transiently publish 0xFFFF before execution returns to
+          // a public display boundary. Apply its captured owner-room repair
+          // at the collision call edge as well as at that boundary. This
+          // intentionally does not classify or rewrite individual requests:
+          // the previously suspected return site is shared actor logic.
           stabilizeCollisionRoom();
           ++world_collision_scans_;
           last_world_collision_caller_ = context.returnAddress();
           const auto request = context.argument(0U);
-          if (context.returnAddress() == 0x80084e7cU) {
-            // WorldCollision_Scan receives its room in the request as well
-            // as through the player collision owner. Repairing only the
-            // owner leaves an invalid request untouched, so the scan still
-            // returns no floor and gravity can accelerate Gabe through
-            // otherwise resident geometry.
-            stabilizePlayerCollisionRequest(context, request);
-          }
           std::uint32_t object{};
           std::uint32_t room{};
           if (context.read32(request + 0x08U, object)) {
@@ -1882,9 +1862,6 @@ private:
           }
           if (context.read32(request + 0x0cU, room)) {
             last_world_collision_room_ = static_cast<std::int32_t>(room);
-          }
-          if (context.returnAddress() == 0x80084e7cU) {
-            last_player_floor_request_ = request;
           }
           context.continueGuestInstruction();
         });
@@ -2114,30 +2091,6 @@ private:
               last_rejected_renderer_vertex_address_ = candidate;
             }
           }
-          context.continueGuestInstruction();
-        });
-    vm_.bindHostCall(
-        0x80084e7cU, [this](LegacyHostCallContext &context) {
-          std::uint32_t result_pointer{};
-          std::uint8_t result{};
-          if (last_player_floor_request_ != 0U &&
-              context.read32(last_player_floor_request_ + 0x1cU,
-                             result_pointer) &&
-              result_pointer != 0U &&
-              context.read8(result_pointer, result)) {
-            ++player_floor_probes_;
-            if (result != 0U) {
-              ++player_floor_probe_true_;
-              player_floor_false_streak_ = 0U;
-            } else {
-              ++player_floor_probe_false_;
-              ++player_floor_false_streak_;
-              maximum_player_floor_false_streak_ =
-                  std::max(maximum_player_floor_false_streak_,
-                           player_floor_false_streak_);
-            }
-          }
-          last_player_floor_request_ = 0U;
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -2892,7 +2845,13 @@ private:
     }
     if (!vm_.runtime().write32(0x801582d4U, mission_index_) ||
         !vm_.runtime().write32(0x80156bdcU, 17U) ||
-        !vm_.runtime().write32(0x8011f61cU, 1U)) {
+        // This is a fresh TITLE-to-mission handoff. Mission overlays use the
+        // retail checkpoint-present flag to distinguish their clean-start
+        // choreography from restore setup; WRECK, for example, dispatches
+        // the parachute-opening event only when this is zero. The normal
+        // post-init checkpoint capture below sets it once retail state is
+        // actually ready.
+        !vm_.runtime().write32(0x8011f61cU, 0U)) {
       return false;
     }
     const auto fog = disc_.image().find(fog_path_);
