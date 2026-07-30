@@ -13667,6 +13667,8 @@ SceneViewerResult runSf2GuestScene(
       runtime.diagnostics().clamped_renderer_ordering_table_entries;
   auto rejected_renderer_list_merges =
       runtime.diagnostics().rejected_renderer_list_merges;
+  auto rejected_sound_bank_lookups =
+      runtime.diagnostics().rejected_sound_bank_lookups;
   auto timeline_event_count =
       runtime.diagnostics().timeline_event_count;
   auto texture_room = native_residency.currentRoom();
@@ -14068,6 +14070,22 @@ SceneViewerResult runSf2GuestScene(
             diagnostics.player_z, diagnostics.guest_current_room);
         rejected_renderer_list_merges =
             diagnostics.rejected_renderer_list_merges;
+      }
+      if (diagnostics.rejected_sound_bank_lookups !=
+          rejected_sound_bank_lookups) {
+        PsyX_Log_Info(
+            "SF2 stale sound-bank lookup rejected: count=%llu "
+            "bank=0x%08X table=0x%08X index=%u "
+            "player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                diagnostics.rejected_sound_bank_lookups),
+            diagnostics.last_rejected_sound_bank,
+            diagnostics.last_rejected_sound_bank_table,
+            diagnostics.last_rejected_sound_bank_index,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z, diagnostics.guest_current_room);
+        rejected_sound_bank_lookups =
+            diagnostics.rejected_sound_bank_lookups;
       }
       if (diagnostics.timeline_event_count != timeline_event_count) {
         const auto first_event = std::max(
