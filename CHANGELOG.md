@@ -13,7 +13,12 @@ pre-release tags rather than a stable semantic-versioning promise.
 - Restored retail HUD and TIM/CLUT uploads for health, armor, ammunition,
   reticles, weapon icons, checkpoint/head-shot notices and pickup messages.
 - Added persistent in-session F5/F9 quick states with coherent guest RAM,
-  CD/XA, SPU, streamed VRAM and fresh ordering-table presentation.
+  CD/XA, SPU, streamed VRAM and restored ordering-table presentation.
+- Fixed post-F9 frame blinking and delayed guest corruption by restoring the
+  saved immutable presentation frame without consuming extra retail GPU
+  boundaries; full-RAM replay gates now require byte-identical results.
+- Added a bounded retail list-merge validator for poisoned renderer links so
+  one malformed object list cannot walk freed `0x5A` memory and fault.
 - Added directional weapon selection, mouse-wheel switching and number-key
   owned-weapon slots without bypassing retail inventory or equip behavior.
 - Improved modern PC input, including crouch-only C, A/D strafing and retained

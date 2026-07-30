@@ -13665,6 +13665,8 @@ SceneViewerResult runSf2GuestScene(
       runtime.diagnostics().rejected_renderer_vertex_entries;
   auto clamped_renderer_ordering_table_entries =
       runtime.diagnostics().clamped_renderer_ordering_table_entries;
+  auto rejected_renderer_list_merges =
+      runtime.diagnostics().rejected_renderer_list_merges;
   auto timeline_event_count =
       runtime.diagnostics().timeline_event_count;
   auto texture_room = native_residency.currentRoom();
@@ -14049,6 +14051,23 @@ SceneViewerResult runSf2GuestScene(
             diagnostics.last_renderer_ordering_table_buckets);
         clamped_renderer_ordering_table_entries =
             diagnostics.clamped_renderer_ordering_table_entries;
+      }
+      if (diagnostics.rejected_renderer_list_merges !=
+          rejected_renderer_list_merges) {
+        PsyX_Log_Info(
+            "SF2 malformed renderer list merge rejected: count=%llu "
+            "descriptor=0x%08X root=0x%08X cursor=0x%08X tag=0x%08X "
+            "player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                diagnostics.rejected_renderer_list_merges),
+            diagnostics.last_rejected_renderer_list_descriptor,
+            diagnostics.last_rejected_renderer_list_root,
+            diagnostics.last_rejected_renderer_list_cursor,
+            diagnostics.last_rejected_renderer_list_tag,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z, diagnostics.guest_current_room);
+        rejected_renderer_list_merges =
+            diagnostics.rejected_renderer_list_merges;
       }
       if (diagnostics.timeline_event_count != timeline_event_count) {
         const auto first_event = std::max(

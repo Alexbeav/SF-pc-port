@@ -100,7 +100,8 @@ void printUsage() {
       << "  sf_tool probe-sf2-mission-transition <game.cue> "
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
-         "[neutral|forward|combat|crouch|quickstate|objective|weapons] "
+         "[neutral|forward|combat|crouch|quickstate|quickobjective|"
+         "objective|weapons] "
          "[mission-index]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
@@ -6515,8 +6516,21 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   auto first_collision_residency_gap_frame = std::uint32_t{};
   auto quick_state_saved = sf::game::Sf2GuestRuntimeDiagnostics{};
   auto quick_state_restored = false;
+  auto quick_state_replay_matched = false;
+  auto quick_state_original_digest = sf::core::Sha256Digest{};
+  std::vector<std::byte> quick_state_original_ram(
+      sf::psx::R3000Runtime::ram_size);
+  std::vector<sf::game::LegacyHostPadState> quick_state_replay_pads;
   const auto quick_save_frame = frames / 3U;
   const auto quick_load_frame = frames * 2U / 3U;
+  const auto quick_replay_updates =
+      quick_load_frame > quick_save_frame + 1U
+          ? quick_load_frame - quick_save_frame - 1U
+          : 0U;
+  const auto quick_replay_end_frame =
+      quick_replay_updates == 0U
+          ? quick_load_frame
+          : quick_load_frame + quick_replay_updates - 1U;
   auto objective_previous_x = runtime.diagnostics().player_x;
   auto objective_previous_z = runtime.diagnostics().player_z;
   auto objective_heading = 0.0;
@@ -6565,8 +6579,12 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         return 10;
       }
     }
-    if (quick_state && frame > quick_save_frame &&
-        frame < quick_load_frame) {
+    const auto quick_original_segment =
+        frame > quick_save_frame && frame < quick_load_frame;
+    const auto quick_replay_segment =
+        frame >= quick_load_frame && frame <= quick_replay_end_frame;
+    if (quick_state &&
+        (quick_original_segment || quick_replay_segment)) {
       pad.buttons = 0x0010U;
       pad.left_y = 0x00U;
     } else if (quick_state) {
@@ -6675,6 +6693,17 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
       }
     }
+    if (quick_state && quick_original_segment) {
+      quick_state_replay_pads.push_back(pad);
+    } else if (quick_state && quick_replay_segment) {
+      const auto replay_index =
+          static_cast<std::size_t>(frame - quick_load_frame);
+      if (replay_index >= quick_state_replay_pads.size()) {
+        std::cerr << "SF2 quick-state replay input transcript is incomplete\n";
+        return 10;
+      }
+      pad = quick_state_replay_pads[replay_index];
+    }
     runtime.setHostPadState(pad);
     if (!runtime.advanceHostUpdate()) {
       std::cerr << "SF2 product runtime stopped at frame " << frame << ": "
@@ -6713,6 +6742,51 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       quick_state_saved = frame_diagnostics;
       if (!runtime.captureQuickState()) {
         std::cerr << "SF2 quick-state probe could not capture\n";
+        return 10;
+      }
+    }
+    if (quick_state && frame + 1U == quick_load_frame) {
+      quick_state_original_digest = runtime.guestRamDigestForProbe();
+      if (!runtime.copyGuestRamForProbe(quick_state_original_ram)) {
+        std::cerr << "SF2 quick-state probe could not retain replay RAM\n";
+        return 10;
+      }
+    }
+    if (quick_state && quick_replay_updates != 0U &&
+        frame == quick_replay_end_frame) {
+      const auto replay_digest = runtime.guestRamDigestForProbe();
+      quick_state_replay_matched =
+          replay_digest == quick_state_original_digest;
+      if (!quick_state_replay_matched) {
+        std::cerr << "SF2 quick-state deterministic replay diverged: "
+                  << sf::core::toHex(quick_state_original_digest) << "/"
+                  << sf::core::toHex(replay_digest);
+        std::vector<std::byte> replay_ram(
+            sf::psx::R3000Runtime::ram_size);
+        if (runtime.copyGuestRamForProbe(replay_ram)) {
+          auto reported = std::size_t{};
+          std::cerr << " differences=";
+          for (auto offset = std::size_t{};
+               offset < replay_ram.size() && reported < 32U; ++offset) {
+            if (replay_ram[offset] == quick_state_original_ram[offset]) {
+              continue;
+            }
+            std::cerr << (reported == 0U ? "" : ",") << "0x"
+                      << std::hex << std::uppercase
+                      << (0x80000000U +
+                          static_cast<std::uint32_t>(offset))
+                      << ":" << static_cast<unsigned int>(
+                                     std::to_integer<std::uint8_t>(
+                                         quick_state_original_ram[offset]))
+                      << "/"
+                      << static_cast<unsigned int>(
+                             std::to_integer<std::uint8_t>(
+                                 replay_ram[offset]))
+                      << std::dec;
+            ++reported;
+          }
+        }
+        std::cerr << '\n';
         return 10;
       }
     }
@@ -6895,6 +6969,13 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.last_renderer_ordering_table_base << std::dec
             << "/"
             << diagnostics.last_renderer_ordering_table_buckets
+            << " rejected-renderer-merges="
+            << diagnostics.rejected_renderer_list_merges << ":0x"
+            << std::hex << std::uppercase
+            << diagnostics.last_rejected_renderer_list_descriptor << "/"
+            << diagnostics.last_rejected_renderer_list_root << "/"
+            << diagnostics.last_rejected_renderer_list_cursor << "/"
+            << diagnostics.last_rejected_renderer_list_tag << std::dec
             << " room-textures="
             << diagnostics.room_texture_activations << "/"
             << diagnostics.room_texture_page_requests << "/"
@@ -7155,8 +7236,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                  "PAD cadence, or post-checkpoint stability is missing\n";
     return 8;
   }
-  if (quick_state && !quick_state_restored) {
-    std::cerr << "SF2 quick-state probe did not cross a restore\n";
+  if (quick_state &&
+      (!quick_state_restored || !quick_state_replay_matched)) {
+    std::cerr << "SF2 quick-state probe did not cross an exact deterministic "
+                 "restore/replay\n";
     return 10;
   }
   if (objective_event && !objective_looted) {
@@ -11462,15 +11545,17 @@ int main(int argc, char **argv) {
       if (!mode.empty() && mode != "neutral" && mode != "forward" &&
           mode != "combat" && mode != "crouch" &&
           mode != "objective" && mode != "weapons" &&
-          mode != "quickstate") {
+          mode != "quickstate" && mode != "quickobjective") {
         printUsage();
         return 1;
       }
       return probeSf2ProductRuntime(
           argv[2], argc >= 4 ? parseFrameCount(argv[3]) : 64U,
           mode == "forward", mode == "combat", mode == "crouch",
-          mode == "quickstate",
-          mode == "objective" || mode == "weapons", mode == "weapons",
+          mode == "quickstate" || mode == "quickobjective",
+          mode == "objective" || mode == "weapons" ||
+              mode == "quickobjective",
+          mode == "weapons",
           argc == 6 ? parseSf2MissionIndex(argv[5]) : 2U);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {

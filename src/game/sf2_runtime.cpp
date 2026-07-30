@@ -704,6 +704,7 @@ public:
       state.gpu_gp0_stream = gpu_gp0_stream_;
       state.gpu_gp0_scan = gpu_gp0_scan_;
       state.vram_setup_packets = vram_setup_packets_;
+      state.presentation_frame = presentation_frame_;
       state.callback_ticks = callback_ticks_;
       state.audio_callback_ticks = audio_callback_ticks_;
       state.retrace_ticks = retrace_ticks_;
@@ -739,10 +740,11 @@ public:
         return false;
       }
       open_files_.swap(open_files);
-      // A published OT is host presentation state, not guest machine state.
-      // Replaying it after the native framebuffer and HUD have advanced mixes
-      // two generations. Wait for restored RAM to publish a fresh world OT.
-      presentation_frame_.reset();
+      // The published frame is the visible half of the save state. Restoring
+      // it immediately avoids a black/stale native frame and, critically,
+      // prevents advanceHostUpdate() from consuming extra guest GPU
+      // boundaries while it searches for a replacement authored OT.
+      presentation_frame_ = quick_state_->presentation_frame;
       gpu_gp0_stream_.swap(gpu_gp0_stream);
       vram_setup_packets_.swap(vram_setup_packets);
       gpu_gp0_scan_ = quick_state_->gpu_gp0_scan;
@@ -774,6 +776,18 @@ public:
   }
   [[nodiscard]] bool hasQuickState() const noexcept {
     return quick_state_.has_value();
+  }
+  [[nodiscard]] core::Sha256Digest guestRamDigestForProbe() const noexcept {
+    return core::sha256(vm_.runtime().ram());
+  }
+  [[nodiscard]] bool
+  copyGuestRamForProbe(std::span<std::byte> destination) const noexcept {
+    const auto ram = vm_.runtime().ram();
+    if (destination.size() != ram.size()) {
+      return false;
+    }
+    std::ranges::copy(ram, destination.begin());
+    return true;
   }
   [[nodiscard]] Sf2GuestRuntimeDiagnostics diagnostics() const noexcept {
     auto result = diagnostics_;
@@ -872,6 +886,16 @@ public:
         last_renderer_ordering_table_base_;
     result.last_renderer_ordering_table_buckets =
         last_renderer_ordering_table_buckets_;
+    result.rejected_renderer_list_merges =
+        rejected_renderer_list_merges_;
+    result.last_rejected_renderer_list_descriptor =
+        last_rejected_renderer_list_descriptor_;
+    result.last_rejected_renderer_list_root =
+        last_rejected_renderer_list_root_;
+    result.last_rejected_renderer_list_cursor =
+        last_rejected_renderer_list_cursor_;
+    result.last_rejected_renderer_list_tag =
+        last_rejected_renderer_list_tag_;
     result.room_texture_activations = room_texture_activations_;
     result.room_texture_page_requests = room_texture_page_requests_;
     result.room_texture_upload_completions =
@@ -1646,6 +1670,7 @@ private:
     std::vector<std::uint32_t> gpu_gp0_stream;
     std::size_t gpu_gp0_scan{};
     std::vector<Sf2GpuPacket> vram_setup_packets;
+    std::shared_ptr<const Sf2PresentationFrame> presentation_frame;
     std::uint64_t callback_ticks{};
     std::uint64_t audio_callback_ticks{};
     std::uint64_t retrace_ticks{};
@@ -1873,6 +1898,53 @@ private:
             last_renderer_ordering_table_clamped_ = clamped;
             last_renderer_ordering_table_base_ = base;
             last_renderer_ordering_table_buckets_ = bucket_count;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800f4b00U, [this](LegacyHostCallContext &context) {
+          // Retail merges a per-object packet list into a display OT here.
+          // The packet links are 24-bit physical RAM addresses terminated by
+          // 0x00ffffff. A poisoned/freed list (observed as 0x005a5a5a after
+          // long play and quick-load) otherwise faults at 0x800f4b54. Reject
+          // only the malformed object list; valid retail merges still run
+          // entirely in guest code.
+          constexpr std::uint32_t dma_end = 0x00ffffffU;
+          constexpr std::uint32_t ram_size =
+              static_cast<std::uint32_t>(psx::R3000Runtime::ram_size);
+          constexpr std::size_t maximum_nodes = 65'536U;
+          const auto descriptor = context.argument(0U);
+          std::uint32_t root{};
+          auto cursor = std::uint32_t{};
+          auto tag = std::uint32_t{};
+          auto valid = context.read32(descriptor + 4U, root);
+          cursor = root & dma_end;
+          for (auto node = std::size_t{}; valid && node < maximum_nodes;
+               ++node) {
+            if (cursor == dma_end) {
+              break;
+            }
+            if ((cursor & 3U) != 0U || cursor >= ram_size ||
+                !context.read32(cursor, tag)) {
+              valid = false;
+              break;
+            }
+            cursor = tag & dma_end;
+            if (node + 1U == maximum_nodes && cursor != dma_end) {
+              valid = false;
+            }
+          }
+          if (!valid) {
+            ++rejected_renderer_list_merges_;
+            last_rejected_renderer_list_descriptor_ = descriptor;
+            last_rejected_renderer_list_root_ = root;
+            last_rejected_renderer_list_cursor_ = cursor;
+            last_rejected_renderer_list_tag_ = tag;
+            // The retail return value is the destination descriptor (a1).
+            // Skipping one corrupt object's list is the narrowest recoverable
+            // behavior and avoids mutating the destination OT.
+            context.setReturnValue(context.argument(1U));
+            return;
           }
           context.continueGuestInstruction();
         });
@@ -3056,6 +3128,11 @@ private:
   std::uint32_t last_renderer_ordering_table_clamped_{};
   std::uint32_t last_renderer_ordering_table_base_{};
   std::uint32_t last_renderer_ordering_table_buckets_{};
+  std::uint64_t rejected_renderer_list_merges_{};
+  std::uint32_t last_rejected_renderer_list_descriptor_{};
+  std::uint32_t last_rejected_renderer_list_root_{};
+  std::uint32_t last_rejected_renderer_list_cursor_{};
+  std::uint32_t last_rejected_renderer_list_tag_{};
   std::uint64_t room_texture_activations_{};
   std::uint64_t room_texture_page_requests_{};
   std::uint64_t room_texture_upload_completions_{};
@@ -3205,6 +3282,16 @@ bool Sf2GuestMissionRuntime::restoreQuickState() noexcept {
 
 bool Sf2GuestMissionRuntime::hasQuickState() const noexcept {
   return impl_->hasQuickState();
+}
+
+core::Sha256Digest
+Sf2GuestMissionRuntime::guestRamDigestForProbe() const noexcept {
+  return impl_->guestRamDigestForProbe();
+}
+
+bool Sf2GuestMissionRuntime::copyGuestRamForProbe(
+    std::span<std::byte> destination) const noexcept {
+  return impl_->copyGuestRamForProbe(destination);
 }
 
 const GameRuntimeProfile &sf2RuntimeProfile() noexcept {

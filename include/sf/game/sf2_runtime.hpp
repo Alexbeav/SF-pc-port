@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sf/core/sha256.hpp"
 #include "sf/game/hud.hpp"
 
 #include <array>
@@ -173,6 +174,11 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_renderer_ordering_table_clamped{};
   std::uint32_t last_renderer_ordering_table_base{};
   std::uint32_t last_renderer_ordering_table_buckets{};
+  std::uint64_t rejected_renderer_list_merges{};
+  std::uint32_t last_rejected_renderer_list_descriptor{};
+  std::uint32_t last_rejected_renderer_list_root{};
+  std::uint32_t last_rejected_renderer_list_cursor{};
+  std::uint32_t last_rejected_renderer_list_tag{};
   std::uint64_t room_texture_activations{};
   std::uint64_t room_texture_page_requests{};
   std::uint64_t room_texture_upload_completions{};
@@ -381,6 +387,10 @@ public:
   [[nodiscard]] bool captureQuickState() noexcept;
   [[nodiscard]] bool restoreQuickState() noexcept;
   [[nodiscard]] bool hasQuickState() const noexcept;
+  // Read-only deterministic probe surface; the product does not consume it.
+  [[nodiscard]] core::Sha256Digest guestRamDigestForProbe() const noexcept;
+  [[nodiscard]] bool
+  copyGuestRamForProbe(std::span<std::byte> destination) const noexcept;
 
 private:
   class Impl;

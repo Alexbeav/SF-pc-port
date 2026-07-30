@@ -310,6 +310,7 @@ PsxMachineState PsxMachine::captureState() const {
   *state.spu = spu_.state();
   state.xa_decoder = xa_decoder_.captureState();
   state.timers = timers_.snapshot();
+  state.gpu_gp0_words = gpu_gp0_words_;
   state.pending_cpu_ticks = pending_cpu_ticks_;
   state.device_tick_remainder = device_tick_remainder_;
   return state;
@@ -327,7 +328,8 @@ bool PsxMachine::validateState(const PsxMachineState &state) const noexcept {
       !interrupts.restoreState(state.interrupts) ||
       !dma.restoreState(state.dma) || !cdrom.restoreState(state.cdrom) ||
       state.spu == nullptr || !spu_.validateState(*state.spu) ||
-      !xa_decoder_.validateState(state.xa_decoder)) {
+      !xa_decoder_.validateState(state.xa_decoder) ||
+      state.gpu_gp0_words.size() > maximum_dma_words) {
     return false;
   }
 
@@ -446,6 +448,7 @@ bool PsxMachine::restoreState(const PsxMachineState &state) noexcept {
   static_cast<void>(spu_.restoreState(*state.spu));
   static_cast<void>(xa_decoder_.restoreState(state.xa_decoder));
   timers_.restoreState(state.timers);
+  gpu_gp0_words_ = state.gpu_gp0_words;
   pending_cpu_ticks_ = state.pending_cpu_ticks;
   device_tick_remainder_ = state.device_tick_remainder;
   syncCpuInterruptLine();

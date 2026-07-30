@@ -48,6 +48,10 @@ struct PsxMachineState {
   std::unique_ptr<SpuState> spu{std::make_unique<SpuState>()};
   XaDecoderState xa_decoder;
   RootTimersState timers;
+  // GP0 writes are presentation output, but a save state can be captured
+  // between a guest DMA/write and the SF2 boundary collector draining them.
+  // Preserve that in-flight tail so restore cannot splice GPU generations.
+  std::vector<std::uint32_t> gpu_gp0_words;
   std::uint64_t pending_cpu_ticks{};
   std::uint32_t device_tick_remainder{};
 
@@ -60,6 +64,7 @@ struct PsxMachineState {
         interrupts(other.interrupts), dma(other.dma), cdrom(other.cdrom),
         spu(other.spu ? std::make_unique<SpuState>(*other.spu) : nullptr),
         xa_decoder(other.xa_decoder), timers(other.timers),
+        gpu_gp0_words(other.gpu_gp0_words),
         pending_cpu_ticks(other.pending_cpu_ticks),
         device_tick_remainder(other.device_tick_remainder) {}
 
@@ -82,6 +87,7 @@ struct PsxMachineState {
     }
     xa_decoder = other.xa_decoder;
     timers = other.timers;
+    gpu_gp0_words = other.gpu_gp0_words;
     pending_cpu_ticks = other.pending_cpu_ticks;
     device_tick_remainder = other.device_tick_remainder;
     return *this;
