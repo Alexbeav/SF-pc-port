@@ -14,6 +14,8 @@ constexpr std::uint32_t timer_base = 0x1f801100U;
 constexpr std::uint32_t cdrom_base = 0x1f801800U;
 constexpr std::uint32_t gpu_gp0 = 0x1f801810U;
 constexpr std::uint32_t gpu_gp1 = 0x1f801814U;
+constexpr std::uint32_t mdec_command = 0x1f801820U;
+constexpr std::uint32_t mdec_status = 0x1f801824U;
 constexpr std::uint32_t spu_base = 0x1f801c00U;
 // Native presentation owns rasterization, but retail code still polls the
 // command-ready bits while initializing PsyQ's graphics layer.
@@ -91,6 +93,8 @@ PsxMachine::PsxMachine(R3000Runtime &cpu, CpuClockScale cpu_clock_scale)
   cpu_clock_scale_.denominator /= divisor;
   cpu_.attachMmioBus(this);
   cdrom_.setXaAudioSink(this);
+  dma_ports_[channelIndex(DmaChannel::mdec_in)] = &native_mdec_dma_port_;
+  dma_ports_[channelIndex(DmaChannel::mdec_out)] = &native_mdec_dma_port_;
   dma_ports_[channelIndex(DmaChannel::gpu)] = &native_gpu_dma_port_;
   dma_ports_[channelIndex(DmaChannel::spu)] = &spu_dma_port_;
   reset();
@@ -108,7 +112,14 @@ void PsxMachine::reset() noexcept {
   spu_.reset();
   xa_decoder_.reset();
   timers_.reset();
+  gpu_gp0_words_.clear();
   syncCpuInterruptLine();
+}
+
+std::vector<std::uint32_t> PsxMachine::takeGpuGp0Words() noexcept {
+  auto words = std::move(gpu_gp0_words_);
+  gpu_gp0_words_.clear();
+  return words;
 }
 
 R3000RunResult PsxMachine::step() noexcept {
@@ -210,8 +221,9 @@ bool PsxMachine::completeNextPendingCdRomEvent() noexcept {
   const auto command = cdrom_.commandSchedule();
   const auto sector = cdrom_.sectorSchedule();
   const auto state = scheduler_.captureState();
+  auto selected = static_cast<std::size_t>(state.event_count);
   for (std::size_t index = 0U; index < state.event_count; ++index) {
-    auto event = state.events[index];
+    const auto &event = state.events[index];
     const auto current_command =
         event.type == MachineEventType::cdrom_command && event.index == 0U &&
         command.pending != 0U && event.payload == command.generation;
@@ -221,14 +233,21 @@ bool PsxMachine::completeNextPendingCdRomEvent() noexcept {
     if (!current_command && !current_sector) {
       continue;
     }
-    if (!scheduler_.cancel(event.token)) {
-      return false;
+    if (selected == state.event_count ||
+        event.deadline < state.events[selected].deadline) {
+      selected = index;
     }
-    event.deadline = scheduler_.now();
-    dispatchEvent(event);
-    return true;
   }
-  return false;
+  if (selected == state.event_count) {
+    return false;
+  }
+  auto event = state.events[selected];
+  if (!scheduler_.cancel(event.token)) {
+    return false;
+  }
+  event.deadline = scheduler_.now();
+  dispatchEvent(event);
+  return true;
 }
 
 void PsxMachine::attachDmaPort(DmaChannel channel, DmaPort *port) noexcept {
@@ -524,6 +543,12 @@ bool PsxMachine::readMmio(std::uint32_t physical_address,
     register_value = interrupts_.mask();
   } else if (aligned == gpu_gp1) {
     register_value = native_gpu_status;
+  } else if (aligned == mdec_command || aligned == mdec_status) {
+    // Native presentation does not consume decoded PSX macroblocks. Expose
+    // an idle MDEC device so retail command/DMA ownership can complete; the
+    // paired native DMA port drains input and returns deterministic black
+    // output words.
+    register_value = 0U;
   } else if (aligned >= dma_base &&
              aligned < dma_base + DmaController::register_span) {
     if (!dma_.readRegister(aligned - dma_base, register_value)) {
@@ -636,6 +661,12 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
   } else if (aligned == gpu_gp0 || aligned == gpu_gp1) {
     // The native renderer consumes ordering-table state separately. Accept
     // command writes here so the guest observes a permanently ready GPU.
+    if (aligned == gpu_gp0 && width == R3000AccessWidth::word) {
+      gpu_gp0_words_.push_back(value);
+    }
+  } else if (aligned == mdec_command || aligned == mdec_status) {
+    // Accept command/control writes. The native MDEC DMA port owns the
+    // deterministic no-decode presentation boundary.
   } else if (aligned >= dma_base &&
              aligned < dma_base + DmaController::register_span) {
     std::array<std::uint64_t, DmaController::channel_count> previous_tokens{};

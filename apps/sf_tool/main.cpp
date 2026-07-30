@@ -12,6 +12,7 @@
 #include "sf/game/actor_animation.hpp"
 #include "sf/game/disc_cdrom_media.hpp"
 #include "sf/game/disc_info.hpp"
+#include "sf/game/embedded_hog.hpp"
 #include "sf/game/game_disc.hpp"
 #include "sf/game/gameplay.hpp"
 #include "sf/game/legacy_first_mission_runtime.hpp"
@@ -19,6 +20,7 @@
 #include "sf/game/legacy_mission_image.hpp"
 #include "sf/game/localization.hpp"
 #include "sf/game/mission.hpp"
+#include "sf/game/sf2_runtime.hpp"
 #include "sf/game/title.hpp"
 #include "sf/psx/function_map.hpp"
 
@@ -93,6 +95,12 @@ void printUsage() {
       << "  sf_tool map-xa-streams <game.cue> <output.csv>\n"
       << "  sf_tool probe-legacy-vm <game.cue>\n"
       << "  sf_tool probe-executable-entry <game.cue> [instruction-budget]\n"
+      << "  sf_tool probe-sf2-guest-bootstrap <game.cue> "
+         "[instruction-budget]\n"
+      << "  sf_tool probe-sf2-mission-transition <game.cue> "
+         "[instruction-budget]\n"
+      << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
+         "[forward|combat|crouch]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -696,8 +704,7 @@ int mapXaStreams(const char *cue_path, const char *output_path) {
     std::uint32_t active_clip_sectors{};
     std::vector<Clip> clips;
   };
-  std::map<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t>,
-           StreamSummary>
+  std::map<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t>, StreamSummary>
       streams;
   std::array<std::byte, 2352U> sector{};
   for (std::uint32_t index = 0U; index < sector_count; ++index) {
@@ -707,26 +714,21 @@ int mapXaStreams(const char *cue_path, const char *output_path) {
     }
     constexpr std::size_t subheader = 16U;
     const auto file = std::to_integer<std::uint8_t>(sector[subheader]);
-    const auto channel =
-        std::to_integer<std::uint8_t>(sector[subheader + 1U]);
-    const auto submode =
-        std::to_integer<std::uint8_t>(sector[subheader + 2U]);
-    const auto coding =
-        std::to_integer<std::uint8_t>(sector[subheader + 3U]);
-    const auto repeated =
-        sector[subheader] == sector[subheader + 4U] &&
-        sector[subheader + 1U] == sector[subheader + 5U] &&
-        sector[subheader + 2U] == sector[subheader + 6U] &&
-        sector[subheader + 3U] == sector[subheader + 7U];
+    const auto channel = std::to_integer<std::uint8_t>(sector[subheader + 1U]);
+    const auto submode = std::to_integer<std::uint8_t>(sector[subheader + 2U]);
+    const auto coding = std::to_integer<std::uint8_t>(sector[subheader + 3U]);
+    const auto repeated = sector[subheader] == sector[subheader + 4U] &&
+                          sector[subheader + 1U] == sector[subheader + 5U] &&
+                          sector[subheader + 2U] == sector[subheader + 6U] &&
+                          sector[subheader + 3U] == sector[subheader + 7U];
     constexpr std::uint8_t audio_bit = 0x04U;
     constexpr std::uint8_t form2_bit = 0x20U;
-    if (!repeated || (submode & (audio_bit | form2_bit)) !=
-                         (audio_bit | form2_bit)) {
+    if (!repeated ||
+        (submode & (audio_bit | form2_bit)) != (audio_bit | form2_bit)) {
       continue;
     }
-    auto [position, inserted] =
-        streams.try_emplace({file, channel, coding},
-                            StreamSummary{index, index, 0U, 0U, 0U, 0U});
+    auto [position, inserted] = streams.try_emplace(
+        {file, channel, coding}, StreamSummary{index, index, 0U, 0U, 0U, 0U});
     auto &summary = position->second;
     if (!inserted && index > summary.last_sector + 1U) {
       summary.largest_gap =
@@ -739,7 +741,8 @@ int mapXaStreams(const char *cue_path, const char *output_path) {
     }
     ++summary.active_clip_sectors;
     summary.eof_sectors += (submode & 0x80U) != 0U ? 1U : 0U;
-    summary.submode_or = static_cast<std::uint8_t>(summary.submode_or | submode);
+    summary.submode_or =
+        static_cast<std::uint8_t>(summary.submode_or | submode);
     if ((submode & 0x80U) != 0U) {
       summary.clips.push_back(StreamSummary::Clip{
           summary.active_clip_first, index, summary.active_clip_sectors, true});
@@ -749,9 +752,9 @@ int mapXaStreams(const char *cue_path, const char *output_path) {
   for (auto &[key, summary] : streams) {
     static_cast<void>(key);
     if (summary.active_clip_sectors != 0U) {
-      summary.clips.push_back(StreamSummary::Clip{
-          summary.active_clip_first, summary.last_sector,
-          summary.active_clip_sectors, false});
+      summary.clips.push_back(
+          StreamSummary::Clip{summary.active_clip_first, summary.last_sector,
+                              summary.active_clip_sectors, false});
       summary.active_clip_sectors = 0U;
     }
   }
@@ -776,17 +779,16 @@ int mapXaStreams(const char *cue_path, const char *output_path) {
              << std::uppercase << static_cast<unsigned int>(coding) << std::dec
              << ',' << ((coding & 1U) != 0U ? 1 : 0) << ','
              << ((coding & 4U) != 0U ? 18900 : 37800) << ',' << clip_index
-             << ',' << clip.sectors << ',' << std::fixed
-             << std::setprecision(3)
+             << ',' << clip.sectors << ',' << std::fixed << std::setprecision(3)
              << static_cast<double>(clip.sectors) / 75.0 << std::defaultfloat
              << ',' << clip.first_sector << ',' << clip.last_sector << ','
              << entry.extent_lba + clip.first_sector << ','
-             << entry.extent_lba + clip.last_sector << ','
-             << (clip.eof ? 1 : 0) << ',' << summary.sectors << ','
-             << std::fixed << std::setprecision(3)
-             << static_cast<double>(summary.sectors) / 75.0
-             << std::defaultfloat << ',' << summary.clips.size() << ','
-             << summary.largest_gap << ",0x" << std::hex << std::uppercase
+             << entry.extent_lba + clip.last_sector << ',' << (clip.eof ? 1 : 0)
+             << ',' << summary.sectors << ',' << std::fixed
+             << std::setprecision(3)
+             << static_cast<double>(summary.sectors) / 75.0 << std::defaultfloat
+             << ',' << summary.clips.size() << ',' << summary.largest_gap
+             << ",0x" << std::hex << std::uppercase
              << static_cast<unsigned int>(summary.submode_or) << std::dec
              << '\n';
     }
@@ -842,8 +844,9 @@ int inspectDiscInfo(const char *cue_path) {
                   : std::span<const sf::game::GameMissionResource>{};
   std::cout << "index,title,available-on-disc,resource\n";
   for (const auto &entry : titles) {
-    const auto resource = std::ranges::find(
-        resources, entry.index, &sf::game::GameMissionResource::selection_index);
+    const auto resource =
+        std::ranges::find(resources, entry.index,
+                          &sf::game::GameMissionResource::selection_index);
     std::cout << entry.index << ',' << std::quoted(entry.title) << ','
               << (resource != resources.end() ? "yes" : "no") << ','
               << (resource != resources.end() ? resource->resource_name
@@ -858,9 +861,8 @@ int inspectMissionArchive(const char *cue_path,
   auto disc = openDisc(cue_path);
   auto resource = std::string{resource_name};
   std::ranges::transform(resource, resource.begin(), [](char value) {
-    return value >= 'a' && value <= 'z'
-               ? static_cast<char>(value - ('a' - 'A'))
-               : value;
+    return value >= 'a' && value <= 'z' ? static_cast<char>(value - ('a' - 'A'))
+                                        : value;
   });
   const auto archive_directory =
       disc.game() ? disc.game()->layout.mission_archive_directory
@@ -873,16 +875,16 @@ int inspectMissionArchive(const char *cue_path,
       sf::game::LegacyMissionImage::load(disc, archive, archive_path);
   static_cast<void>(legacy_image.createVirtualCd());
   const auto world_model_bytes = archive.file("WLDEMD.HOG");
-  const auto world_models = sf::assets::HogArchive::parse(
-      std::vector<std::byte>{world_model_bytes.begin(),
-                             world_model_bytes.end()});
+  const auto world_models =
+      sf::assets::HogArchive::parse(std::vector<std::byte>{
+          world_model_bytes.begin(), world_model_bytes.end()});
   std::optional<sf::assets::LevelLayout> layout;
   std::optional<sf::assets::MissionObjects> objects;
   std::string layout_error;
   std::string objects_error;
   try {
-    layout = sf::assets::LevelLayout::parse(
-        archive.file(resource + ".DAT"), world_models.entries().size());
+    layout = sf::assets::LevelLayout::parse(archive.file(resource + ".DAT"),
+                                            world_models.entries().size());
   } catch (const sf::core::Error &error) {
     layout_error = error.what();
   }
@@ -899,11 +901,10 @@ int inspectMissionArchive(const char *cue_path,
       continue;
     }
     const auto bytes = archive.file(entry.name);
-    texture_count +=
-        sf::assets::HogArchive::parse(
-            std::vector<std::byte>{bytes.begin(), bytes.end()})
-            .entries()
-            .size();
+    texture_count += sf::assets::HogArchive::parse(
+                         std::vector<std::byte>{bytes.begin(), bytes.end()})
+                         .entries()
+                         .size();
   }
   std::cout << "resource=" << resource
             << " archive-files=" << archive.entries().size()
@@ -1042,8 +1043,7 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
         name.push_back('0');
       }
       name += std::to_string(page) + ".BIN";
-      return mission
-          .textureBank(static_cast<std::size_t>(canonical_bank(bank)))
+      return mission.textureBank(static_cast<std::size_t>(canonical_bank(bank)))
           .file(name);
     };
     const auto require_page = [&](unsigned int page, int bank) {
@@ -1179,8 +1179,7 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
             << mission.objects().player().transform.z << " yaw "
             << gameplay.player().yaw << '\n'
             << "Initial weapon:  "
-            << static_cast<unsigned int>(
-                   gameplay.hud().inventory().current())
+            << static_cast<unsigned int>(gameplay.hud().inventory().current())
             << " (" << gameplay.hud().inventory().currentDefinition().name
             << "), armor " << gameplay.hud().vitals().armor << ", timer "
             << (gameplay.nativeMissionTimerSeconds()
@@ -1204,8 +1203,9 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
             << running_root_distance << " (frames/world units)\n\n"
             << "name,start_sector,sector_count,size\n";
   std::cout << "Initial visibility:";
-  for (const auto model :
-       mission.layout().visibility(mission.layout().initialRoom()).active_models) {
+  for (const auto model : mission.layout()
+                              .visibility(mission.layout().initialRoom())
+                              .active_models) {
     std::cout << ' ' << model;
   }
   std::cout << "\nResident models:";
@@ -1215,7 +1215,8 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
   std::cout << "\nResident visibility:";
   for (const auto resident : mission.layout().residentModels()) {
     std::cout << " [" << resident << ':';
-    for (const auto model : mission.layout().visibility(resident).active_models) {
+    for (const auto model :
+         mission.layout().visibility(resident).active_models) {
       std::cout << ' ' << model;
     }
     std::cout << ']';
@@ -1227,10 +1228,9 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
     }
     const auto &world = gameplay.models()[model];
     std::cout << model << ',' << world.name << ',' << world.bounds.minimum_x
-              << ',' << world.bounds.minimum_y << ','
-              << world.bounds.minimum_z << ',' << world.bounds.maximum_x
-              << ',' << world.bounds.maximum_y << ','
-              << world.bounds.maximum_z << '\n';
+              << ',' << world.bounds.minimum_y << ',' << world.bounds.minimum_z
+              << ',' << world.bounds.maximum_x << ',' << world.bounds.maximum_y
+              << ',' << world.bounds.maximum_z << '\n';
   }
   std::cout << "Object definitions:\n";
   for (std::size_t index = 0; index < mission.objects().definitions().size();
@@ -1316,7 +1316,8 @@ int inspectMission(const char *cue_path, std::uint32_t mission_index) {
   return 0;
 }
 
-std::vector<std::uint32_t> sequelOverlayExecutableSeeds(sf::game::GameDisc &disc);
+std::vector<std::uint32_t>
+sequelOverlayExecutableSeeds(sf::game::GameDisc &disc);
 std::vector<std::pair<std::uint32_t, std::uint32_t>>
 embeddedArchiveExactDataRanges(std::span<const std::byte> text,
                                std::uint32_t load_address);
@@ -1331,8 +1332,8 @@ int mapFunctions(const char *cue_path, const char *output_path) {
       executable.text(), header.text_address, header.initial_pc, true,
       overlay_seeds);
   const std::set overlay_seed_set(overlay_seeds.begin(), overlay_seeds.end());
-  const auto asset_ranges = embeddedArchiveExactDataRanges(
-      executable.text(), header.text_address);
+  const auto asset_ranges =
+      embeddedArchiveExactDataRanges(executable.text(), header.text_address);
   const auto in_asset_range = [&](std::uint32_t address) {
     return std::ranges::any_of(asset_ranges, [&](const auto &range) {
       return address >= range.first && address < range.second;
@@ -1344,10 +1345,11 @@ int mapFunctions(const char *cue_path, const char *output_path) {
     throw sf::core::Error{sf::core::ErrorCode::io,
                           "Cannot open function-map output"};
   }
-  output << "address,static_call_sites,instructions,direct_callees,has_return,"
-            "overlay_referenced,embedded_asset_range,seed_evidence,exact_sha256,"
-            "structural_sha256\n"
-         << std::hex << std::uppercase;
+  output
+      << "address,static_call_sites,instructions,direct_callees,has_return,"
+         "overlay_referenced,embedded_asset_range,seed_evidence,exact_sha256,"
+         "structural_sha256\n"
+      << std::hex << std::uppercase;
   for (const auto &candidate : candidates) {
     output << "0x" << candidate.address << ',' << std::dec
            << candidate.static_call_count << ',' << candidate.instruction_count
@@ -1367,9 +1369,8 @@ int mapFunctions(const char *cue_path, const char *output_path) {
     } else {
       output << "prologue_only";
     }
-    output << ','
-           << candidate.exact_sha256 << ',' << candidate.structural_sha256
-           << '\n'
+    output << ',' << candidate.exact_sha256 << ','
+           << candidate.structural_sha256 << '\n'
            << std::hex;
   }
   if (!output) {
@@ -1404,8 +1405,8 @@ int mapFunctionUnion(const char *left_cue_path, const char *right_cue_path,
   const auto candidates = sf::psx::fingerprintFunctionCandidates(
       executable.text(), header.text_address, header.initial_pc, true,
       union_seeds);
-  const auto asset_ranges = embeddedArchiveExactDataRanges(
-      executable.text(), header.text_address);
+  const auto asset_ranges =
+      embeddedArchiveExactDataRanges(executable.text(), header.text_address);
   const auto in_asset_range = [&](std::uint32_t address) {
     return std::ranges::any_of(asset_ranges, [&](const auto &range) {
       return address >= range.first && address < range.second;
@@ -1428,8 +1429,8 @@ int mapFunctionUnion(const char *left_cue_path, const char *right_cue_path,
     output << "0x" << candidate.address << ',' << std::dec
            << candidate.static_call_count << ',' << candidate.instruction_count
            << ',' << candidate.direct_callee_count << ','
-           << (candidate.has_return ? 1 : 0) << ','
-           << (left_overlay ? 1 : 0) << ',' << (right_overlay ? 1 : 0) << ','
+           << (candidate.has_return ? 1 : 0) << ',' << (left_overlay ? 1 : 0)
+           << ',' << (right_overlay ? 1 : 0) << ','
            << (in_asset_range(candidate.address) ? 1 : 0) << ',';
     if (candidate.address == header.initial_pc) {
       output << "entry";
@@ -1467,8 +1468,8 @@ int mapFunctionCalls(const char *cue_path, const char *output_path) {
       overlay_seeds);
   const auto calls =
       sf::psx::discoverDirectCalls(executable.text(), header.text_address);
-  const auto asset_ranges = embeddedArchiveExactDataRanges(
-      executable.text(), header.text_address);
+  const auto asset_ranges =
+      embeddedArchiveExactDataRanges(executable.text(), header.text_address);
   const auto in_asset_range = [&](std::uint32_t address) {
     return std::ranges::any_of(asset_ranges, [&](const auto &range) {
       return address >= range.first && address < range.second;
@@ -1498,9 +1499,8 @@ int mapFunctionCalls(const char *cue_path, const char *output_path) {
       continue;
     }
     output << "0x" << function.address << ",0x" << call.site << ",0x"
-           << call.target << ',' << std::dec
-           << (call.target_in_text ? 1 : 0) << ','
-           << (in_asset_range(call.site) ? 1 : 0) << '\n'
+           << call.target << ',' << std::dec << (call.target_in_text ? 1 : 0)
+           << ',' << (in_asset_range(call.site) ? 1 : 0) << '\n'
            << std::hex;
     ++mapped_calls;
   }
@@ -1521,8 +1521,7 @@ int compareFunctions(const char *left_cue_path, const char *right_cue_path,
   const auto &right_executable = right_disc.executable();
   auto left_seed_disc = openDisc(left_cue_path);
   auto right_seed_disc = openDisc(right_cue_path);
-  const auto left_overlay_seeds =
-      sequelOverlayExecutableSeeds(left_seed_disc);
+  const auto left_overlay_seeds = sequelOverlayExecutableSeeds(left_seed_disc);
   const auto right_overlay_seeds =
       sequelOverlayExecutableSeeds(right_seed_disc);
   const auto left = sf::psx::fingerprintFunctionCandidates(
@@ -1640,9 +1639,8 @@ std::uint32_t sequelMissionOverlayCodeAddress(std::size_t code_offset) {
 std::size_t sequelOverlayContentSize(std::span<const std::byte> bytes,
                                      std::size_t code_offset) {
   auto end = bytes.size();
-  while (end > code_offset &&
-         (bytes[end - 1U] == std::byte{0xcd} ||
-          bytes[end - 1U] == std::byte{0})) {
+  while (end > code_offset && (bytes[end - 1U] == std::byte{0xcd} ||
+                               bytes[end - 1U] == std::byte{0})) {
     --end;
   }
   end = std::min(bytes.size(), (end + 3U) & ~std::size_t{3U});
@@ -1670,22 +1668,18 @@ sequelResidentOverlayDefinitions(sf::game::GameId game) {
     // SF3's larger TITLE2 image ends exactly where INIT begins:
     // 0x80150950 + sizeof(TITLE2.OVL) == 0x8015e978.
     return {
-        {"MENU.OVL", 0x80146950U},
-        {"MENU2.OVL", 0x80146950U},
-        {"MOVIE.OVL", 0x80146950U},
-        {"TITLE.OVL", 0x80150950U},
-        {"TITLE2.OVL", 0x80150950U},
-        {"INIT.OVL", 0x8015e978U},
+        {"MENU.OVL", 0x80146950U},   {"MENU2.OVL", 0x80146950U},
+        {"MOVIE.OVL", 0x80146950U},  {"TITLE.OVL", 0x80150950U},
+        {"TITLE2.OVL", 0x80150950U}, {"INIT.OVL", 0x8015e978U},
     };
   }
   return {};
 }
 
-std::size_t sequelResidentOverlayCodeOffset(
-    std::span<const std::byte> bytes, std::uint32_t load_address) {
+std::size_t sequelResidentOverlayCodeOffset(std::span<const std::byte> bytes,
+                                            std::uint32_t load_address) {
   auto first_internal_target = bytes.size();
-  for (const auto &call :
-       sf::psx::discoverDirectCalls(bytes, load_address)) {
+  for (const auto &call : sf::psx::discoverDirectCalls(bytes, load_address)) {
     if (call.target_in_text) {
       first_internal_target =
           std::min(first_internal_target,
@@ -1703,34 +1697,30 @@ std::span<const std::byte>
 readResidentOverlay(sf::game::GameDisc &disc,
                     const ResidentOverlayDefinition &definition,
                     std::vector<std::byte> &storage) {
-  storage = disc.image().readFile(
-      "BIN/" + std::string{definition.name});
+  storage = disc.image().readFile("BIN/" + std::string{definition.name});
   return storage;
 }
 
 std::vector<std::uint32_t>
 sequelOverlayExecutableSeeds(sf::game::GameDisc &disc) {
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     return {};
   }
   std::set<std::uint32_t> result;
   const auto text_begin = disc.executable().header().text_address;
-  const auto text_end =
-      text_begin + disc.executable().header().text_size;
+  const auto text_end = text_begin + disc.executable().header().text_size;
   for (const auto &definition :
        sequelResidentOverlayDefinitions(disc.game()->id)) {
     std::vector<std::byte> storage;
-    const auto overlay_bytes =
-        readResidentOverlay(disc, definition, storage);
-    const auto code_offset = sequelResidentOverlayCodeOffset(
-        overlay_bytes, definition.load_address);
-    const auto code_size =
-        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto overlay_bytes = readResidentOverlay(disc, definition, storage);
+    const auto code_offset =
+        sequelResidentOverlayCodeOffset(overlay_bytes, definition.load_address);
+    const auto code_size = sequelOverlayContentSize(overlay_bytes, code_offset);
     for (const auto &call : sf::psx::discoverDirectCalls(
              overlay_bytes.subspan(code_offset, code_size),
-             definition.load_address + static_cast<std::uint32_t>(code_offset))) {
+             definition.load_address +
+                 static_cast<std::uint32_t>(code_offset))) {
       if (!call.target_in_text && call.target >= text_begin &&
           call.target < text_end) {
         result.insert(call.target);
@@ -1744,8 +1734,7 @@ sequelOverlayExecutableSeeds(sf::game::GameDisc &disc) {
         std::string{resource.resource_name} + ".FOG";
     const auto archive =
         sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
-    const auto specific_overlay =
-        std::string{resource.resource_name} + ".OVL";
+    const auto specific_overlay = std::string{resource.resource_name} + ".OVL";
     const auto has_specific_overlay =
         std::ranges::any_of(archive.entries(), [&](const auto &entry) {
           return entry.name == specific_overlay;
@@ -1754,12 +1743,10 @@ sequelOverlayExecutableSeeds(sf::game::GameDisc &disc) {
         has_specific_overlay ? specific_overlay : std::string{"GENERIC.OVL"};
     const auto overlay_bytes = archive.file(overlay_name);
     const auto code_offset = sequelOverlayCodeOffset(overlay_bytes);
-    const auto code_size =
-        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto code_size = sequelOverlayContentSize(overlay_bytes, code_offset);
     const auto code_address = sequelMissionOverlayCodeAddress(code_offset);
     for (const auto &call : sf::psx::discoverDirectCalls(
-             overlay_bytes.subspan(code_offset, code_size),
-             code_address)) {
+             overlay_bytes.subspan(code_offset, code_size), code_address)) {
       if (!call.target_in_text && call.target >= text_begin &&
           call.target < text_end) {
         result.insert(call.target);
@@ -1771,9 +1758,8 @@ sequelOverlayExecutableSeeds(sf::game::GameDisc &disc) {
 
 int mapResidentOverlays(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Resident-overlay mapping requires a recognized sequel disc"};
@@ -1793,12 +1779,10 @@ int mapResidentOverlays(const char *cue_path, const char *output_path) {
   for (const auto &definition :
        sequelResidentOverlayDefinitions(disc.game()->id)) {
     std::vector<std::byte> storage;
-    const auto overlay_bytes =
-        readResidentOverlay(disc, definition, storage);
-    const auto code_offset = sequelResidentOverlayCodeOffset(
-        overlay_bytes, definition.load_address);
-    const auto code_size =
-        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto overlay_bytes = readResidentOverlay(disc, definition, storage);
+    const auto code_offset =
+        sequelResidentOverlayCodeOffset(overlay_bytes, definition.load_address);
+    const auto code_size = sequelOverlayContentSize(overlay_bytes, code_offset);
     const auto code = overlay_bytes.subspan(code_offset, code_size);
     const auto code_address =
         definition.load_address + static_cast<std::uint32_t>(code_offset);
@@ -1842,16 +1826,14 @@ int mapResidentOverlays(const char *cue_path, const char *output_path) {
                           "Failed to write resident-overlay map"};
   }
   std::cout << "Mapped " << function_count << " function seeds across "
-            << overlay_count << " resident overlays to " << output_path
-            << '\n';
+            << overlay_count << " resident overlays to " << output_path << '\n';
   return 0;
 }
 
 int mapMissionOverlays(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission overlay mapping requires a recognized sequel disc"};
@@ -1876,8 +1858,7 @@ int mapMissionOverlays(const char *cue_path, const char *output_path) {
         std::string{resource.resource_name} + ".FOG";
     const auto archive =
         sf::assets::FogArchive::parse(disc.image().readFile(archive_path));
-    const auto specific_overlay =
-        std::string{resource.resource_name} + ".OVL";
+    const auto specific_overlay = std::string{resource.resource_name} + ".OVL";
     const auto has_specific_overlay =
         std::ranges::any_of(archive.entries(), [&](const auto &entry) {
           return entry.name == specific_overlay;
@@ -1886,14 +1867,12 @@ int mapMissionOverlays(const char *cue_path, const char *output_path) {
         has_specific_overlay ? specific_overlay : std::string{"GENERIC.OVL"};
     const auto overlay_bytes = archive.file(overlay_name);
     const auto code_offset = sequelOverlayCodeOffset(overlay_bytes);
-    const auto code_size =
-        sequelOverlayContentSize(overlay_bytes, code_offset);
+    const auto code_size = sequelOverlayContentSize(overlay_bytes, code_offset);
     const auto code = overlay_bytes.subspan(code_offset, code_size);
     const auto code_address = sequelMissionOverlayCodeAddress(code_offset);
     const auto functions = sf::psx::fingerprintFunctionCandidates(
         code, code_address, code_address, true);
-    const auto calls =
-        sf::psx::discoverDirectCalls(code, code_address);
+    const auto calls = sf::psx::discoverDirectCalls(code, code_address);
 
     for (const auto &function : functions) {
       std::set<std::uint32_t> external_targets;
@@ -1907,13 +1886,12 @@ int mapMissionOverlays(const char *cue_path, const char *output_path) {
         }
       }
       output << resource.selection_index << ',' << resource.resource_name << ','
-             << overlay_name << ',' << overlay_bytes.size() << ','
-             << "0x" << std::hex << std::uppercase
-             << sequelMissionOverlayLoadAddress << std::dec << ','
-             << code_offset << ",0x" << std::hex << std::uppercase
-             << code_address << std::dec << ',' << code_size << ",0x"
-             << std::hex << std::uppercase << function.address << std::dec << ','
-             << function.instruction_count << ','
+             << overlay_name << ',' << overlay_bytes.size() << ',' << "0x"
+             << std::hex << std::uppercase << sequelMissionOverlayLoadAddress
+             << std::dec << ',' << code_offset << ",0x" << std::hex
+             << std::uppercase << code_address << std::dec << ',' << code_size
+             << ",0x" << std::hex << std::uppercase << function.address
+             << std::dec << ',' << function.instruction_count << ','
              << function.static_call_count << ','
              << function.direct_callee_count << ','
              << (function.has_return ? 1 : 0) << ',' << function.exact_sha256
@@ -1942,9 +1920,8 @@ void writeCsvString(std::ostream &output, std::string_view value);
 
 int mapMissionClasses(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-class mapping requires a recognized sequel disc"};
@@ -1997,9 +1974,8 @@ int mapMissionClasses(const char *cue_path, const char *output_path) {
 
 int mapMissionObjects(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-object mapping requires a recognized sequel disc"};
@@ -2054,9 +2030,8 @@ int mapMissionObjects(const char *cue_path, const char *output_path) {
       for (const auto parameter : object.handler_parameters) {
         output << ',' << parameter;
       }
-      output << ',' << object.handler_state << ','
-             << object.patrol_path.size() << ','
-             << (object.patrol_path_loops ? 1 : 0) << ','
+      output << ',' << object.handler_state << ',' << object.patrol_path.size()
+             << ',' << (object.patrol_path_loops ? 1 : 0) << ','
              << static_cast<unsigned int>(object.patrol_loop_start) << '\n';
       ++object_count;
     }
@@ -2075,9 +2050,8 @@ int mapMissionObjects(const char *cue_path, const char *output_path) {
 
 int mapMissionScriptStrings(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-script string mapping requires a recognized sequel disc"};
@@ -2117,8 +2091,8 @@ int mapMissionScriptStrings(const char *cue_path, const char *output_path) {
         std::string value;
         value.reserve(end - offset);
         for (auto cursor = offset; cursor < end; ++cursor) {
-          value.push_back(static_cast<char>(
-              std::to_integer<unsigned char>(bytes[cursor])));
+          value.push_back(
+              static_cast<char>(std::to_integer<unsigned char>(bytes[cursor])));
         }
         output << resource.selection_index << ',' << resource.resource_name
                << ',' << bytes.size() << ',' << digest << ',' << offset << ',';
@@ -2143,9 +2117,8 @@ int mapMissionScriptStrings(const char *cue_path, const char *output_path) {
 
 int mapMissionScripts(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-script mapping requires a recognized sequel disc"};
@@ -2195,7 +2168,8 @@ int mapMissionScripts(const char *cue_path, const char *output_path) {
     throw sf::core::Error{sf::core::ErrorCode::io,
                           "Failed to write mission-script map"};
   }
-  std::cout << "Mapped " << program_count << " compiled mission programs across "
+  std::cout << "Mapped " << program_count
+            << " compiled mission programs across "
             << sf::game::missionResources(disc.game()->id,
                                           disc.game()->disc_number)
                    .size()
@@ -2205,9 +2179,8 @@ int mapMissionScripts(const char *cue_path, const char *output_path) {
 
 int mapMissionScriptEvents(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-script event mapping requires a recognized sequel disc"};
@@ -2241,9 +2214,9 @@ int mapMissionScriptEvents(const char *cue_path, const char *output_path) {
                << ',' << program_index << ',';
         writeCsvString(output, program.name);
         output << ',' << event_index << ',' << event.relative_offset << ",0x"
-               << std::hex << std::uppercase << event.encoded_header
-               << std::dec << ',' << static_cast<unsigned>(event.event_id)
-               << ",0x" << std::hex << std::uppercase
+               << std::hex << std::uppercase << event.encoded_header << std::dec
+               << ',' << static_cast<unsigned>(event.event_id) << ",0x"
+               << std::hex << std::uppercase
                << static_cast<unsigned>(event.event_flags) << ",0x"
                << event.selector << std::dec << ','
                << static_cast<unsigned>(event.length_halfwords) << ','
@@ -2279,9 +2252,8 @@ std::uint16_t readAnalysisHalfword(std::span<const std::byte> bytes,
 
 int mapMissionScriptOpcodes(const char *cue_path, const char *output_path) {
   const auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-script opcode mapping requires a recognized sequel disc"};
@@ -2329,8 +2301,7 @@ int mapMissionScriptOpcodes(const char *cue_path, const char *output_path) {
     const auto table_offset =
         static_cast<std::size_t>(table_address - text_address);
     for (std::size_t opcode = 0; opcode < opcode_count; ++opcode) {
-      const auto descriptor_offset =
-          table_offset + opcode * descriptor_size;
+      const auto descriptor_offset = table_offset + opcode * descriptor_size;
       const auto handler = readAnalysisWord(text, descriptor_offset);
       const auto metadata_0 =
           readAnalysisHalfword(text, descriptor_offset + 4U);
@@ -2339,12 +2310,11 @@ int mapMissionScriptOpcodes(const char *cue_path, const char *output_path) {
       const auto handler_in_executable =
           handler >= text_address &&
           static_cast<std::uint64_t>(handler - text_address) < text.size();
-      output << table_names[table_index] << ",0x"
-             << std::hex << std::uppercase << table_address << ",0x"
-             << opcode << std::dec << ',' << (handler != 0U ? 1 : 0)
-             << ",0x" << std::hex << std::uppercase << handler << ",0x"
-             << metadata_0 << ",0x" << metadata_1 << std::dec << ','
-             << (handler_in_executable ? 1 : 0) << '\n';
+      output << table_names[table_index] << ",0x" << std::hex << std::uppercase
+             << table_address << ",0x" << opcode << std::dec << ','
+             << (handler != 0U ? 1 : 0) << ",0x" << std::hex << std::uppercase
+             << handler << ",0x" << metadata_0 << ",0x" << metadata_1
+             << std::dec << ',' << (handler_in_executable ? 1 : 0) << '\n';
       populated += handler != 0U ? 1U : 0U;
     }
   }
@@ -2362,9 +2332,8 @@ int mapMissionScriptOpcodes(const char *cue_path, const char *output_path) {
 int mapMissionScriptHandlerCalls(const char *cue_path,
                                  const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-script handler call mapping requires a recognized sequel "
@@ -2417,9 +2386,8 @@ int mapMissionScriptHandlerCalls(const char *cue_path,
 
   std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
   if (!output) {
-    throw sf::core::Error{
-        sf::core::ErrorCode::io,
-        "Cannot open mission-script handler-call map output"};
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Cannot open mission-script handler-call map output"};
   }
   output << "table,opcode,handler_address,call_site,target,"
             "target_in_executable\n";
@@ -2437,9 +2405,8 @@ int mapMissionScriptHandlerCalls(const char *cue_path,
       for (auto edge = begin; edge != end; ++edge) {
         output << table_names[table_index] << ",0x" << std::hex
                << std::uppercase << opcode << ",0x" << handler << ",0x"
-               << edge->second.site << ",0x" << edge->second.target
-               << std::dec << ',' << (edge->second.target_in_text ? 1 : 0)
-               << '\n';
+               << edge->second.site << ",0x" << edge->second.target << std::dec
+               << ',' << (edge->second.target_in_text ? 1 : 0) << '\n';
         ++edge_count;
         physical_edges.emplace(edge->second.site, edge->second.target);
         physical_handlers.emplace(handler);
@@ -2447,9 +2414,8 @@ int mapMissionScriptHandlerCalls(const char *cue_path,
     }
   }
   if (!output) {
-    throw sf::core::Error{
-        sf::core::ErrorCode::io,
-        "Failed to write mission-script handler-call map"};
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script handler-call map"};
   }
   std::cout << "Mapped " << edge_count << " descriptor-associated rows ("
             << physical_edges.size() << " unique direct calls from "
@@ -2488,22 +2454,21 @@ int compareMissionScriptOpcodes(const char *left_cue_path,
                               std::uint32_t root, std::uint32_t delta,
                               std::size_t opcode) {
     const auto &executable = disc.executable();
-    const auto address = root + delta +
-                         static_cast<std::uint32_t>(opcode * descriptor_size);
-    const auto offset = static_cast<std::size_t>(
-        address - executable.header().text_address);
+    const auto address =
+        root + delta + static_cast<std::uint32_t>(opcode * descriptor_size);
+    const auto offset =
+        static_cast<std::size_t>(address - executable.header().text_address);
     if (offset > executable.text().size() ||
         executable.text().size() - offset < descriptor_size) {
       throw sf::core::Error{
           sf::core::ErrorCode::invalid_format,
           "Mission-script opcode descriptor is outside executable text"};
     }
-    return std::array{
-        readAnalysisWord(executable.text(), offset),
-        static_cast<std::uint32_t>(
-            readAnalysisHalfword(executable.text(), offset + 4U)),
-        static_cast<std::uint32_t>(
-            readAnalysisHalfword(executable.text(), offset + 6U))};
+    return std::array{readAnalysisWord(executable.text(), offset),
+                      static_cast<std::uint32_t>(
+                          readAnalysisHalfword(executable.text(), offset + 4U)),
+                      static_cast<std::uint32_t>(readAnalysisHalfword(
+                          executable.text(), offset + 6U))};
   };
 
   std::ofstream output{std::filesystem::path{output_path}, std::ios::trunc};
@@ -2533,9 +2498,8 @@ int compareMissionScriptOpcodes(const char *left_cue_path,
     }
   }
   if (!output) {
-    throw sf::core::Error{
-        sf::core::ErrorCode::io,
-        "Failed to write mission-script opcode comparison"};
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Failed to write mission-script opcode comparison"};
   }
   std::cout << "Compared " << table_deltas.size() * opcode_count
             << " aligned mission-script descriptor slots to " << output_path
@@ -2545,9 +2509,8 @@ int compareMissionScriptOpcodes(const char *left_cue_path,
 
 int mapMissionScriptActions(const char *cue_path, const char *output_path) {
   auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Mission-script action mapping requires a recognized sequel disc"};
@@ -2624,8 +2587,8 @@ int mapMissionScriptActions(const char *cue_path, const char *output_path) {
                     std::to_string(event_begin) + ".." +
                     std::to_string(event_end) + ')'};
           }
-          const auto encoded = readAnalysisHalfword(
-              bytes, program.offset + instruction_offset);
+          const auto encoded =
+              readAnalysisHalfword(bytes, program.offset + instruction_offset);
           const auto high = static_cast<std::uint8_t>(encoded >> 8U);
           const auto low = static_cast<std::uint8_t>(encoded & 0xffU);
           std::string_view kind{"action"};
@@ -2651,8 +2614,8 @@ int mapMissionScriptActions(const char *cue_path, const char *output_path) {
                   sf::core::ErrorCode::invalid_format,
                   "Truncated mission-script predicate branch"};
             }
-            next_offset = instruction_offset +
-                          static_cast<std::size_t>(low) * 2U;
+            next_offset =
+                instruction_offset + static_cast<std::size_t>(low) * 2U;
             alternate_offset =
                 instruction_offset +
                 static_cast<std::size_t>(readAnalysisHalfword(
@@ -2666,18 +2629,16 @@ int mapMissionScriptActions(const char *cue_path, const char *output_path) {
                    : high == 0xfcU ? "control"
                    : high == 0xfaU ? "skip"
                                    : "formatted_text";
-            next_offset = instruction_offset +
-                          static_cast<std::size_t>(low) * 2U;
+            next_offset =
+                instruction_offset + static_cast<std::size_t>(low) * 2U;
             pending.push_back(next_offset);
           } else {
             const auto descriptor =
                 descriptor_offset +
                 static_cast<std::size_t>(opcode) * descriptor_size;
             handler = readAnalysisWord(executable_text, descriptor);
-            metadata_0 =
-                readAnalysisHalfword(executable_text, descriptor + 4U);
-            metadata_1 =
-                readAnalysisHalfword(executable_text, descriptor + 6U);
+            metadata_0 = readAnalysisHalfword(executable_text, descriptor + 4U);
+            metadata_1 = readAnalysisHalfword(executable_text, descriptor + 6U);
             auto size = std::size_t{2U};
             if ((low & 0x80U) != 0U) {
               operand_0 = static_cast<std::uint16_t>(low & 0x7fU);
@@ -2712,8 +2673,7 @@ int mapMissionScriptActions(const char *cue_path, const char *output_path) {
             next_offset = instruction_offset + size;
             pending.push_back(next_offset);
             if (opcode == 0x0bU || opcode == 0x0cU) {
-              program_operation =
-                  opcode == 0x0bU ? "activate" : "deactivate";
+              program_operation = opcode == 0x0bU ? "activate" : "deactivate";
               if (*operand_0 >= scripts.programs().size()) {
                 throw sf::core::Error{
                     sf::core::ErrorCode::invalid_format,
@@ -2818,8 +2778,7 @@ discoverEmbeddedArchives(std::span<const std::byte> text) {
     candidate.file_offsets.reserve(count);
     auto valid = true;
     for (std::size_t index = 0; index < count; ++index) {
-      const auto offset =
-          readAnalysisWord(view, header_size + index * 4U);
+      const auto offset = readAnalysisWord(view, header_size + index * 4U);
       if ((index == 0U && offset != 0U) ||
           (index > 0U && offset < candidate.file_offsets.back()) ||
           offset >= view.size() - data_offset) {
@@ -2836,8 +2795,7 @@ discoverEmbeddedArchives(std::span<const std::byte> text) {
     while (candidate.names.size() < count && cursor < data_offset) {
       const auto start = cursor;
       while (cursor < data_offset && view[cursor] != std::byte{0}) {
-        const auto character =
-            std::to_integer<unsigned char>(view[cursor]);
+        const auto character = std::to_integer<unsigned char>(view[cursor]);
         if (character < 0x20U || character > 0x7eU) {
           valid = false;
           break;
@@ -2849,8 +2807,7 @@ discoverEmbeddedArchives(std::span<const std::byte> text) {
         break;
       }
       candidate.names.emplace_back(
-          reinterpret_cast<const char *>(view.data() + start),
-          cursor - start);
+          reinterpret_cast<const char *>(view.data() + start), cursor - start);
       ++cursor;
     }
     if (valid && candidate.names.size() == count) {
@@ -2874,9 +2831,8 @@ embeddedArchiveExactDataRanges(std::span<const std::byte> text,
           archive.offset + archive.data_offset + archive.file_offsets[index];
       const auto end = archive.offset + archive.data_offset +
                        archive.file_offsets[index + 1U];
-      result.emplace_back(
-          load_address + static_cast<std::uint32_t>(begin),
-          load_address + static_cast<std::uint32_t>(end));
+      result.emplace_back(load_address + static_cast<std::uint32_t>(begin),
+                          load_address + static_cast<std::uint32_t>(end));
     }
   }
   std::ranges::sort(result);
@@ -2902,11 +2858,10 @@ int mapEmbeddedArchives(const char *cue_path, const char *output_path) {
     for (std::size_t index = 0; index < archive.names.size(); ++index) {
       const auto data_begin =
           archive.offset + archive.data_offset + archive.file_offsets[index];
-      const auto data_end =
-          index + 1U < archive.file_offsets.size()
-              ? archive.offset + archive.data_offset +
-                    archive.file_offsets[index + 1U]
-              : text.size();
+      const auto data_end = index + 1U < archive.file_offsets.size()
+                                ? archive.offset + archive.data_offset +
+                                      archive.file_offsets[index + 1U]
+                                : text.size();
       output << "0x" << std::hex << std::uppercase
              << text_address + static_cast<std::uint32_t>(archive.offset)
              << ",0x" << archive.identifier << std::dec << ','
@@ -2923,17 +2878,15 @@ int mapEmbeddedArchives(const char *cue_path, const char *output_path) {
     throw sf::core::Error{sf::core::ErrorCode::io,
                           "Failed to write embedded-archive map"};
   }
-  std::cout << "Mapped " << entry_count << " entries across "
-            << archives.size() << " embedded archives to " << output_path
-            << '\n';
+  std::cout << "Mapped " << entry_count << " entries across " << archives.size()
+            << " embedded archives to " << output_path << '\n';
   return 0;
 }
 
 int mapObjectHandlers(const char *cue_path, const char *output_path) {
   const auto disc = openDisc(cue_path);
-  if (!disc.game() ||
-      (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
-       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
+  if (!disc.game() || (disc.game()->id != sf::game::GameId::syphon_filter_2 &&
+                       disc.game()->id != sf::game::GameId::syphon_filter_3)) {
     throw sf::core::Error{
         sf::core::ErrorCode::unsupported,
         "Object-handler mapping requires a recognized sequel disc"};
@@ -2942,10 +2895,9 @@ int mapObjectHandlers(const char *cue_path, const char *output_path) {
       disc.game()->id == sf::game::GameId::syphon_filter_2
           ? std::uint32_t{0x8010c3d4U}
           : std::uint32_t{0x8010f0f0U};
-  const auto class_count =
-      disc.game()->id == sf::game::GameId::syphon_filter_3
-          ? std::size_t{0x85U}
-          : std::size_t{0x84U};
+  const auto class_count = disc.game()->id == sf::game::GameId::syphon_filter_3
+                               ? std::size_t{0x85U}
+                               : std::size_t{0x84U};
   const auto &executable = disc.executable();
   const auto text = executable.text();
   const auto text_address = executable.header().text_address;
@@ -2966,20 +2918,19 @@ int mapObjectHandlers(const char *cue_path, const char *output_path) {
   constexpr std::uint32_t overlay_begin = 0x8014b978U;
   constexpr std::uint32_t overlay_end = overlay_begin + 0x10000U;
   for (std::size_t family = 0; family < class_count; ++family) {
-    const auto handler =
-        readAnalysisWord(text, table_offset + family * 4U);
+    const auto handler = readAnalysisWord(text, table_offset + family * 4U);
     std::string owner{"direct"};
     if (handler >= overlay_begin && handler < overlay_end) {
       owner = "MISSION_OVERLAY";
-    } else if (handler >= text_address && handler < text_address + text.size()) {
+    } else if (handler >= text_address &&
+               handler < text_address + text.size()) {
       const auto handler_offset =
           static_cast<std::size_t>(handler - text_address);
       if (handler_offset + 0x18U < text.size()) {
         auto cursor = handler_offset + 0x18U;
         std::string candidate;
         while (cursor < text.size() && candidate.size() < 15U) {
-          const auto character =
-              std::to_integer<unsigned char>(text[cursor++]);
+          const auto character = std::to_integer<unsigned char>(text[cursor++]);
           if (character == 0U) {
             break;
           }
@@ -2994,8 +2945,8 @@ int mapObjectHandlers(const char *cue_path, const char *output_path) {
         }
       }
     }
-    output << "0x" << std::hex << std::uppercase << family << ",0x"
-           << handler << std::dec << ',';
+    output << "0x" << std::hex << std::uppercase << family << ",0x" << handler
+           << std::dec << ',';
     writeCsvString(output, owner);
     output << '\n';
   }
@@ -3032,17 +2983,15 @@ int mapStringReferences(const char *cue_path, const char *output_path) {
     while (end < text.size() && printable(text[end])) {
       ++end;
     }
-    if (end - offset >= 4U && end < text.size() &&
-        text[end] == std::byte{0}) {
+    if (end - offset >= 4U && end < text.size() && text[end] == std::byte{0}) {
       std::string value;
       value.reserve(end - offset);
       for (auto cursor = offset; cursor < end; ++cursor) {
         value.push_back(
             static_cast<char>(std::to_integer<unsigned char>(text[cursor])));
       }
-      strings.emplace(
-          header.text_address + static_cast<std::uint32_t>(offset),
-          std::move(value));
+      strings.emplace(header.text_address + static_cast<std::uint32_t>(offset),
+                      std::move(value));
     }
     offset = std::max(end, offset + 1U);
   }
@@ -3062,9 +3011,8 @@ int mapStringReferences(const char *cue_path, const char *output_path) {
     }
     const auto base_register = (instruction >> 16U) & 0x1fU;
     const auto upper = (instruction & 0xffffU) << 16U;
-    for (std::size_t lookahead = 1U; lookahead <= 8U &&
-                                      offset + lookahead * 4U + 4U <=
-                                          text.size();
+    for (std::size_t lookahead = 1U;
+         lookahead <= 8U && offset + lookahead * 4U + 4U <= text.size();
          ++lookahead) {
       const auto use_offset = offset + lookahead * 4U;
       const auto use = readAnalysisWord(text, use_offset);
@@ -3075,10 +3023,9 @@ int mapStringReferences(const char *cue_path, const char *output_path) {
         continue;
       }
       const auto immediate = use & 0xffffU;
-      const auto lower =
-          (opcode == 0x0dU || (immediate & 0x8000U) == 0U)
-              ? immediate
-              : immediate | 0xffff0000U;
+      const auto lower = (opcode == 0x0dU || (immediate & 0x8000U) == 0U)
+                             ? immediate
+                             : immediate | 0xffff0000U;
       const auto address = upper + lower;
       const auto found_string = strings.find(address);
       if (found_string == strings.end()) {
@@ -3199,10 +3146,19 @@ int probeExecutableEntry(const char *cue_path, std::uint64_t budget) {
     if (layout.cd_pending_command_address != 0U) {
       vm.bindPsxCdPendingCommandCall(
           layout.cd_pending_command_address, layout.cd_pending_command_state,
-          layout.cd_response_pointer, layout.cd_completion_state);
+          layout.cd_response_pointer, layout.cd_completion_state,
+          disc.game()->id == sf::game::GameId::syphon_filter_2
+              ? 0x80141a10U
+              : 0U);
     }
     if (layout.cd_control_address != 0U) {
-      vm.bindPsxCdControlCall(layout.cd_control_address);
+      const auto is_sf2 =
+          disc.game()->id == sf::game::GameId::syphon_filter_2;
+      const auto sf2_profile = sf::game::sf2UsaGuestRuntimeProfile();
+      vm.bindPsxCdControlCall(
+          layout.cd_control_address,
+          is_sf2 ? sf2_profile.cd_setloc_state : 0U,
+          is_sf2 ? sf2_profile.cd_mode_state : 0U);
     }
     vm.bindPsxCdReadyCallback(
         layout.cd_ready_callback_address, layout.cd_ready_result_address,
@@ -3294,8 +3250,3535 @@ int probeExecutableEntry(const char *cue_path, std::uint64_t budget) {
             << static_cast<unsigned int>(cdrom.response_count) << " cd-dma=0x"
             << cd_dma_madr << ",0x" << cd_dma_bcr << ",0x" << cd_dma_chcr
             << " spu-dma=0x" << spu_dma_madr << ",0x" << spu_dma_bcr << ",0x"
-            << spu_dma_chcr
-            << std::dec << '\n';
+            << spu_dma_chcr << std::dec << '\n';
+  return 0;
+}
+
+int probeSf2GuestBootstrap(const char *cue_path, std::uint64_t budget,
+                           bool probe_mission_transition) {
+  constexpr auto guest_profile = sf::game::sf2UsaGuestRuntimeProfile();
+  constexpr std::size_t frame_boundary_count = 8U;
+  constexpr std::size_t mission_boundary_limit = 512U;
+  constexpr std::size_t stable_mission_boundary_count = 8U;
+  constexpr std::uint64_t scheduler_slice_budget = 50'000U;
+  constexpr std::uint32_t mission_selection_index = 2U;
+
+  auto disc = openDisc(cue_path);
+  if (!disc.game() || disc.game()->id != sf::game::GameId::syphon_filter_2) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "SF2 guest bootstrap probe requires a supported Syphon Filter 2 disc"};
+  }
+  struct MissionProbeAssets {
+    std::vector<std::byte> fog_bytes;
+    std::vector<std::byte> init_overlay;
+    std::vector<std::byte> expected_overlay;
+    std::map<std::string, std::vector<std::byte>> fog_files;
+    std::vector<sf::assets::FogEntry> fog_entries;
+    std::map<std::string, std::vector<std::byte>> resident_files;
+  };
+  MissionProbeAssets mission_assets;
+  if (probe_mission_transition) {
+    if (disc.game()->disc_number != 1U) {
+      throw sf::core::Error{
+          sf::core::ErrorCode::unsupported,
+          "SF2 Mission 3 transition probe requires retail Disc 1"};
+    }
+    mission_assets.fog_bytes = disc.image().readFile("FOG/HWAY.FOG");
+    mission_assets.init_overlay = disc.image().readFile("BIN/INIT.OVL");
+    const auto resident_archive =
+        sf::game::parseEmbeddedHog(disc.executable(), "BEEPSX.VB");
+    for (const auto &entry : resident_archive.entries()) {
+      const auto file = resident_archive.file(entry.name);
+      mission_assets.resident_files.emplace(
+          entry.name, std::vector<std::byte>{file.begin(), file.end()});
+    }
+    const auto fog = sf::assets::FogArchive::parse(mission_assets.fog_bytes);
+    mission_assets.fog_entries = fog.entries();
+    for (const auto &entry : fog.entries()) {
+      const auto file = fog.file(entry.name);
+      mission_assets.fog_files.emplace(
+          entry.name, std::vector<std::byte>{file.begin(), file.end()});
+    }
+    const auto overlay_file = fog.file("HWAY.OVL");
+    if (overlay_file.size() <= sequelMissionOverlayHeaderSize) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "HWAY mission overlay is truncated"};
+    }
+    mission_assets.expected_overlay.assign(
+        overlay_file.begin() +
+            static_cast<std::ptrdiff_t>(sequelMissionOverlayHeaderSize),
+        overlay_file.end());
+  }
+  const auto &fog_bytes = mission_assets.fog_bytes;
+  const auto &init_overlay = mission_assets.init_overlay;
+  const auto &expected_overlay = mission_assets.expected_overlay;
+  const auto &fog_files = mission_assets.fog_files;
+  const auto &fog_entries = mission_assets.fog_entries;
+  const auto &resident_files = mission_assets.resident_files;
+  const auto init_code_offset =
+      probe_mission_transition
+          ? sequelResidentOverlayCodeOffset(init_overlay, 0x80158878U)
+          : std::size_t{};
+  constexpr std::size_t init_code_probe_size = 256U;
+  const auto fog_header = std::span<const std::byte>{fog_bytes}.first(
+      std::min(fog_bytes.size(), sf::assets::FogArchive::sector_size));
+
+  sf::game::LegacyGameplayVm vm{disc.executable()};
+  sf::game::DiscCdRomMedia cdrom_media{disc.image()};
+  auto enable_sf2_mission_search = probe_mission_transition;
+  auto enable_sf2_resident_overlay_load = false;
+  auto enable_sf2_resident_file_access = probe_mission_transition;
+  auto sf2_search_calls = std::size_t{};
+  auto sf2_search_matches = std::size_t{};
+  std::string sf2_last_search_path;
+  std::array<std::byte, 0x240U> sf2_catalog_after_copy{};
+  auto sf2_catalog_copy_observations = std::size_t{};
+  auto sf2_catalog_repair_bridges = std::size_t{};
+  auto sf2_slf_open_bridges = std::size_t{};
+  auto sf2_slf_load_bridges = std::size_t{};
+  auto sf2_resident_file_open_bridges = std::size_t{};
+  auto sf2_resident_file_load_bridges = std::size_t{};
+  auto sf2_movie_catalog_open_bridges = std::size_t{};
+  auto sf2_movie_catalog_load_bridges = std::size_t{};
+  std::vector<std::string> sf2_file_open_paths;
+  struct ResidentOpenFile {
+    const std::vector<std::byte> *bytes{};
+    std::size_t offset{};
+    bool fog_member{};
+  };
+  std::map<std::uint32_t, ResidentOpenFile> sf2_resident_open_files;
+  auto sf2_pad_poll_bridges = std::size_t{};
+  auto sf2_resident_callback_table_bridges = std::size_t{};
+  auto sf2_resident_overlay_load_bridges = std::size_t{};
+  auto sf2_movie_overlay_load_bridges = std::size_t{};
+  auto sf2_title_overlay_load_bridges = std::size_t{};
+  std::vector<std::uint32_t> sf2_common_init_arguments;
+  std::vector<std::uint32_t> sf2_common_disc_open_results;
+  std::vector<std::array<std::uint32_t, 2U>> sf2_file_seek_results;
+  std::vector<std::array<std::uint32_t, 3U>> sf2_application_state_calls;
+  struct Sf2ArchiveMemberRequest {
+    std::string name;
+    std::uint32_t destination_slot{};
+    std::uint32_t mode{};
+    std::uint32_t caller{};
+  };
+  std::vector<Sf2ArchiveMemberRequest> sf2_archive_member_requests;
+  std::vector<std::array<std::uint32_t, 7U>> sf2_init_resource_inputs;
+  std::vector<std::array<std::uint32_t, 6U>> sf2_init_descriptor_writes;
+  std::vector<std::string> sf2_init_archive_paths;
+  std::string sf2_last_resident_overlay_name;
+  std::uint32_t sf2_last_resident_overlay_address{};
+  std::uint32_t sf2_last_resident_overlay_mode{};
+  std::vector<std::tuple<std::string, std::uint32_t, std::uint32_t,
+                         std::uint32_t>>
+      sf2_overlay_requests;
+  struct Sf2RenderListInsert {
+    std::uint32_t list{};
+    std::uint32_t object{};
+    std::uint32_t caller{};
+    std::uint32_t upstream_caller{};
+    bool scheduled_callback{};
+    std::array<std::uint32_t, 8U> object_words{};
+  };
+  std::vector<Sf2RenderListInsert> sf2_render_list_inserts;
+  auto sf2_servicing_scheduled_callback = false;
+  struct Sf2RenderListRemove {
+    std::uint32_t list{};
+    std::uint32_t node{};
+    std::uint32_t object{};
+    std::uint32_t caller{};
+  };
+  std::vector<Sf2RenderListRemove> sf2_render_list_removes;
+  std::vector<std::array<std::uint32_t, 3U>> sf2_heap_rewinds;
+  struct Sf2HeapAllocation {
+    std::uint32_t size{};
+    std::uint32_t address{};
+    std::uint32_t caller{};
+  };
+  std::vector<Sf2HeapAllocation> sf2_heap_allocations;
+  std::vector<std::array<std::uint32_t, 7U>> sf2_render_arena_resets;
+  vm.machine().setCdRomMedia(&cdrom_media);
+  vm.bindPsxBiosCoreVector(probe_mission_transition);
+  if (probe_mission_transition) {
+    // This probe runs without a ROM BIOS. Acknowledge the low exception
+    // vector through the host-owned scheduler and resume the interrupted
+    // retail instruction with the architectural RFE status rotation.
+    constexpr std::uint32_t exception_return_trampoline = 0x8000c100U;
+    constexpr std::array exception_return_code{
+        0x03600008U, // jr k1
+        0x0340f821U, // addu ra,k0,zero
+    };
+    std::array<std::byte, exception_return_code.size() * sizeof(std::uint32_t)>
+        exception_return_bytes{};
+    for (std::size_t word = 0U; word < exception_return_code.size(); ++word) {
+      for (std::size_t byte = 0U; byte < sizeof(std::uint32_t); ++byte) {
+        exception_return_bytes[word * sizeof(std::uint32_t) + byte] =
+            static_cast<std::byte>(exception_return_code[word] >> (byte * 8U));
+      }
+    }
+    if (!vm.runtime().loadBytes(exception_return_trampoline,
+                                exception_return_bytes)) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "Could not install SF2 probe exception return"};
+    }
+    vm.bindHostCall(exception_return_trampoline,
+                    [](sf::game::LegacyHostCallContext &context) {
+                      context.continueGuestInstruction();
+                    });
+    vm.bindHostCall(0x80000080U, [&vm, exception_return_trampoline](
+                                     sf::game::LegacyHostCallContext &context) {
+      constexpr std::uint32_t mode_stack_mask = 0x0fU;
+      constexpr std::uint32_t interrupt_status_address = 0x1f801070U;
+      auto state = vm.runtime().state();
+      const auto resume_pc = state.cop0_epc;
+      const auto interrupted_return = state.gpr[31U];
+      state.cop0_status = (state.cop0_status & ~mode_stack_mask) |
+                          ((state.cop0_status >> 2U) & mode_stack_mask);
+      vm.runtime().restoreCpuState(state);
+      if (!context.write16(interrupt_status_address, 0U)) {
+        context.rejectHostCall();
+        return;
+      }
+      vm.runtime().setExternalInterrupt(false);
+      context.setRegister(26U, interrupted_return);
+      context.setRegister(27U, resume_pc);
+      context.setRegister(31U, exception_return_trampoline);
+      context.setReturnValue(0U);
+    });
+  }
+  const auto &layout = disc.game()->executable_layout;
+  vm.bindPsxVideoTimingCall(layout.vsync_address,
+                            layout.retrace_counter_address);
+  vm.bindPsxCdPendingCommandCall(
+      layout.cd_pending_command_address, layout.cd_pending_command_state,
+      layout.cd_response_pointer, layout.cd_completion_state,
+      guest_profile.cd_completion_result);
+  vm.bindPsxCdControlCall(layout.cd_control_address,
+                          guest_profile.cd_setloc_state,
+                          guest_profile.cd_mode_state);
+  vm.bindPsxCdReadyCallback(
+      layout.cd_ready_callback_address, layout.cd_ready_result_address,
+      layout.cd_ready_state_address, layout.cd_ready_callback_is_pointer);
+  vm.bindPsxCdCompletionCallback(0x8011d1bcU,
+                                 guest_profile.cd_completion_result, true);
+  if (probe_mission_transition) {
+    // PsyQ CdSearchFile is a platform boundary: resolve the retail ISO extent
+    // natively, then let guest code own every sector transfer, archive parse,
+    // overlay placement, and overlay execution.
+    vm.bindHostCall(
+        guest_profile.cd_search_file_entry,
+        [&disc, &enable_sf2_mission_search, &enable_sf2_resident_file_access,
+         &sf2_search_calls, &sf2_search_matches,
+         &sf2_last_search_path](sf::game::LegacyHostCallContext &context) {
+          if (!enable_sf2_mission_search) {
+            context.continueGuestInstruction();
+            return;
+          }
+          const auto destination = context.argument(0);
+          std::string path;
+          if (destination == 0U ||
+              !context.readCString(context.argument(1), path, 256U)) {
+            context.setReturnValue(0U);
+            return;
+          }
+          std::ranges::replace(path, '\\', '/');
+          while (!path.empty() && path.front() == '/') {
+            path.erase(path.begin());
+          }
+          if (path.ends_with(";1")) {
+            path.resize(path.size() - 2U);
+          }
+          ++sf2_search_calls;
+          sf2_last_search_path = path;
+          std::uint32_t extent_lba{};
+          std::uint32_t file_size{};
+          std::string file_name;
+          auto found = false;
+          try {
+            const auto entry = disc.image().find(path);
+            if (entry.is_directory) {
+              context.setReturnValue(0U);
+              return;
+            }
+            extent_lba = entry.extent_lba;
+            file_size = entry.size;
+            file_name = entry.name;
+            found = true;
+          } catch (const sf::core::Error &) {
+            if (!enable_sf2_resident_file_access &&
+                path.ends_with("GLOBAL.DAT")) {
+              const auto entry = disc.image().find(
+                  std::string{disc.game()->layout.mission_info_path});
+              extent_lba = entry.extent_lba;
+              file_size = entry.size;
+              file_name = entry.name;
+              found = true;
+            }
+          }
+          if (!found) {
+            context.setReturnValue(0U);
+            return;
+          }
+          constexpr std::uint32_t pregap_sectors = 150U;
+          constexpr std::uint32_t sectors_per_second = 75U;
+          constexpr std::uint32_t seconds_per_minute = 60U;
+          const auto absolute_sector = extent_lba + pregap_sectors;
+          const auto minute =
+              absolute_sector / (sectors_per_second * seconds_per_minute);
+          const auto second =
+              (absolute_sector / sectors_per_second) % seconds_per_minute;
+          const auto frame = absolute_sector % sectors_per_second;
+          const auto bcd = [](std::uint32_t value) {
+            return static_cast<std::byte>(((value / 10U) << 4U) |
+                                          (value % 10U));
+          };
+          std::array<std::byte, 24U> cdl_file{};
+          cdl_file[0] = bcd(minute);
+          cdl_file[1] = bcd(second);
+          cdl_file[2] = bcd(frame);
+          for (std::size_t index = 0U; index < sizeof(file_size); ++index) {
+            cdl_file[4U + index] =
+                static_cast<std::byte>(file_size >> (index * 8U));
+          }
+          const auto name_size =
+              std::min(file_name.size(), cdl_file.size() - 8U);
+          for (std::size_t index = 0U; index < name_size; ++index) {
+            cdl_file[8U + index] = static_cast<std::byte>(file_name[index]);
+          }
+          if (!context.writeBytes(destination, cdl_file)) {
+            context.setReturnValue(0U);
+            return;
+          }
+          ++sf2_search_matches;
+          context.setReturnValue(destination);
+        });
+    vm.bindHostCall(0x80010750U, [&sf2_catalog_after_copy,
+                                  &sf2_catalog_copy_observations](
+                                     sf::game::LegacyHostCallContext &context) {
+      if (context.argument(0) != 0x80126058U || context.argument(2) != 0x90U) {
+        context.continueGuestInstruction();
+        return;
+      }
+      if (!context.readBytes(context.argument(1), sf2_catalog_after_copy) ||
+          !context.writeBytes(context.argument(0), sf2_catalog_after_copy)) {
+        context.setReturnValue(0xffffffffU);
+        return;
+      }
+      ++sf2_catalog_copy_observations;
+      context.setReturnValue(0U);
+    });
+    vm.bindHostCall(0x800260e4U, [&disc, &sf2_catalog_after_copy,
+                                  &sf2_catalog_copy_observations,
+                                  &sf2_catalog_repair_bridges](
+                                     sf::game::LegacyHostCallContext &context) {
+      if (sf2_catalog_copy_observations == 0U) {
+        context.continueGuestInstruction();
+        return;
+      }
+      try {
+        const auto entry = disc.image().find("FOG/HWAY.FOG");
+        const auto stack_pointer = context.registerValue(29U);
+        std::uint32_t caller_return{};
+        std::uint32_t saved_s0{};
+        if (!context.writeBytes(0x80126058U, sf2_catalog_after_copy) ||
+            !context.write32(0x8011ee68U, 0x80126058U) ||
+            !context.write32(0x80126060U, entry.extent_lba) ||
+            !context.read32(stack_pointer + 0x81cU, caller_return) ||
+            !context.read32(stack_pointer + 0x818U, saved_s0)) {
+          context.setReturnValue(0U);
+          return;
+        }
+        context.setRegister(16U, saved_s0);
+        context.setRegister(29U, stack_pointer + 0x820U);
+        context.setRegister(31U, caller_return);
+        ++sf2_catalog_repair_bridges;
+        context.setReturnValue(1U);
+      } catch (const sf::core::Error &) {
+        context.setReturnValue(0U);
+      }
+    });
+    vm.bindHostCall(0x8002b4c4U, [&enable_sf2_resident_overlay_load,
+                                  &sf2_resident_overlay_load_bridges,
+                                  &sf2_movie_overlay_load_bridges,
+                                   &sf2_title_overlay_load_bridges,
+                                   &sf2_overlay_requests,
+                                   &sf2_last_resident_overlay_name,
+                                  &sf2_last_resident_overlay_address,
+                                  &sf2_last_resident_overlay_mode](
+                                     sf::game::LegacyHostCallContext &context) {
+      if (!enable_sf2_resident_overlay_load) {
+        context.continueGuestInstruction();
+        return;
+      }
+      std::string name;
+      if (!context.readCString(context.argument(0), name, 64U)) {
+        context.continueGuestInstruction();
+        return;
+      }
+      sf2_last_resident_overlay_name = name;
+      sf2_last_resident_overlay_address = context.argument(1);
+      sf2_last_resident_overlay_mode = context.argument(2);
+      if (sf2_overlay_requests.size() < 32U) {
+        sf2_overlay_requests.emplace_back(
+            name, context.argument(1), context.argument(2),
+            context.registerValue(31U));
+      }
+      ++sf2_resident_overlay_load_bridges;
+      if (name == "MOVIE.OVL") {
+        ++sf2_movie_overlay_load_bridges;
+      } else if (name == "TITLE.OVL") {
+        ++sf2_title_overlay_load_bridges;
+      }
+      // Observe the high-level request but leave heap teardown, file sizing,
+      // relocation, and lifetime bookkeeping in the retail loader. The lower
+      // open/read platform bridges provide only immutable file bytes.
+      context.continueGuestInstruction();
+    });
+    vm.bindHostCall(0x80026414U, [&disc, &cdrom_media, &resident_files,
+                                   &enable_sf2_resident_file_access,
+                                   &sf2_resident_open_files,
+                                   &sf2_resident_file_open_bridges,
+                                   &sf2_resident_file_load_bridges,
+                                   &sf2_slf_load_bridges,
+                                   &sf2_movie_catalog_load_bridges](
+                                      sf::game::LegacyHostCallContext &context) {
+      auto resident = sf2_resident_open_files.find(context.argument(0));
+      if (resident == sf2_resident_open_files.end()) {
+        std::uint32_t handle_size{};
+        const auto movie_entry = disc.image().find("MOVIE1.HOG");
+        if (context.argument(1) != 0U && context.argument(2) == 0x800U &&
+            context.read32(context.argument(0) + 4U, handle_size) &&
+            handle_size == movie_entry.size) {
+          std::array<std::byte, 0x800U> sector{};
+          if (!cdrom_media.readDataSector(movie_entry.extent_lba, sector) ||
+              !context.writeBytes(context.argument(1), sector) ||
+              (context.argument(3) != 0U &&
+               !context.write32(context.argument(3), 0U))) {
+            context.setReturnValue(3U);
+            return;
+          }
+          ++sf2_movie_catalog_load_bridges;
+          context.setReturnValue(0U);
+          return;
+        }
+        const std::vector<std::byte> *resident_bytes{};
+        auto resident_size_matches = std::size_t{};
+        if (enable_sf2_resident_file_access &&
+            context.read32(context.argument(0) + 4U, handle_size)) {
+          for (const auto &[name, bytes] : resident_files) {
+            static_cast<void>(name);
+            if (bytes.size() == handle_size) {
+              resident_bytes = &bytes;
+              ++resident_size_matches;
+            }
+          }
+        }
+        if (resident_size_matches == 1U) {
+          resident =
+              sf2_resident_open_files
+                  .insert_or_assign(
+                      context.argument(0),
+                      ResidentOpenFile{resident_bytes, 0U, false})
+                  .first;
+          ++sf2_resident_file_open_bridges;
+        }
+      }
+      if (resident == sf2_resident_open_files.end()) {
+        context.continueGuestInstruction();
+        return;
+      }
+      const auto requested = static_cast<std::size_t>(context.argument(2));
+      const auto &bytes = *resident->second.bytes;
+      const auto available = resident->second.offset < bytes.size()
+                                 ? bytes.size() - resident->second.offset
+                                 : 0U;
+      const auto copied = std::min(requested, available);
+      std::vector<std::byte> payload(requested);
+      std::ranges::copy_n(
+          bytes.begin() + static_cast<std::ptrdiff_t>(resident->second.offset),
+          copied, payload.begin());
+      if (context.argument(1) == 0U ||
+          !context.writeBytes(context.argument(1), payload) ||
+          (context.argument(3) != 0U &&
+           !context.write32(context.argument(3), 0U))) {
+        context.setReturnValue(3U);
+        return;
+      }
+      resident->second.offset += copied;
+      if (resident->second.fog_member) {
+        ++sf2_slf_load_bridges;
+      } else {
+        ++sf2_resident_file_load_bridges;
+      }
+      if (resident->second.offset >= bytes.size()) {
+        sf2_resident_open_files.erase(resident);
+      }
+      context.setReturnValue(0U);
+    });
+    vm.bindHostCall(
+        0x8002662cU,
+        [&sf2_resident_open_files](
+            sf::game::LegacyHostCallContext &context) {
+          std::uint32_t handle{};
+          if (context.argument(0) != 0U &&
+              context.read32(context.argument(0), handle)) {
+            sf2_resident_open_files.erase(handle);
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(0x80026234U, [&disc, &fog_entries, &fog_files,
+                                   &sf2_resident_open_files,
+                                   &sf2_slf_open_bridges,
+                                  &sf2_file_open_paths](
+                                     sf::game::LegacyHostCallContext &context) {
+      std::string path;
+      if (!context.readCString(context.argument(0), path, 256U) ||
+          context.argument(1) == 0U) {
+        context.continueGuestInstruction();
+        return;
+      }
+      if (sf2_file_open_paths.size() < 32U) {
+        sf2_file_open_paths.push_back(path);
+      }
+      auto member_name = path;
+      if (member_name.ends_with(";1")) {
+        member_name.resize(member_name.size() - 2U);
+      }
+      const auto separator = member_name.find_last_of("\\/");
+      if (separator != std::string::npos) {
+        member_name.erase(0U, separator + 1U);
+      }
+      std::ranges::transform(
+          member_name, member_name.begin(),
+          [](unsigned char character) {
+            return static_cast<char>(std::toupper(character));
+          });
+      const auto fog_entry =
+          std::ranges::find_if(fog_entries, [&member_name](const auto &entry) {
+            auto candidate = entry.name;
+            std::ranges::transform(
+                candidate, candidate.begin(),
+                [](unsigned char character) {
+                  return static_cast<char>(std::toupper(character));
+                });
+            return candidate == member_name;
+          });
+      const auto fog_file = fog_files.find(member_name);
+      if (fog_entry == fog_entries.end() || fog_file == fog_files.end()) {
+        context.continueGuestInstruction();
+        return;
+      }
+      auto handle = std::uint32_t{};
+      for (std::size_t index = 0U; index < 5U; ++index) {
+        const auto candidate =
+            0x80125ff4U + static_cast<std::uint32_t>(index * 0x14U);
+        std::uint32_t state{};
+        if (context.read32(candidate + 4U, state) && state == 0xcacacacaU) {
+          handle = candidate;
+          break;
+        }
+      }
+      if (handle == 0U) {
+        context.setReturnValue(3U);
+        return;
+      }
+      const auto mission_fog = disc.image().find("FOG/HWAY.FOG");
+      const auto sector = mission_fog.extent_lba + fog_entry->start_sector;
+      const auto size = fog_entry->sector_count << 11U;
+      const auto absolute = sector + 150U;
+      const auto bcd = [](std::uint32_t value) {
+        return static_cast<std::byte>(((value / 10U) << 4U) | (value % 10U));
+      };
+      std::array<std::byte, 20U> file{};
+      file[0] = bcd(absolute / (60U * 75U));
+      file[1] = bcd((absolute / 75U) % 60U);
+      file[2] = bcd(absolute % 75U);
+      file[12] = file[0];
+      file[13] = file[1];
+      file[14] = file[2];
+      const auto write_le32 = [&file](std::size_t offset, std::uint32_t value) {
+        for (std::size_t index = 0U; index < sizeof(value); ++index) {
+          file[offset + index] = static_cast<std::byte>(value >> (index * 8U));
+        }
+      };
+      write_le32(4U, size);
+      write_le32(8U, sector + fog_entry->sector_count - 1U);
+      write_le32(16U, size);
+      if (!context.writeBytes(handle, file) ||
+          !context.write32(context.argument(1), handle)) {
+        context.setReturnValue(3U);
+        return;
+      }
+      sf2_resident_open_files.insert_or_assign(
+          handle, ResidentOpenFile{&fog_file->second, 0U, true});
+      ++sf2_slf_open_bridges;
+      context.setReturnValue(0U);
+    });
+    vm.bindHostCall(
+        0x8002b0d0U,
+        [&sf2_archive_member_requests](
+            sf::game::LegacyHostCallContext &context) {
+          std::string name;
+          if (sf2_archive_member_requests.size() < 32U &&
+              context.readCString(context.argument(0), name, 256U)) {
+            sf2_archive_member_requests.push_back(
+                {std::move(name), context.argument(1), context.argument(2),
+                 context.registerValue(31U)});
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        0x80158e3cU,
+        [&sf2_init_resource_inputs](
+            sf::game::LegacyHostCallContext &context) {
+          std::uint32_t descriptor{};
+          std::uint32_t field_0c{};
+          std::uint32_t field_30{};
+          std::uint32_t resource{};
+          static_cast<void>(context.read32(0x8011f598U, descriptor));
+          static_cast<void>(context.read32(0x8011f5a4U, resource));
+          if (descriptor != 0U) {
+            static_cast<void>(context.read32(descriptor + 0x0cU, field_0c));
+            static_cast<void>(context.read32(descriptor + 0x30U, field_30));
+          }
+          if (sf2_init_resource_inputs.size() < 16U) {
+            sf2_init_resource_inputs.push_back(
+                {context.argument(0), descriptor, field_0c, field_30, resource,
+                 context.registerValue(22U), context.registerValue(31U)});
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        0x8015d594U,
+        [&sf2_init_archive_paths](sf::game::LegacyHostCallContext &context) {
+          std::string path;
+          if (sf2_init_archive_paths.size() < 16U &&
+              context.readCString(context.argument(0), path, 256U)) {
+            sf2_init_archive_paths.push_back(std::move(path));
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        0x8015d5bcU,
+        [&sf2_init_descriptor_writes](
+            sf::game::LegacyHostCallContext &context) {
+          std::uint32_t prior{};
+          std::uint32_t archive_result{};
+          std::uint32_t root{};
+          static_cast<void>(context.read32(0x8011f598U, prior));
+          static_cast<void>(
+              context.read32(context.registerValue(29U) + 0xd0U,
+                             archive_result));
+          if (archive_result != 0U) {
+            static_cast<void>(context.read32(archive_result, root));
+          }
+          if (sf2_init_descriptor_writes.size() < 16U) {
+            sf2_init_descriptor_writes.push_back(
+                {context.argument(0), context.registerValue(16U), prior,
+                 archive_result, root, context.registerValue(22U)});
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        0x80025c3cU,
+        [&sf2_render_list_inserts, &sf2_servicing_scheduled_callback](
+            sf::game::LegacyHostCallContext &context) {
+          if (sf2_render_list_inserts.size() < 2'048U) {
+            std::uint32_t upstream_caller{};
+            static_cast<void>(context.read32(
+                context.registerValue(29U) + 0x14U, upstream_caller));
+            Sf2RenderListInsert insert{
+                context.argument(0), context.argument(1),
+                context.registerValue(31U), upstream_caller,
+                sf2_servicing_scheduled_callback, {}};
+            for (std::size_t index = 0U;
+                 index < insert.object_words.size(); ++index) {
+              static_cast<void>(context.read32(
+                  insert.object +
+                      static_cast<std::uint32_t>(
+                          index * sizeof(std::uint32_t)),
+                  insert.object_words[index]));
+            }
+            sf2_render_list_inserts.push_back(insert);
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        0x80025d3cU,
+        [&sf2_render_list_removes](
+            sf::game::LegacyHostCallContext &context) {
+          if (sf2_render_list_removes.size() < 2'048U) {
+            std::uint32_t object{};
+            if (context.argument(1) != 0U) {
+              static_cast<void>(
+                  context.read32(context.argument(1), object));
+            }
+            sf2_render_list_removes.push_back(
+                {context.argument(0), context.argument(1), object,
+                 context.registerValue(31U)});
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        0x80015878U,
+        [&sf2_render_arena_resets](
+            sf::game::LegacyHostCallContext &context) {
+          if (sf2_render_arena_resets.size() < 32U) {
+            std::array<std::uint32_t, 7U> reset{
+                context.registerValue(5U), context.registerValue(31U)};
+            static_cast<void>(context.read32(0x8011f4a0U, reset[2U]));
+            static_cast<void>(context.read32(0x8011f4a4U, reset[3U]));
+            static_cast<void>(context.read32(0x8011ee2cU, reset[4U]));
+            static_cast<void>(context.read32(0x80120f0cU, reset[5U]));
+            static_cast<void>(context.read32(0x80120f10U, reset[6U]));
+            sf2_render_arena_resets.push_back(reset);
+          }
+          context.continueGuestInstruction();
+        });
+    const auto observe_sf2_heap_rewind =
+        [&sf2_heap_rewinds](std::uint32_t entry) {
+          return [&sf2_heap_rewinds, entry](
+                     sf::game::LegacyHostCallContext &context) {
+            if (sf2_heap_rewinds.size() < 128U) {
+              sf2_heap_rewinds.push_back(
+                  {entry, context.argument(0),
+                   context.registerValue(31U)});
+            }
+            context.continueGuestInstruction();
+          };
+        };
+    vm.bindHostCall(0x80025b3cU, observe_sf2_heap_rewind(0x80025b3cU));
+    vm.bindHostCall(0x80025b48U, observe_sf2_heap_rewind(0x80025b48U));
+    vm.bindHostCall(
+        0x80025b24U,
+        [&sf2_heap_allocations](
+            sf::game::LegacyHostCallContext &context) {
+          if (sf2_heap_allocations.size() < 4'096U) {
+            std::uint32_t caller{};
+            static_cast<void>(
+                context.read32(context.registerValue(29U) + 0x14U, caller));
+            sf2_heap_allocations.push_back(
+                {context.registerValue(6U), context.registerValue(16U),
+                 caller});
+          }
+          context.continueGuestInstruction();
+        });
+  }
+  vm.bindHostCall(guest_profile.gpu_submission_entry,
+                  [](sf::game::LegacyHostCallContext &context) {
+                    context.setReturnValue(0U);
+                  });
+  vm.bindHostCall(
+      guest_profile.common_init_entry,
+      [&sf2_common_init_arguments](
+          sf::game::LegacyHostCallContext &context) {
+        if (sf2_common_init_arguments.size() < 16U) {
+          sf2_common_init_arguments.push_back(context.argument(0));
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x8002a684U,
+      [&sf2_common_disc_open_results](
+          sf::game::LegacyHostCallContext &context) {
+        if (sf2_common_disc_open_results.size() < 16U) {
+          sf2_common_disc_open_results.push_back(context.registerValue(2U));
+        }
+        context.continueGuestInstruction();
+      });
+  const auto observe_sf2_file_seek =
+      [&sf2_file_seek_results](std::uint32_t command) {
+        return [&sf2_file_seek_results, command](
+                   sf::game::LegacyHostCallContext &context) {
+          if (sf2_file_seek_results.size() < 32U) {
+            sf2_file_seek_results.push_back(
+                {command, context.registerValue(2U)});
+          }
+          context.continueGuestInstruction();
+        };
+      };
+  vm.bindHostCall(0x800261e0U, observe_sf2_file_seek(0x02U));
+  vm.bindHostCall(0x800261f8U, observe_sf2_file_seek(0x15U));
+  const auto observe_sf2_application_state =
+      [&sf2_application_state_calls](std::uint32_t operation) {
+        return [&sf2_application_state_calls, operation](
+                   sf::game::LegacyHostCallContext &context) {
+          if (sf2_application_state_calls.size() < 64U) {
+            sf2_application_state_calls.push_back(
+                {operation, context.argument(0), context.registerValue(31U)});
+          }
+          context.continueGuestInstruction();
+        };
+      };
+  vm.bindHostCall(guest_profile.application_state_push_entry,
+                  observe_sf2_application_state(1U));
+  vm.bindHostCall(0x8002bdc0U, observe_sf2_application_state(2U));
+  vm.bindHostCall(guest_profile.application_state_pop_entry,
+                  observe_sf2_application_state(3U));
+  // Observe the original function without replacing it. This is the first
+  // architecture gate for the sequel guest runtime: CRT/Game_Main must reach
+  // the retail fourteen-state loop under the shared PSX machine.
+  vm.bindHostCall(guest_profile.state_loop_entry,
+                  [](sf::game::LegacyHostCallContext &context) {
+                    context.continueGuestInstruction();
+                  });
+  const auto state_loop =
+      vm.runCurrentPcUntilHostBoundary(guest_profile.state_loop_entry, budget);
+  if (!state_loop.stoppedAtHostBoundary()) {
+    std::cerr << "SF2 guest did not reach state loop: stop=0x" << std::hex
+              << std::uppercase << state_loop.execution.pc << std::dec
+              << " reason=" << sf::psx::toString(state_loop.execution.reason)
+              << " instructions=" << state_loop.execution.instructions << '\n';
+    return 3;
+  }
+
+  struct BoundaryTrace {
+    std::array<std::uint64_t, frame_boundary_count> instructions{};
+    std::array<std::uint32_t, frame_boundary_count> retrace_counters{};
+    std::array<std::uint32_t, frame_boundary_count> return_addresses{};
+    std::array<std::uint32_t, frame_boundary_count> application_states{};
+  };
+  auto suppress_guest_interrupts = false;
+  const std::array<std::uint32_t, 2U> sf2_root_callback_slots{
+      guest_profile.interrupt_callback_table + 4U * 4U,
+      guest_profile.interrupt_callback_table + 7U * 4U};
+  constexpr std::uint32_t sf2_callback_stack = 0x807f0000U;
+  constexpr std::uint64_t sf2_task_callback_period =
+      sf::psx::CdRomController::cpu_clock_hz /
+      sf::game::LegacyGameplayVm::updates_per_second;
+  constexpr std::uint64_t sf2_retrace_period =
+      sf::psx::CdRomController::cpu_clock_hz / 60U;
+  auto sf2_task_callback_ticks = std::uint64_t{};
+  auto sf2_retrace_ticks = std::uint64_t{};
+  auto sf2_cd_completion_interrupts = std::size_t{};
+  std::uint32_t sf2_cd_completion_callback_at_interrupt{};
+  std::vector<std::array<std::uint32_t, 3U>> sf2_cd_completion_trace;
+  auto sf2_cd_dma_callbacks = std::size_t{};
+  auto sf2_spu_dma_callbacks = std::size_t{};
+  std::string sf2_scheduler_failure;
+  std::optional<sf::game::LegacyGameplayVmResult> sf2_callback_failure;
+  std::uint32_t sf2_callback_failure_slot{};
+  std::uint32_t sf2_callback_failure_address{};
+  const auto service_sf2_cd_callback = [&]() {
+    if ((vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 2U) {
+      ++sf2_cd_completion_interrupts;
+      static_cast<void>(vm.runtime().read32(
+          0x8011d1bcU, sf2_cd_completion_callback_at_interrupt));
+      std::uint16_t pending_command{};
+      const auto cdrom = vm.machine().cdrom().captureState();
+      static_cast<void>(
+          vm.runtime().read16(0x8011bdf2U, pending_command));
+      if (sf2_cd_completion_trace.size() < 32U) {
+        sf2_cd_completion_trace.push_back(
+            {pending_command, sf2_cd_completion_callback_at_interrupt,
+             cdrom.response_count != 0U
+                 ? cdrom.response[cdrom.response_position]
+                 : 0xffffffffU});
+      }
+    }
+    return vm.servicePsxCdReadyCallback();
+  };
+  const auto advance_sf2_retrace_counter = [&](std::uint64_t ticks) {
+    sf2_retrace_ticks += ticks;
+    const auto retraces = sf2_retrace_ticks / sf2_retrace_period;
+    sf2_retrace_ticks %= sf2_retrace_period;
+    if (retraces == 0U) {
+      return true;
+    }
+    std::uint32_t counter{};
+    return vm.runtime().read32(layout.retrace_counter_address, counter) &&
+           vm.runtime().write32(
+               layout.retrace_counter_address,
+               counter + static_cast<std::uint32_t>(retraces));
+  };
+  const auto advance_sf2_root_callbacks = [&](std::uint64_t ticks) {
+    sf2_task_callback_ticks += ticks;
+    while (sf2_task_callback_ticks >= sf2_task_callback_period) {
+      sf2_task_callback_ticks -= sf2_task_callback_period;
+      for (const auto slot : sf2_root_callback_slots) {
+        sf::game::LegacyGameplayVmResult callback_result;
+        sf2_servicing_scheduled_callback = true;
+        const auto callback_succeeded = vm.servicePsxCallbackSlot(
+            slot, sf2_callback_stack, &callback_result);
+        sf2_servicing_scheduled_callback = false;
+        if (!callback_succeeded) {
+          sf2_callback_failure = callback_result;
+          sf2_callback_failure_slot = slot;
+          static_cast<void>(
+              vm.runtime().read32(slot, sf2_callback_failure_address));
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+  const auto service_sf2_spu_dma_callback = [&]() {
+    constexpr std::uint32_t dma_interrupt_control_address = 0x1f8010f4U;
+    constexpr std::uint32_t spu_dma_flag = 1U << (24U + 4U);
+    constexpr std::uint32_t spu_transfer_callback_slot = 0x8011e3acU;
+    std::uint32_t interrupt_control{};
+    if (!vm.runtime().read32(dma_interrupt_control_address,
+                             interrupt_control)) {
+      return false;
+    }
+    if ((interrupt_control & spu_dma_flag) == 0U) {
+      return true;
+    }
+    sf::game::LegacyGameplayVmResult callback_result;
+    if (!vm.runtime().write32(dma_interrupt_control_address,
+                              (interrupt_control & 0x00ffffffU) |
+                                  spu_dma_flag) ||
+        !vm.servicePsxCallbackSlot(spu_transfer_callback_slot,
+                                   sf2_callback_stack, &callback_result)) {
+      sf2_callback_failure = callback_result;
+      sf2_callback_failure_slot = spu_transfer_callback_slot;
+      static_cast<void>(vm.runtime().read32(spu_transfer_callback_slot,
+                                            sf2_callback_failure_address));
+      return false;
+    }
+    ++sf2_spu_dma_callbacks;
+    return true;
+  };
+  const auto service_sf2_cd_dma_callback = [&]() {
+    constexpr std::uint32_t dma_interrupt_control_address = 0x1f8010f4U;
+    constexpr std::uint32_t cd_dma_flag = 1U << (24U + 3U);
+    // Retail DMACallback at 0x801011a4 indexes the SDK callback array as
+    // 0x8011d108 + channel * 4. STR registers channel 3 through
+    // 0x800f61cc -> 0x800f4c20.
+    constexpr std::uint32_t cd_transfer_callback_slot = 0x8011d114U;
+    std::uint32_t interrupt_control{};
+    if (!vm.runtime().read32(dma_interrupt_control_address,
+                             interrupt_control)) {
+      return false;
+    }
+    if ((interrupt_control & cd_dma_flag) == 0U) {
+      return true;
+    }
+    sf::game::LegacyGameplayVmResult callback_result;
+    if (!vm.runtime().write32(dma_interrupt_control_address,
+                              (interrupt_control & 0x00ffffffU) |
+                                  cd_dma_flag) ||
+        !vm.servicePsxCallbackSlot(cd_transfer_callback_slot,
+                                   sf2_callback_stack, &callback_result)) {
+      sf2_callback_failure = callback_result;
+      sf2_callback_failure_slot = cd_transfer_callback_slot;
+      static_cast<void>(vm.runtime().read32(cd_transfer_callback_slot,
+                                            sf2_callback_failure_address));
+      return false;
+    }
+    ++sf2_cd_dma_callbacks;
+    return true;
+  };
+  const auto service_sf2_scheduler_slice = [&](std::uint64_t ticks) {
+    sf2_scheduler_failure.clear();
+    sf2_callback_failure.reset();
+    sf2_callback_failure_slot = 0U;
+    sf2_callback_failure_address = 0U;
+    if (suppress_guest_interrupts) {
+      vm.machine().advanceHardwareTicks(ticks);
+    }
+    if (!advance_sf2_retrace_counter(ticks)) {
+      sf2_scheduler_failure = "retrace";
+      return false;
+    }
+    if (!service_sf2_cd_callback()) {
+      sf2_scheduler_failure = "cd-ready";
+      return false;
+    }
+    if (!service_sf2_cd_dma_callback()) {
+      sf2_scheduler_failure = "cd-dma";
+      return false;
+    }
+    if (!service_sf2_spu_dma_callback()) {
+      sf2_scheduler_failure = "spu-dma";
+      return false;
+    }
+    if (!advance_sf2_root_callbacks(ticks)) {
+      sf2_scheduler_failure = "root-counter";
+      return false;
+    }
+    return true;
+  };
+  const auto run_scheduled_until_boundary = [&](std::uint32_t address) {
+    constexpr std::uint32_t interrupt_status_address = 0x1f801070U;
+    if (suppress_guest_interrupts) {
+      static_cast<void>(vm.runtime().write16(interrupt_status_address, 0U));
+      vm.runtime().setExternalInterrupt(false);
+    }
+    auto remaining = budget;
+    auto total_instructions = std::uint64_t{};
+    sf::game::LegacyGameplayVmResult result;
+    for (;;) {
+      const auto slice = std::min(remaining, scheduler_slice_budget);
+      result = suppress_guest_interrupts
+                   ? vm.runCurrentPcUntilHostBoundaryClockNeutral(address,
+                                                                  slice)
+                   : vm.runCurrentPcUntilHostBoundary(address, slice);
+      total_instructions += result.execution.instructions;
+      if (!service_sf2_scheduler_slice(result.execution.instructions)) {
+        result.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        result.execution.instructions = total_instructions;
+        return result;
+      }
+      if (suppress_guest_interrupts) {
+        static_cast<void>(vm.runtime().write16(interrupt_status_address, 0U));
+        vm.runtime().setExternalInterrupt(false);
+      }
+      if (result.stoppedAtHostBoundary() ||
+          result.execution.reason !=
+              sf::psx::R3000StopReason::instruction_budget ||
+          remaining <= slice) {
+        result.execution.instructions = total_instructions;
+        return result;
+      }
+      remaining -= slice;
+    }
+  };
+  const auto invoke_scheduled = [&](std::uint32_t address,
+                                    std::span<const std::uint32_t> arguments) {
+    auto remaining = budget;
+    const auto first_slice = std::min(remaining, scheduler_slice_budget);
+    auto result = suppress_guest_interrupts
+                      ? vm.invokeClockNeutral(address, arguments, first_slice)
+                      : vm.invoke(address, arguments, first_slice);
+    auto total_instructions = result.execution.instructions;
+    remaining -= first_slice;
+    if (!service_sf2_scheduler_slice(result.execution.instructions)) {
+      result.execution.reason = sf::psx::R3000StopReason::memory_fault;
+      result.execution.instructions = total_instructions;
+      return result;
+    }
+    while (result.execution.reason ==
+               sf::psx::R3000StopReason::instruction_budget &&
+           remaining != 0U) {
+      const auto slice = std::min(remaining, scheduler_slice_budget);
+      if (suppress_guest_interrupts) {
+        vm.runtime().setExternalInterrupt(false);
+      }
+      result = suppress_guest_interrupts
+                   ? vm.resumeCurrentPcClockNeutral(slice)
+                   : vm.resumeCurrentPc(slice);
+      total_instructions += result.execution.instructions;
+      remaining -= slice;
+      if (!service_sf2_scheduler_slice(result.execution.instructions)) {
+        result.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        break;
+      }
+    }
+    result.execution.instructions = total_instructions;
+    return result;
+  };
+  const auto invoke_nested_scheduled =
+      [&](std::uint32_t address, std::span<const std::uint32_t> arguments) {
+        constexpr std::uint32_t return_trampoline = 0x8000c000U;
+        const auto continuation_state = vm.runtime().state();
+        vm.bindHostCall(return_trampoline,
+                        [](sf::game::LegacyHostCallContext &context) {
+                          context.continueGuestInstruction();
+                        });
+        if (!vm.runtime().beginCall(address, arguments)) {
+          return sf::game::LegacyGameplayVmResult{
+              {sf::psx::R3000StopReason::memory_fault, 0U, address, 0U},
+              vm.runtime().state().gpr[2U],
+              0U,
+              std::nullopt,
+          };
+        }
+        vm.runtime().setRegister(31U, return_trampoline);
+        auto result = run_scheduled_until_boundary(return_trampoline);
+        if (result.stoppedAtHostBoundary() || result.completed()) {
+          vm.runtime().restoreCpuState(continuation_state);
+        }
+        return result;
+      };
+  const auto trace_boundaries = [&](BoundaryTrace &trace) {
+    for (std::size_t frame = 0U; frame < frame_boundary_count; ++frame) {
+      const auto boundary =
+          run_scheduled_until_boundary(guest_profile.gpu_submission_entry);
+      if (!boundary.stoppedAtHostBoundary()) {
+        std::cerr << "SF2 guest stopped before GPU boundary " << frame
+                  << ": stop=0x" << std::hex << std::uppercase
+                  << boundary.execution.pc << std::dec
+                  << " reason=" << sf::psx::toString(boundary.execution.reason)
+                  << " instructions=" << boundary.execution.instructions
+                  << '\n';
+        return false;
+      }
+      trace.instructions[frame] = boundary.execution.instructions;
+      trace.return_addresses[frame] = vm.runtime().state().gpr[31U];
+      if (!vm.runtime().read32(layout.retrace_counter_address,
+                               trace.retrace_counters[frame]) ||
+          !vm.runtime().read32(guest_profile.application_state,
+                               trace.application_states[frame])) {
+        return false;
+      }
+
+      // Retire the observed GPU host call before looking for the following
+      // boundary. Otherwise the boundary-aware pump correctly yields again at
+      // the same PC without proving that the guest loop advanced.
+      const auto retired = vm.resumeCurrentPcClockNeutral(1U);
+      if (retired.execution.reason !=
+          sf::psx::R3000StopReason::instruction_budget) {
+        std::cerr << "SF2 guest could not retire GPU boundary " << frame
+                  << ": stop=0x" << std::hex << std::uppercase
+                  << retired.execution.pc << std::dec
+                  << " reason=" << sf::psx::toString(retired.execution.reason)
+                  << '\n';
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // The executable can reach its state-loop entry with a bootstrap INT1
+  // already pending. Deliver that retail callback before entering the first
+  // application slice; otherwise Common_Init(1)'s immediate Setloc retries
+  // all observe the stale controller IRQ before the periodic scheduler gets
+  // its first chance to run.
+  if (!service_sf2_scheduler_slice(0U)) {
+    return 4;
+  }
+  const auto state_loop_snapshot = vm.captureSnapshot();
+  BoundaryTrace trace;
+  if (!trace_boundaries(trace)) {
+    return 4;
+  }
+  if (!vm.restoreSnapshot(state_loop_snapshot)) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Could not restore SF2 state-loop snapshot"};
+  }
+  BoundaryTrace replay;
+  if (!trace_boundaries(replay) || replay.instructions != trace.instructions ||
+      replay.retrace_counters != trace.retrace_counters ||
+      replay.return_addresses != trace.return_addresses ||
+      replay.application_states != trace.application_states) {
+    std::cerr << "SF2 guest GPU boundary replay diverged\n";
+    return 5;
+  }
+  const auto init_code_is_loaded = [&]() {
+    std::array<std::byte, init_code_probe_size> guest_code{};
+    return init_code_offset + guest_code.size() <= init_overlay.size() &&
+           vm.runtime().copyBytes(
+               0x80158878U + static_cast<std::uint32_t>(init_code_offset),
+               guest_code) &&
+           std::ranges::equal(guest_code,
+                              std::span<const std::byte>{init_overlay}.subspan(
+                                  init_code_offset, guest_code.size()));
+  };
+  // The first state-loop boundary can still own the executable's bootstrap
+  // read. Starting Common_Init from that point races a second CdRead against
+  // stale INT1 sectors. Keep executing the retail loop until libcd and the
+  // controller have remained idle for one complete 20 Hz task period, then
+  // use that application-owned continuation for every later transition.
+  suppress_guest_interrupts = true;
+  constexpr std::uint32_t interrupt_status_address = 0x1f801070U;
+  static_cast<void>(vm.runtime().write16(interrupt_status_address, 0U));
+  vm.runtime().setExternalInterrupt(false);
+  const auto sf2_cd_is_quiescent = [&]() {
+    const auto cdrom = vm.machine().cdrom().captureState();
+    std::uint8_t guest_read_cleanup{};
+    return vm.runtime().read8(0x8011cf6cU, guest_read_cleanup) &&
+           guest_read_cleanup == 0U &&
+           (cdrom.interrupt_flags & 0x07U) == 0U &&
+           cdrom.pending_command == 0U &&
+           cdrom.command_phase == sf::psx::CdRomCommandPhase::idle &&
+           cdrom.reading == 0U && cdrom.seeking == 0U &&
+           cdrom.command_event.pending == 0U &&
+           cdrom.sector_event.pending == 0U;
+  };
+  const auto sf2_frontend_bootstrap_is_ready = [&]() {
+    std::uint8_t disc_index{};
+    std::uint32_t task_callback{};
+    return sf2_cd_is_quiescent() &&
+           vm.runtime().read8(0x8011f608U, disc_index) &&
+           (!probe_mission_transition || disc_index < 2U) &&
+           vm.runtime().read32(sf2_root_callback_slots.front(),
+                               task_callback) &&
+           task_callback == 0x80022584U &&
+           (!probe_mission_transition || init_code_is_loaded());
+  };
+  auto resident_boundaries = frame_boundary_count;
+  auto quiescent_boundaries = std::size_t{};
+  constexpr std::size_t bootstrap_settle_boundary_limit = 2'000U;
+  while (resident_boundaries < bootstrap_settle_boundary_limit &&
+         quiescent_boundaries < 1U) {
+    const auto was_quiescent = sf2_frontend_bootstrap_is_ready();
+    const auto boundary =
+        run_scheduled_until_boundary(guest_profile.gpu_submission_entry);
+    if (!boundary.stoppedAtHostBoundary()) {
+      std::uint32_t failed_application_state{};
+      std::uint32_t failed_hog_offset{};
+      std::uint32_t failed_task_callback{};
+      std::uint8_t failed_disc_index{};
+      std::uint8_t failed_read_cleanup{};
+      static_cast<void>(vm.runtime().read32(guest_profile.application_state,
+                                             failed_application_state));
+      static_cast<void>(
+          vm.runtime().read32(0x801b92b4U, failed_hog_offset));
+      static_cast<void>(
+          vm.runtime().read8(0x8011f608U, failed_disc_index));
+      static_cast<void>(vm.runtime().read32(sf2_root_callback_slots.front(),
+                                            failed_task_callback));
+      static_cast<void>(
+          vm.runtime().read8(0x8011cf6cU, failed_read_cleanup));
+      const auto failed_cdrom = vm.machine().cdrom().captureState();
+      std::cerr << "SF2 bootstrap did not settle at an application frame: "
+                << "stop=0x" << std::hex << std::uppercase
+                << boundary.execution.pc << std::dec << " reason="
+                << sf::psx::toString(boundary.execution.reason)
+                << " instructions=" << boundary.execution.instructions
+                << " t1=0x" << std::hex << std::uppercase
+                << vm.runtime().state().gpr[9U] << " ra=0x"
+                << vm.runtime().state().gpr[31U] << " a0=0x"
+                << vm.runtime().state().gpr[4U] << " a1=0x"
+                << vm.runtime().state().gpr[5U] << std::dec
+                << " app=" << failed_application_state
+                << " disc-index="
+                << static_cast<unsigned int>(failed_disc_index)
+                << " hog=0x" << std::hex << std::uppercase
+                << failed_hog_offset << " task=0x" << failed_task_callback
+                << std::dec << " init-code="
+                << (init_code_is_loaded() ? 1 : 0)
+                << " read-cleanup="
+                << static_cast<unsigned int>(failed_read_cleanup)
+                << " cd=" << static_cast<unsigned int>(
+                                   failed_cdrom.interrupt_flags & 0x07U)
+                << '/' << static_cast<unsigned int>(failed_cdrom.pending_command)
+                << '/' << static_cast<unsigned int>(failed_cdrom.reading)
+                << '/' << static_cast<unsigned int>(failed_cdrom.seeking)
+                << " opens=";
+      for (const auto &path : sf2_file_open_paths) {
+        std::cerr << path << '/';
+      }
+      std::cerr << '\n';
+      return 6;
+    }
+    ++resident_boundaries;
+    if (!sf2_frontend_bootstrap_is_ready()) {
+      quiescent_boundaries = 0U;
+    } else if (was_quiescent) {
+      ++quiescent_boundaries;
+    } else {
+      quiescent_boundaries = 1U;
+    }
+    const auto retired = vm.resumeCurrentPcClockNeutral(1U);
+    const auto frame_padding =
+        boundary.execution.instructions < sf2_retrace_period
+            ? sf2_retrace_period - boundary.execution.instructions
+            : 0U;
+    if (retired.execution.reason !=
+            sf::psx::R3000StopReason::instruction_budget ||
+        !service_sf2_scheduler_slice(retired.execution.instructions +
+                                     frame_padding)) {
+      return 6;
+    }
+  }
+  if (quiescent_boundaries < 1U) {
+    const auto cdrom = vm.machine().cdrom().captureState();
+    std::cerr << "SF2 bootstrap CD path did not become quiescent: irq="
+              << static_cast<unsigned int>(cdrom.interrupt_flags & 0x07U)
+              << " command="
+              << static_cast<unsigned int>(cdrom.pending_command)
+              << " reading=" << static_cast<unsigned int>(cdrom.reading)
+              << " seeking=" << static_cast<unsigned int>(cdrom.seeking)
+              << " boundaries=" << resident_boundaries << '\n';
+    return 6;
+  }
+  const auto resident_loop_snapshot = vm.captureSnapshot();
+  std::vector<std::byte> guest_init_overlay(init_overlay.size());
+  const auto init_overlay_loaded =
+      !init_overlay.empty() &&
+      vm.runtime().copyBytes(0x80158878U, guest_init_overlay) &&
+      std::ranges::equal(guest_init_overlay, init_overlay);
+  const auto init_code_loaded = init_code_is_loaded();
+
+  std::cout << "SF2 guest bootstrap passed: disc="
+            << static_cast<unsigned int>(disc.game()->disc_number)
+            << " entry=0x" << std::hex << std::uppercase
+            << disc.executable().header().initial_pc << " state-loop=0x"
+            << guest_profile.state_loop_entry << " gpu-submit=0x"
+            << guest_profile.gpu_submission_entry << std::dec
+            << " state-loop-instructions=" << state_loop.execution.instructions
+            << " frame-boundaries=" << frame_boundary_count
+            << " frame-instructions=";
+  for (std::size_t frame = 0U; frame < frame_boundary_count; ++frame) {
+    if (frame != 0U) {
+      std::cout << '/';
+    }
+    std::cout << trace.instructions[frame];
+  }
+  std::cout << " retrace=";
+  for (std::size_t frame = 0U; frame < frame_boundary_count; ++frame) {
+    if (frame != 0U) {
+      std::cout << '/';
+    }
+    std::cout << trace.retrace_counters[frame];
+  }
+  std::cout << " callers=";
+  for (std::size_t frame = 0U; frame < frame_boundary_count; ++frame) {
+    if (frame != 0U) {
+      std::cout << '/';
+    }
+    std::cout << "0x" << std::hex << std::uppercase
+              << trace.return_addresses[frame] << std::dec;
+  }
+  std::cout << " states=";
+  for (std::size_t frame = 0U; frame < frame_boundary_count; ++frame) {
+    if (frame != 0U) {
+      std::cout << '/';
+    }
+    std::cout << trace.application_states[frame];
+  }
+  std::cout << " replay=identical resident-init="
+            << (!probe_mission_transition ? "not-checked"
+                : init_overlay_loaded     ? "exact"
+                : init_code_loaded        ? "code-exact"
+                                          : "missing-or-different")
+             << " resident-boundaries=" << resident_boundaries;
+  if (!probe_mission_transition) {
+    std::cout << '\n';
+    return 0;
+  }
+
+  // Common_Init(4) is the mission-mode initializer. Invoking it here starts
+  // the default COLO mission and is not a frontend bootstrap checkpoint.
+  // Continue from the quiescent executable frame into the retail selector
+  // instead of using that old synthetic detour.
+  std::cout << " common-init4=not-invoked\n";
+
+  // MENU.OVL and TITLE.OVL both enter MissionArchive_Open with the zero-based
+  // selection index followed by two true flags. Execute that retail
+  // transition directly, then return to the original application loop so its
+  // state-12 loader owns every subsequent FOG and overlay operation.
+  if (!vm.restoreSnapshot(resident_loop_snapshot)) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Could not restore SF2 mission-selection snapshot"};
+  }
+  enable_sf2_mission_search = true;
+  enable_sf2_resident_overlay_load = true;
+  enable_sf2_resident_file_access = true;
+  std::uint32_t continuous_state{};
+  std::uint32_t continuous_depth{};
+  if (!vm.runtime().read32(guest_profile.application_state, continuous_state) ||
+      !vm.runtime().read32(guest_profile.application_state_depth,
+                           continuous_depth)) {
+    return 7;
+  }
+  // Executable bootstrap already ran Common_Init(1) before entering this
+  // state loop. Re-entering it reloads INIT over live allocator state. Resume
+  // only this initialized retail frame and verify its resident MOVIE code.
+  const auto movie_file = resident_files.find("MOVIE.OVL");
+  std::vector<std::byte> continuous_movie_bytes;
+  if (movie_file != resident_files.end()) {
+    continuous_movie_bytes.resize(movie_file->second.size());
+  }
+  const auto continuous_movie_exact =
+      !continuous_movie_bytes.empty() &&
+      vm.runtime().copyBytes(0x80142150U, continuous_movie_bytes) &&
+      std::ranges::equal(continuous_movie_bytes, movie_file->second);
+  auto continuous_movie_code_exact = false;
+  if (movie_file != resident_files.end()) {
+    const auto movie_code_offset =
+        sequelResidentOverlayCodeOffset(movie_file->second, 0x80142150U);
+    std::array<std::byte, init_code_probe_size> guest_movie_code{};
+    continuous_movie_code_exact =
+        movie_code_offset + guest_movie_code.size() <=
+            movie_file->second.size() &&
+        vm.runtime().copyBytes(
+            0x80142150U + static_cast<std::uint32_t>(movie_code_offset),
+            guest_movie_code) &&
+        std::ranges::equal(
+            guest_movie_code,
+            std::span<const std::byte>{movie_file->second}.subspan(
+                movie_code_offset, guest_movie_code.size()));
+  }
+  std::array<std::uint32_t, 4U> continuous_movie_state{};
+  std::uint8_t continuous_disc_index{};
+  static_cast<void>(vm.runtime().read8(0x8011f608U,
+                                       continuous_disc_index));
+  for (std::size_t index = 0U; index < continuous_movie_state.size(); ++index) {
+    static_cast<void>(vm.runtime().read32(
+        0x80146710U + static_cast<std::uint32_t>(index * 4U),
+        continuous_movie_state[index]));
+  }
+  std::cerr << "SF2 continuous frontend diagnostic: common-init1=bootstrap"
+            << " exact=" << (continuous_movie_exact ? 1 : 0)
+            << " code-exact=" << (continuous_movie_code_exact ? 1 : 0)
+            << " resident-file=" << sf2_resident_file_open_bridges << '/'
+            << sf2_resident_file_load_bridges << " overlay="
+            << sf2_last_resident_overlay_name << "@0x" << std::hex
+            << std::uppercase
+            << sf2_last_resident_overlay_address << std::dec << ':'
+            << sf2_last_resident_overlay_mode << '/'
+            << sf2_resident_overlay_load_bridges << " movie/title="
+            << sf2_movie_overlay_load_bridges << '/'
+            << sf2_title_overlay_load_bridges
+            << " disc-index="
+            << static_cast<unsigned int>(continuous_disc_index)
+            << " cd-search=" << sf2_search_matches << '/'
+            << sf2_search_calls
+            << " movie-state=" << std::hex << std::uppercase
+            << continuous_movie_state[0] << '/' << continuous_movie_state[1]
+            << '/' << continuous_movie_state[2] << '/'
+            << continuous_movie_state[3] << std::dec << " common-init=";
+  for (std::size_t index = 0U; index < sf2_common_init_arguments.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << sf2_common_init_arguments[index];
+  }
+  std::cerr << " disc-open=";
+  for (std::size_t index = 0U;
+       index < sf2_common_disc_open_results.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << sf2_common_disc_open_results[index];
+  }
+  std::cerr << " seek=";
+  for (std::size_t index = 0U; index < sf2_file_seek_results.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << sf2_file_seek_results[index][0] << ','
+              << sf2_file_seek_results[index][1] << std::dec;
+  }
+  std::cerr << '\n';
+  std::cerr << "SF2 file-open diagnostic:";
+  for (const auto &path : sf2_file_open_paths) {
+    std::cerr << ' ' << path;
+  }
+  std::cerr << '\n';
+  if (!continuous_movie_code_exact) {
+    return 7;
+  }
+  std::uint32_t sf2_task_callback{};
+  if (!vm.runtime().read32(sf2_root_callback_slots.front(),
+                           sf2_task_callback) ||
+      sf2_task_callback != 0x80022584U) {
+    return 7;
+  }
+  auto movie_stream_starts = std::size_t{};
+  auto movie_ready_dispatches = std::size_t{};
+  auto title_handoffs = std::size_t{};
+  auto title_mission_opens = std::size_t{};
+  auto title_frame_updates = std::size_t{};
+  auto title_selector_calls = std::size_t{};
+  auto state_loop_epilogues = std::size_t{};
+  auto game_main_returns = std::size_t{};
+  std::uint32_t title_frame_return{};
+  std::uint32_t title_selector_return{};
+  std::array<std::uint32_t, 3U> title_mission_arguments{};
+  std::vector<std::array<std::uint32_t, 2U>> title_selector_arguments;
+  auto title_input_dispatches = std::size_t{};
+  auto title_confirm_callbacks = std::size_t{};
+  auto title_accept_callbacks = std::size_t{};
+  auto title_cancel_callbacks = std::size_t{};
+  std::vector<std::array<std::uint32_t, 3U>> title_button_edges;
+  std::vector<std::array<std::uint32_t, 4U>> title_pad_reads;
+  auto movie_open_calls = std::size_t{};
+  auto movie_open_returns = std::size_t{};
+  std::array<std::uint32_t, 8U> movie_open_arguments{};
+  std::uint32_t movie_open_result{};
+  std::uint8_t movie_open_active{};
+  std::array<std::size_t, 7U> movie_task_trace{};
+  constexpr std::array<std::uint32_t, 7U> movie_task_entries{
+      0x8002686cU, 0x800226d4U, 0x80022584U, 0x800266d4U,
+      0x800265a8U, 0x8002619cU, 0x8002676cU};
+  std::vector<std::array<std::uint32_t, 3U>> movie_sync_results;
+  auto movie_ring_callbacks = std::size_t{};
+  std::array<std::uint32_t, 3U> movie_dma_registration{};
+  auto movie_cd_dma_starts = std::size_t{};
+  std::vector<std::uint32_t> movie_cd_read_start_times;
+  std::vector<std::array<std::uint32_t, 6U>> movie_ready_trace;
+  std::vector<std::uint32_t> title_input_states;
+  constexpr std::array movie_preflight_entries{
+      0x800f7808U, 0x800f703cU, 0x80153d30U,
+      0x8002a338U, 0x80153e24U, 0x8002b9a8U,
+      0x8002a028U, 0x800296e8U};
+  vm.bindHostCall(
+      movie_preflight_entries[0],
+      [&movie_stream_starts](sf::game::LegacyHostCallContext &context) {
+        ++movie_stream_starts;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[1],
+      [&movie_ready_dispatches,
+       &movie_ready_trace](sf::game::LegacyHostCallContext &context) {
+        ++movie_ready_dispatches;
+        if (movie_ready_trace.size() < 16U) {
+          std::array<std::uint32_t, 6U> trace{
+              context.registerValue(4U), context.registerValue(5U)};
+          static_cast<void>(context.read32(0x8011cf58U, trace[2U]));
+          static_cast<void>(context.read32(0x8011cf5cU, trace[3U]));
+          static_cast<void>(context.read32(0x8011cf60U, trace[4U]));
+          static_cast<void>(context.read32(0x8011cf68U, trace[5U]));
+          movie_ready_trace.push_back(trace);
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[2],
+      [&title_handoffs](sf::game::LegacyHostCallContext &context) {
+        ++title_handoffs;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[3],
+      [&title_mission_opens,
+       &title_mission_arguments](sf::game::LegacyHostCallContext &context) {
+        ++title_mission_opens;
+        title_mission_arguments = {context.argument(0), context.argument(1),
+                                   context.argument(2)};
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[4],
+      [&title_frame_updates,
+       &title_frame_return](sf::game::LegacyHostCallContext &context) {
+        ++title_frame_updates;
+        title_frame_return = context.registerValue(31U);
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[5],
+      [&title_selector_calls,
+       &title_selector_return,
+       &title_selector_arguments](sf::game::LegacyHostCallContext &context) {
+        ++title_selector_calls;
+        title_selector_return = context.registerValue(31U);
+        if (title_selector_arguments.size() < 16U) {
+          title_selector_arguments.push_back(
+              {context.argument(0), context.argument(1)});
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[6],
+      [&state_loop_epilogues](sf::game::LegacyHostCallContext &context) {
+        ++state_loop_epilogues;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      movie_preflight_entries[7],
+      [&game_main_returns](sf::game::LegacyHostCallContext &context) {
+        ++game_main_returns;
+        context.continueGuestInstruction();
+      });
+  auto movie_preflight_stop = sf::game::LegacyGameplayVmResult{};
+  std::vector<std::uint32_t> movie_preflight_title_states;
+  std::vector<std::uint32_t> movie_preflight_application_states;
+  std::vector<std::uint8_t> movie_preflight_transitions;
+  enum class TitlePadPulse {
+    waiting,
+    armed,
+    pressed,
+    released,
+  };
+  auto title_pad_pulse = TitlePadPulse::waiting;
+  auto title_pad_samples = std::size_t{};
+  std::uint16_t title_injected_buttons{};
+  constexpr std::uint32_t sf2_primary_pad_state = 0x80122fecU;
+  vm.bindHostCall(
+      0x801538c4U,
+      [&title_input_dispatches, &title_input_states](
+          sf::game::LegacyHostCallContext &context) {
+        ++title_input_dispatches;
+        const auto title_state = context.argument(0);
+        if (title_input_states.size() < 32U &&
+            (title_input_states.empty() ||
+             title_input_states.back() != title_state)) {
+          title_input_states.push_back(title_state);
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x80153a34U,
+      [&title_button_edges,
+       &title_pad_pulse](sf::game::LegacyHostCallContext &context) {
+        std::uint32_t edge{};
+        static_cast<void>(
+            context.read32(context.registerValue(29U) + 0x14U, edge));
+        if (title_button_edges.size() < 16U) {
+          title_button_edges.push_back(
+              {context.registerValue(17U), edge, context.registerValue(19U)});
+        }
+        if ((edge & 0x0008U) != 0U) {
+          title_pad_pulse = TitlePadPulse::released;
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x8015394cU,
+      [&title_pad_reads](sf::game::LegacyHostCallContext &context) {
+        if (title_pad_reads.size() < 32U) {
+          std::uint32_t previous{};
+          static_cast<void>(context.read32(context.registerValue(18U),
+                                           previous));
+          title_pad_reads.push_back(
+              {context.registerValue(17U), previous,
+               context.registerValue(16U), context.registerValue(19U)});
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x80153930U,
+      [&title_pad_pulse, &title_pad_samples,
+       &title_injected_buttons](sf::game::LegacyHostCallContext &context) {
+        std::uint32_t pad_state{};
+        if (!context.read32(context.registerValue(29U) + 0x10U,
+                            pad_state) ||
+            pad_state == 0U) {
+          context.rejectHostCall();
+          return;
+        }
+        if (context.registerValue(20U) == 0U) {
+          ++title_pad_samples;
+          title_injected_buttons = 0U;
+          if (title_pad_pulse == TitlePadPulse::waiting) {
+            title_pad_pulse = TitlePadPulse::armed;
+          } else if (title_pad_pulse == TitlePadPulse::armed &&
+                     title_pad_samples >= 16U) {
+            title_injected_buttons = 0x0008U;
+            title_pad_pulse = TitlePadPulse::pressed;
+          } else if (title_pad_pulse == TitlePadPulse::pressed) {
+            title_injected_buttons = 0x0008U;
+          }
+        }
+        if (!context.write8(pad_state, 0U) ||
+            !context.write16(pad_state + 4U, title_injected_buttons)) {
+          context.rejectHostCall();
+          return;
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x800222bcU,
+      [&title_pad_pulse, &title_pad_samples, &title_injected_buttons,
+       sf2_primary_pad_state](sf::game::LegacyHostCallContext &context) {
+        std::uint32_t title_state{};
+        const auto pad_index = context.argument(1);
+        if ((pad_index != 0U && pad_index != 4U) ||
+            !context.read32(0x80156bdcU, title_state) ||
+            title_state != 3U) {
+          context.continueGuestInstruction();
+          return;
+        }
+        if (pad_index == 0U) {
+          ++title_pad_samples;
+          title_injected_buttons = 0U;
+          if (title_pad_pulse == TitlePadPulse::waiting) {
+            title_pad_pulse = TitlePadPulse::armed;
+          } else if (title_pad_pulse == TitlePadPulse::armed &&
+                     title_pad_samples >= 16U) {
+            title_injected_buttons = 0x0008U;
+            title_pad_pulse = TitlePadPulse::pressed;
+          } else if (title_pad_pulse == TitlePadPulse::pressed) {
+            title_injected_buttons = 0x0008U;
+          }
+        }
+        const auto pad_state =
+            sf2_primary_pad_state + pad_index * 60U;
+        if (!context.write8(pad_state, 0U) ||
+            !context.write16(pad_state + 4U, title_injected_buttons)) {
+          context.rejectHostCall();
+          return;
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x801501f0U,
+      [&title_confirm_callbacks](sf::game::LegacyHostCallContext &context) {
+        ++title_confirm_callbacks;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x80151db0U,
+      [&title_accept_callbacks](sf::game::LegacyHostCallContext &context) {
+        ++title_accept_callbacks;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x80152264U,
+      [&title_cancel_callbacks](sf::game::LegacyHostCallContext &context) {
+        ++title_cancel_callbacks;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x80142e60U,
+      [&movie_open_calls,
+       &movie_open_arguments](sf::game::LegacyHostCallContext &context) {
+        ++movie_open_calls;
+        movie_open_arguments[0] = context.argument(0);
+        movie_open_arguments[1] = context.argument(1);
+        movie_open_arguments[2] = context.argument(2);
+        movie_open_arguments[3] = context.argument(3);
+        const auto stack = context.registerValue(29U);
+        for (std::size_t index = 4U; index < movie_open_arguments.size();
+             ++index) {
+          static_cast<void>(context.read32(
+              stack + static_cast<std::uint32_t>(index * 4U),
+              movie_open_arguments[index]));
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x8002c27cU,
+      [&movie_open_returns, &movie_open_result,
+       &movie_open_active](sf::game::LegacyHostCallContext &context) {
+        ++movie_open_returns;
+        movie_open_result = context.registerValue(2U);
+        static_cast<void>(context.read8(0x80146710U, movie_open_active));
+        context.continueGuestInstruction();
+      });
+  for (std::size_t index = 0U; index < movie_task_entries.size(); ++index) {
+    vm.bindHostCall(
+        movie_task_entries[index],
+        [&movie_task_trace, index](
+            sf::game::LegacyHostCallContext &context) {
+          ++movie_task_trace[index];
+          context.continueGuestInstruction();
+        });
+  }
+  vm.bindHostCall(
+      0x800266fcU,
+      [&movie_sync_results](sf::game::LegacyHostCallContext &context) {
+        if (movie_sync_results.size() < 32U) {
+          std::uint8_t callback_result{};
+          std::uint8_t completion_result{};
+          std::uint8_t completion_state{};
+          static_cast<void>(context.read8(context.registerValue(29U) + 0x10U,
+                                          callback_result));
+          static_cast<void>(context.read8(0x80141a10U, completion_result));
+          static_cast<void>(context.read8(0x8011d498U, completion_state));
+          movie_sync_results.push_back(
+              {context.registerValue(2U), callback_result,
+               (static_cast<std::uint32_t>(completion_state) << 8U) |
+                   completion_result});
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x800ff11cU,
+      [&movie_ring_callbacks](sf::game::LegacyHostCallContext &context) {
+        ++movie_ring_callbacks;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x80104308U,
+      [&movie_cd_dma_starts](sf::game::LegacyHostCallContext &context) {
+        ++movie_cd_dma_starts;
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x800f7548U,
+      [&movie_cd_read_start_times](
+          sf::game::LegacyHostCallContext &context) {
+        if (movie_cd_read_start_times.size() < 8U) {
+          movie_cd_read_start_times.push_back(context.registerValue(2U));
+        }
+        context.continueGuestInstruction();
+      });
+  vm.bindHostCall(
+      0x800f4c20U,
+      [&movie_dma_registration](sf::game::LegacyHostCallContext &context) {
+        std::uint32_t dispatch{};
+        static_cast<void>(context.read32(0x8011ce78U, dispatch));
+        movie_dma_registration[0U] = context.registerValue(4U);
+        movie_dma_registration[1U] = context.registerValue(5U);
+        if (dispatch != 0U) {
+          static_cast<void>(
+              context.read32(dispatch + 4U, movie_dma_registration[2U]));
+        }
+        context.continueGuestInstruction();
+      });
+  auto movie_frontend_seen = false;
+  auto movie_attract_seen = false;
+  for (std::size_t boundary_index = 0U; boundary_index < 3'000U;
+       ++boundary_index) {
+    movie_preflight_stop =
+        run_scheduled_until_boundary(guest_profile.gpu_submission_entry);
+    std::uint32_t title_state{};
+    if (vm.runtime().read32(0x80156bdcU, title_state) &&
+        (movie_preflight_title_states.empty() ||
+         movie_preflight_title_states.back() != title_state) &&
+        movie_preflight_title_states.size() < 32U) {
+      movie_preflight_title_states.push_back(title_state);
+    }
+    movie_attract_seen = movie_attract_seen || title_state == 3U;
+    std::uint32_t application_state{};
+    if (vm.runtime().read32(guest_profile.application_state,
+                            application_state) &&
+        (movie_preflight_application_states.empty() ||
+         movie_preflight_application_states.back() != application_state)) {
+      movie_preflight_application_states.push_back(application_state);
+    }
+    movie_frontend_seen = movie_frontend_seen || application_state == 4U;
+    std::uint8_t transition{};
+    if (vm.runtime().read8(0x8011ee94U, transition) &&
+        (movie_preflight_transitions.empty() ||
+         movie_preflight_transitions.back() != transition)) {
+      movie_preflight_transitions.push_back(transition);
+    }
+    if (title_handoffs != 0U || title_mission_opens != 0U ||
+        (movie_frontend_seen && application_state != 4U) ||
+        (movie_attract_seen && title_state != 3U) ||
+        title_input_dispatches >= 32U) {
+      break;
+    }
+    if (!movie_preflight_stop.stoppedAtHostBoundary()) {
+      break;
+    }
+    const auto retired = vm.resumeCurrentPcClockNeutral(1U);
+    if (retired.execution.reason !=
+        sf::psx::R3000StopReason::instruction_budget) {
+      return 7;
+    }
+    const auto frame_padding =
+        movie_preflight_stop.execution.instructions < sf2_retrace_period
+            ? sf2_retrace_period -
+                  movie_preflight_stop.execution.instructions
+            : 0U;
+    if (!service_sf2_scheduler_slice(retired.execution.instructions +
+                                     frame_padding)) {
+      return 7;
+    }
+  }
+  for (const auto entry : movie_preflight_entries) {
+    if (!vm.unbindHostCall(entry)) {
+      return 7;
+    }
+  }
+  if (!vm.unbindHostCall(0x801538c4U)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x80153a34U)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x8015394cU)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x80153930U)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x800222bcU)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x801501f0U)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x80151db0U) ||
+      !vm.unbindHostCall(0x80152264U)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x80142e60U) ||
+      !vm.unbindHostCall(0x8002c27cU)) {
+    return 7;
+  }
+  for (const auto entry : movie_task_entries) {
+    if (!vm.unbindHostCall(entry)) {
+      return 7;
+    }
+  }
+  if (!vm.unbindHostCall(0x800266fcU)) {
+    return 7;
+  }
+  if (!vm.unbindHostCall(0x800ff11cU)) {
+    return 7;
+  }
+  const auto movie_preflight_passed =
+      title_pad_pulse == TitlePadPulse::released &&
+      movie_preflight_stop.stoppedAtHostBoundary();
+  std::uint32_t movie_preflight_application_state{};
+  std::uint32_t movie_preflight_application_depth{};
+  std::uint32_t movie_preflight_title_selection{};
+  std::uint32_t movie_preflight_title_clock{};
+  std::uint32_t movie_preflight_title_deadline{};
+  std::uint32_t movie_ring_base{};
+  std::uint32_t movie_ring_index{};
+  std::array<std::uint16_t, 4U> movie_ring_states{};
+  std::array<std::uint32_t, 7U> movie_dma_state{};
+  const auto movie_cd_state = vm.machine().cdrom().captureState();
+  static_cast<void>(vm.runtime().read32(guest_profile.application_state,
+                                        movie_preflight_application_state));
+  static_cast<void>(vm.runtime().read32(guest_profile.application_state_depth,
+                                        movie_preflight_application_depth));
+  static_cast<void>(
+      vm.runtime().read32(0x80156be4U, movie_preflight_title_selection));
+  static_cast<void>(
+      vm.runtime().read32(0x8011f668U, movie_preflight_title_clock));
+  static_cast<void>(
+      vm.runtime().read32(0x801582d0U, movie_preflight_title_deadline));
+  static_cast<void>(vm.runtime().read32(0x801419c8U, movie_ring_base));
+  static_cast<void>(vm.runtime().read32(0x801419d4U, movie_ring_index));
+  static_cast<void>(vm.runtime().read32(0x1f8010f0U, movie_dma_state[0U]));
+  static_cast<void>(vm.runtime().read32(0x1f8010f4U, movie_dma_state[1U]));
+  static_cast<void>(vm.runtime().read32(0x1f8010b0U, movie_dma_state[2U]));
+  static_cast<void>(vm.runtime().read32(0x1f8010b4U, movie_dma_state[3U]));
+  static_cast<void>(vm.runtime().read32(0x1f8010b8U, movie_dma_state[4U]));
+  static_cast<void>(vm.runtime().read32(0x8011d114U, movie_dma_state[5U]));
+  static_cast<void>(vm.runtime().read32(layout.retrace_counter_address,
+                                        movie_dma_state[6U]));
+  if (movie_ring_base != 0U) {
+    for (std::size_t index = 0U; index < movie_ring_states.size(); ++index) {
+      static_cast<void>(vm.runtime().read16(
+          movie_ring_base + static_cast<std::uint32_t>(index * 0x20U),
+          movie_ring_states[index]));
+    }
+  }
+  std::cerr << "SF2 MOVIE scheduler diagnostic: task=0x" << std::hex
+            << std::uppercase << sf2_task_callback << std::dec
+            << " catalog=" << sf2_movie_catalog_open_bridges << '/'
+            << sf2_movie_catalog_load_bridges
+            << " stream-start=" << movie_stream_starts
+            << " ready=" << movie_ready_dispatches
+            << " handoff=" << title_handoffs << '/' << title_mission_opens
+            << ':' << title_mission_arguments[0] << '/'
+            << title_mission_arguments[1] << '/' << title_mission_arguments[2]
+             << " title-frame=" << title_frame_updates << "@0x" << std::hex
+            << std::uppercase << title_frame_return << std::dec
+             << " selector=" << title_selector_calls << "@0x" << std::hex
+             << std::uppercase << title_selector_return << std::dec << ':';
+  for (std::size_t index = 0U; index < title_selector_arguments.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << title_selector_arguments[index][0] << ','
+              << title_selector_arguments[index][1];
+  }
+  std::cerr
+            << " input=" << title_input_dispatches << '/'
+            << title_confirm_callbacks << '/' << title_accept_callbacks << '/'
+            << title_cancel_callbacks << ":edges=";
+  for (std::size_t index = 0U; index < title_button_edges.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << title_button_edges[index][0U] << ','
+              << title_button_edges[index][1U] << ','
+              << title_button_edges[index][2U] << std::dec;
+  }
+  std::cerr << ":reads=";
+  for (std::size_t index = 0U; index < title_pad_reads.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << title_pad_reads[index][0U] << ','
+              << title_pad_reads[index][1U] << ','
+              << title_pad_reads[index][2U] << ','
+              << title_pad_reads[index][3U] << std::dec;
+  }
+  std::cerr << ':';
+  for (std::size_t index = 0U; index < title_input_states.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << title_input_states[index];
+  }
+  std::cerr
+             << " movie-open=" << movie_open_calls << '/'
+             << movie_open_returns << ':' << movie_open_result << '/'
+             << static_cast<unsigned int>(movie_open_active) << ':';
+  for (std::size_t index = 0U; index < movie_open_arguments.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << movie_open_arguments[index] << std::dec;
+  }
+  std::cerr << " task-trace=";
+  for (std::size_t index = 0U; index < movie_task_trace.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << movie_task_trace[index];
+  }
+  std::cerr << " sync=";
+  for (std::size_t index = 0U; index < movie_sync_results.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << movie_sync_results[index][0]
+              << ',' << movie_sync_results[index][1] << ',' << std::hex
+              << std::uppercase << movie_sync_results[index][2] << std::dec;
+  }
+  std::cerr << " ring=" << movie_ring_callbacks << "@0x" << std::hex
+            << std::uppercase << movie_ring_base << std::dec << ':'
+            << movie_ring_index << ':';
+  for (std::size_t index = 0U; index < movie_ring_states.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << movie_ring_states[index];
+  }
+  std::cerr << " dma-register=" << movie_dma_registration[0U] << "/0x"
+            << std::hex << std::uppercase << movie_dma_registration[1U]
+            << "/0x" << movie_dma_registration[2U] << std::dec
+            << " dma-state=" << movie_cd_dma_starts << ':';
+  for (std::size_t index = 0U; index < movie_dma_state.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << movie_dma_state[index] << std::dec;
+  }
+  std::cerr << " ready-trace=";
+  for (std::size_t trace_index = 0U; trace_index < movie_ready_trace.size();
+       ++trace_index) {
+    std::cerr << (trace_index == 0U ? "" : ";");
+    for (std::size_t field = 0U; field < movie_ready_trace[trace_index].size();
+         ++field) {
+      std::cerr << (field == 0U ? "" : ",") << std::hex << std::uppercase
+                << movie_ready_trace[trace_index][field] << std::dec;
+    }
+  }
+  std::cerr << " read-start=";
+  for (std::size_t index = 0U; index < movie_cd_read_start_times.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << movie_cd_read_start_times[index];
+  }
+  std::cerr << " cd=" << static_cast<unsigned int>(movie_cd_state.reading)
+            << '/' << static_cast<unsigned int>(movie_cd_state.seeking) << '/'
+            << static_cast<unsigned int>(movie_cd_state.interrupt_flags & 7U)
+            << '/' << movie_cd_state.current_lba << '/'
+            << movie_cd_state.target_lba << '/'
+            << static_cast<unsigned int>(movie_cd_state.mode);
+  std::cerr
+             << " loop-exit=" << state_loop_epilogues << '/'
+            << game_main_returns
+             << " app=" << movie_preflight_application_state << '/'
+            << movie_preflight_application_depth
+            << " selection=" << movie_preflight_title_selection
+            << " clock=" << movie_preflight_title_clock << '/'
+            << movie_preflight_title_deadline
+            << " title-states=";
+  for (std::size_t index = 0U; index < movie_preflight_title_states.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << movie_preflight_title_states[index];
+  }
+  std::cerr << " app-states=";
+  for (std::size_t index = 0U;
+       index < movie_preflight_application_states.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << movie_preflight_application_states[index];
+  }
+  std::cerr << " transitions=";
+  for (std::size_t index = 0U; index < movie_preflight_transitions.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/")
+              << static_cast<unsigned int>(movie_preflight_transitions[index]);
+  }
+  std::cerr << " stop="
+            << sf::psx::toString(movie_preflight_stop.execution.reason)
+            << "@0x" << std::hex << std::uppercase
+             << movie_preflight_stop.execution.pc << " ra=0x"
+            << vm.runtime().state().gpr[31U] << " sp=0x"
+            << vm.runtime().state().gpr[29U] << " v0=0x"
+             << vm.runtime().state().gpr[2U] << std::dec
+             << " dma=" << sf2_cd_dma_callbacks << '/'
+             << sf2_spu_dma_callbacks
+             << " cd-complete=" << sf2_cd_completion_interrupts << "@0x"
+             << std::hex << std::uppercase
+             << sf2_cd_completion_callback_at_interrupt << std::dec
+             << ':';
+  for (std::size_t index = 0U; index < sf2_cd_completion_trace.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << sf2_cd_completion_trace[index][0] << ','
+              << sf2_cd_completion_trace[index][1] << ','
+              << sf2_cd_completion_trace[index][2] << std::dec;
+  }
+  std::cerr
+             << " pad-pulse="
+             << (title_pad_pulse == TitlePadPulse::released ? "released"
+                                                            : "missing")
+             << " overlay=" << sf2_last_resident_overlay_name << "@0x"
+             << std::hex << std::uppercase
+             << sf2_last_resident_overlay_address << std::dec << ':'
+             << sf2_last_resident_overlay_mode << '/'
+             << sf2_resident_overlay_load_bridges << '\n';
+  if (title_handoffs != 0U || title_mission_opens != 0U) {
+    return 7;
+  }
+  if (!movie_preflight_passed) {
+    return 7;
+  }
+  std::uint32_t continuous_pre_heap_marker{};
+  std::uint32_t continuous_pre_heap_current{};
+  if (!vm.runtime().read32(0x8011ef00U, continuous_pre_heap_marker) ||
+      !vm.runtime().read32(0x8011ee2cU, continuous_pre_heap_current)) {
+    return 7;
+  }
+  // The mission-selection state normally reaches this cleanup through the
+  // state-11 completion callback at 0x80152434. It shuts down TITLE's
+  // asynchronous memory-card manager and unregisters interrupt slot 7 before
+  // MissionArchive_Open reclaims the MOVIE overlay. The deterministic probe
+  // enters at the selected-state boundary, so execute that exact retail
+  // teardown explicitly rather than leaving a callback into freed overlay
+  // code.
+  const auto continuous_title_cleanup =
+      invoke_nested_scheduled(0x8014db50U, std::span<const std::uint32_t>{});
+  std::uint32_t continuous_title_worker_after_cleanup{};
+  if ((!continuous_title_cleanup.stoppedAtHostBoundary() &&
+       !continuous_title_cleanup.completed()) ||
+      !vm.runtime().read32(guest_profile.interrupt_callback_table + 7U * 4U,
+                           continuous_title_worker_after_cleanup) ||
+      continuous_title_worker_after_cleanup != 0U) {
+    std::cerr << "SF2 TITLE transition cleanup failed: "
+              << sf::psx::toString(continuous_title_cleanup.execution.reason)
+              << "@0x" << std::hex << std::uppercase
+              << continuous_title_cleanup.execution.pc << " slot7=0x"
+              << continuous_title_worker_after_cleanup << std::dec << '\n';
+    return 7;
+  }
+  // The normal frontend exit balances the temporary packet-arena reservation
+  // through this retail restore call before INIT reclaims the heap. The
+  // deterministic selected-state entry skips that outer state-0 pass, so
+  // release it here; state 8 will build the mission arena after loading.
+  constexpr std::array<std::uint32_t, 2U>
+      continuous_frontend_arena_release_arguments{0U, 0U};
+  const auto continuous_frontend_arena_release = invoke_nested_scheduled(
+      0x80015510U, continuous_frontend_arena_release_arguments);
+  if (!continuous_frontend_arena_release.completed() &&
+      !continuous_frontend_arena_release.stoppedAtHostBoundary()) {
+    std::cerr << "SF2 frontend graphics reservation release failed\n";
+    return 7;
+  }
+  // Drive the retail TITLE state that owns the mission-selection handoff.
+  // State 17 passes the overlay selection plus both retail transition flags
+  // to MissionArchive_Open; selection 2 is Mission 3.
+  if (!vm.runtime().write32(0x801582d4U, mission_selection_index) ||
+      !vm.runtime().write32(0x80156bdcU, 17U) ||
+      !vm.runtime().write32(0x8011f61cU, 1U)) {
+    return 7;
+  }
+  const auto mission_fog_entry = disc.image().find("FOG/HWAY.FOG");
+  cdrom_media.mapRelativeExtent(
+      mission_fog_entry.extent_lba,
+      (mission_fog_entry.size + sf::assets::FogArchive::sector_size - 1U) /
+          sf::assets::FogArchive::sector_size);
+  std::vector<std::array<std::uint32_t, 2U>> continuous_clear_calls;
+  vm.bindHostCall(
+      0x8015cf84U,
+      [&continuous_clear_calls](sf::game::LegacyHostCallContext &context) {
+        if (continuous_clear_calls.size() < 16U) {
+          continuous_clear_calls.push_back(
+              {context.argument(0), context.registerValue(31U)});
+        }
+        context.continueGuestInstruction();
+      });
+  const auto continuous_mission = invoke_nested_scheduled(
+      0x80153d30U, std::span<const std::uint32_t>{});
+  std::uint32_t continuous_hog_offset_after_mission{};
+  static_cast<void>(
+      vm.runtime().read32(0x801b92b4U, continuous_hog_offset_after_mission));
+  std::uint32_t continuous_heap_marker{};
+  std::uint32_t continuous_heap_current{};
+  std::uint32_t continuous_heap_base{};
+  static_cast<void>(vm.runtime().read32(0x8011ef00U, continuous_heap_marker));
+  static_cast<void>(vm.runtime().read32(0x8011ee2cU, continuous_heap_current));
+  static_cast<void>(vm.runtime().read32(0x8011ee28U, continuous_heap_base));
+  if (!vm.runtime().read32(guest_profile.application_state, continuous_state) ||
+      !vm.runtime().read32(guest_profile.application_state_depth,
+                           continuous_depth)) {
+    return 7;
+  }
+  std::cerr << "SF2 continuous mission diagnostic: result="
+            << sf::psx::toString(continuous_mission.execution.reason) << "@0x"
+            << std::hex << std::uppercase << continuous_mission.execution.pc
+            << std::dec << " state=" << continuous_state
+            << " depth=" << continuous_depth << " pre-heap=0x" << std::hex
+            << std::uppercase << continuous_pre_heap_marker << "/0x"
+            << continuous_pre_heap_current << " heap=0x" << std::hex
+            << std::uppercase << continuous_heap_marker << "/0x"
+            << continuous_heap_current << "/0x" << continuous_heap_base
+            << std::dec << " cd-search=" << sf2_search_matches << '/'
+            << sf2_search_calls << " last-path=" << sf2_last_search_path
+            << " catalog=" << sf2_catalog_copy_observations << '/'
+            << sf2_catalog_repair_bridges
+            << " instructions=" << continuous_mission.execution.instructions
+            << " instruction=0x" << std::hex << std::uppercase
+            << continuous_mission.execution.instruction << std::dec
+            << " resident-file=" << sf2_resident_file_open_bridges << '/'
+            << sf2_resident_file_load_bridges << " slf=" << sf2_slf_open_bridges
+            << '/' << sf2_slf_load_bridges << " hog-offset=0x" << std::hex
+            << std::uppercase << continuous_hog_offset_after_mission << std::dec
+            << '\n';
+  if (!continuous_mission.stoppedAtHostBoundary() &&
+      !continuous_mission.completed()) {
+    return 7;
+  }
+  suppress_guest_interrupts = true;
+  vm.runtime().setExternalInterrupt(false);
+  constexpr std::uint32_t cd_sync_boundary = 0x800f5d48U;
+  auto continuous_cd_sync_polls = std::size_t{};
+  vm.bindHostCall(
+      cd_sync_boundary,
+      [&continuous_cd_sync_polls](sf::game::LegacyHostCallContext &context) {
+        ++continuous_cd_sync_polls;
+        context.continueGuestInstruction();
+      });
+  auto continuous_loading_pad_polls = std::size_t{};
+  auto continuous_loading_confirm_sent = false;
+  vm.bindHostCall(
+      0x80029b28U,
+      [&continuous_loading_pad_polls, &continuous_loading_confirm_sent](
+          sf::game::LegacyHostCallContext &context) {
+        ++continuous_loading_pad_polls;
+        std::uint32_t record{};
+        if (context.read32(context.registerValue(29U) + 0x14U, record) &&
+            record != 0U) {
+          const auto confirm =
+              !continuous_loading_confirm_sent &&
+              continuous_loading_pad_polls >= 8U;
+          if (!context.write8(record, 0U) ||
+              !context.write16(record + 4U, confirm ? 0x0040U : 0U)) {
+            context.rejectHostCall();
+            return;
+          }
+          if (confirm) {
+            continuous_loading_confirm_sent = true;
+          }
+        }
+        context.continueGuestInstruction();
+      });
+  auto continuous_loading_frames = std::size_t{};
+  auto continuous_state4_boundaries = std::size_t{};
+  auto continuous_stable_boundaries = std::size_t{};
+  auto continuous_background_slices = std::size_t{};
+  constexpr std::size_t continuous_state4_probe_limit = 1'400U;
+  std::vector<std::uint32_t> continuous_states;
+  std::optional<sf::game::Sf2PresentationFrame> continuous_presentation_frame;
+  std::optional<sf::game::Sf2PresentationFrame>
+      continuous_best_presentation_frame;
+  std::vector<std::uint32_t> continuous_presentation_roots;
+  auto continuous_embedded_hog_lifetime_blocked = false;
+  while (continuous_loading_frames < 2'000U) {
+    const auto frame_boundary = guest_profile.gpu_submission_entry;
+    const auto frame = run_scheduled_until_boundary(frame_boundary);
+    if (!vm.runtime().read32(guest_profile.application_state,
+                             continuous_state)) {
+      return 7;
+    }
+    if (!frame.stoppedAtHostBoundary() &&
+        frame.execution.reason ==
+            sf::psx::R3000StopReason::instruction_budget &&
+        continuous_background_slices < 64U) {
+      if (continuous_states.empty() ||
+          continuous_states.back() != continuous_state) {
+        continuous_states.push_back(continuous_state);
+      }
+      ++continuous_background_slices;
+      continue;
+    }
+    if (!frame.stoppedAtHostBoundary()) {
+      std::uint32_t failure_pc_word{};
+      std::uint32_t failure_object_table{};
+      std::uint16_t failure_object_count{};
+      std::uint32_t failure_object_entry{};
+      std::array<std::uint32_t, 12U> failure_render_object{};
+      std::array<std::uint32_t, 4U> failure_render_node{};
+      std::array<std::uint32_t, 4U> failure_render_owner{};
+      std::array<std::uint32_t, 2U> failure_primitive_starts{};
+      std::uint32_t failure_primitive_cursor{};
+      std::uint32_t failure_heap_cursor{};
+      static_cast<void>(
+          vm.runtime().read32(frame.execution.pc, failure_pc_word));
+      static_cast<void>(
+          vm.runtime().read32(0x8011f4b8U, failure_object_table));
+      static_cast<void>(
+          vm.runtime().read16(0x8011ed0cU, failure_object_count));
+      if (failure_object_table != 0U) {
+        static_cast<void>(vm.runtime().read32(
+            failure_object_table +
+                static_cast<std::uint32_t>(vm.runtime().state().gpr[3U] * 4U),
+            failure_object_entry));
+      }
+      static_cast<void>(
+          vm.runtime().read32(0x8011f4a0U, failure_primitive_starts[0U]));
+      static_cast<void>(
+          vm.runtime().read32(0x8011f4a4U, failure_primitive_starts[1U]));
+      static_cast<void>(
+          vm.runtime().read32(0x8013e6dcU, failure_primitive_cursor));
+      static_cast<void>(
+          vm.runtime().read32(0x8011ee2cU, failure_heap_cursor));
+      for (std::size_t index = 0U; index < failure_render_object.size();
+           ++index) {
+        static_cast<void>(vm.runtime().read32(
+            vm.runtime().state().gpr[16U] +
+                static_cast<std::uint32_t>(index * sizeof(std::uint32_t)),
+            failure_render_object[index]));
+      }
+      for (std::size_t index = 0U; index < failure_render_node.size();
+           ++index) {
+        static_cast<void>(vm.runtime().read32(
+            vm.runtime().state().gpr[30U] +
+                static_cast<std::uint32_t>(
+                    index * sizeof(std::uint32_t)),
+            failure_render_node[index]));
+        static_cast<void>(vm.runtime().read32(
+            vm.runtime().state().gpr[20U] +
+                static_cast<std::uint32_t>(
+                    index * sizeof(std::uint32_t)),
+            failure_render_owner[index]));
+      }
+      std::cerr << "SF2 continuous application loop failed: frame="
+                << continuous_loading_frames
+                << " reason=" << sf::psx::toString(frame.execution.reason)
+                << " pc=0x" << std::hex << std::uppercase << frame.execution.pc
+                 << " instruction=0x" << frame.execution.instruction << " v0=0x"
+                << vm.runtime().state().gpr[2U] << " v1=0x"
+                << vm.runtime().state().gpr[3U] << " t1=0x"
+                << vm.runtime().state().gpr[9U] << " a0=0x"
+                << vm.runtime().state().gpr[4U] << " a1=0x"
+                << vm.runtime().state().gpr[5U] << " s0=0x"
+                << vm.runtime().state().gpr[16U] << " s1=0x"
+                << vm.runtime().state().gpr[17U] << " s2=0x"
+                << vm.runtime().state().gpr[18U] << " s3=0x"
+                << vm.runtime().state().gpr[19U] << " s4=0x"
+                << vm.runtime().state().gpr[20U] << " fp=0x"
+                << vm.runtime().state().gpr[30U] << " ra=0x"
+                << vm.runtime().state().gpr[31U] << " sp=0x"
+                << vm.runtime().state().gpr[29U] << " status=0x"
+                << vm.runtime().state().cop0_status << " cause=0x"
+                << vm.runtime().state().cop0_cause << " epc=0x"
+                << vm.runtime().state().cop0_epc << " istat=0x"
+                << vm.machine().interrupts().status() << " imask=0x"
+                << vm.machine().interrupts().mask() << " ilines=0x"
+                 << vm.machine().interrupts().inputLines() << std::dec
+                 << " pc-word=0x" << std::hex << std::uppercase
+                 << failure_pc_word << " object-table=0x"
+                 << failure_object_table << " object-count=0x"
+                 << failure_object_count << " object-entry=0x"
+                 << failure_object_entry << std::dec
+                 << " scheduler-failure=" << sf2_scheduler_failure;
+      if (sf2_callback_failure) {
+        std::cerr << ":slot=0x" << std::hex << std::uppercase
+                  << sf2_callback_failure_slot << ":callback=0x"
+                  << sf2_callback_failure_address << ":"
+                  << sf::psx::toString(
+                         sf2_callback_failure->execution.reason)
+                  << "@0x" << sf2_callback_failure->execution.pc
+                  << ":instruction=0x"
+                  << sf2_callback_failure->execution.instruction << std::dec;
+      }
+      std::cerr
+                 << " state=" << continuous_state << " states=";
+      for (std::size_t index = 0U; index < continuous_states.size(); ++index) {
+        std::cerr << (index == 0U ? "" : "/") << continuous_states[index];
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 render object:";
+      for (const auto word : failure_render_object) {
+        std::cerr << " 0x" << std::hex << std::uppercase << word << std::dec;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 render node:";
+      for (const auto word : failure_render_node) {
+        std::cerr << " 0x" << std::hex << std::uppercase << word << std::dec;
+      }
+      std::cerr << "\nSF2 render owner:";
+      for (const auto word : failure_render_owner) {
+        std::cerr << " 0x" << std::hex << std::uppercase << word << std::dec;
+      }
+      std::cerr << "\nSF2 primitive arena: starts=0x" << std::hex
+                << std::uppercase << failure_primitive_starts[0U] << "/0x"
+                << failure_primitive_starts[1U] << " cursor=0x"
+                << failure_primitive_cursor << " heap=0x"
+                << failure_heap_cursor << std::dec << '\n';
+      const auto failed_object = vm.runtime().state().gpr[16U];
+      const auto matching_insert = std::find_if(
+          sf2_render_list_inserts.rbegin(), sf2_render_list_inserts.rend(),
+          [failed_object](const Sf2RenderListInsert &insert) {
+            return insert.object == failed_object;
+          });
+      if (matching_insert != sf2_render_list_inserts.rend()) {
+        std::cerr << "SF2 render-list insertion: list=0x" << std::hex
+                  << std::uppercase << matching_insert->list << " object=0x"
+                  << matching_insert->object << " caller=0x"
+                  << matching_insert->caller << " upstream=0x"
+                  << matching_insert->upstream_caller << " scheduled="
+                  << (matching_insert->scheduled_callback ? 1 : 0)
+                  << " words=";
+        for (const auto word : matching_insert->object_words) {
+          std::cerr << " 0x" << word;
+        }
+        std::cerr << std::dec << '\n';
+      } else {
+        std::cerr << "SF2 render-list insertion: not observed; total="
+                  << sf2_render_list_inserts.size() << '\n';
+      }
+      std::cerr << "SF2 matching render-list removals:";
+      auto matching_removals = std::size_t{};
+      for (const auto &remove : sf2_render_list_removes) {
+        if (remove.object == failed_object) {
+          std::cerr << " list=0x" << std::hex << std::uppercase
+                    << remove.list << ":node=0x" << remove.node
+                    << "@0x" << remove.caller << std::dec;
+          ++matching_removals;
+        }
+      }
+      if (matching_removals == 0U) {
+        std::cerr << " none";
+      }
+      std::cerr << "\nSF2 heap rewinds:";
+      for (const auto &rewind : sf2_heap_rewinds) {
+        std::cerr << " 0x" << std::hex << std::uppercase << rewind[0U]
+                  << "->0x" << rewind[1U] << "@0x" << rewind[2U]
+                  << std::dec;
+      }
+      std::cerr << "\nSF2 nearby heap allocations:";
+      for (const auto &allocation : sf2_heap_allocations) {
+        const auto size =
+            static_cast<std::int32_t>(allocation.size) < 0
+                ? 0U - allocation.size
+                : allocation.size;
+        if (allocation.address <= failed_object + 0x100U &&
+            allocation.address + size >= failed_object - 0x1000U) {
+          std::cerr << " 0x" << std::hex << std::uppercase
+                    << allocation.address << "+0x" << size << "@0x"
+                    << allocation.caller << std::dec;
+        }
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 render-arena resets:";
+      for (const auto &reset : sf2_render_arena_resets) {
+        std::cerr << " mode=0x" << std::hex << std::uppercase << reset[0U]
+                  << "@0x" << reset[1U] << ":0x" << reset[2U] << "/0x"
+                  << reset[3U] << ":heap=0x" << reset[4U] << ":span=0x"
+                  << reset[5U] << "/0x" << reset[6U] << std::dec;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 overlay requests:";
+      for (const auto &[name, address, mode, caller] : sf2_overlay_requests) {
+        std::cerr << " " << name << "@0x" << std::hex << std::uppercase
+                  << address << ":0x" << mode << "@0x" << caller << std::dec;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 INIT clear calls:";
+      for (const auto &call : continuous_clear_calls) {
+        std::cerr << " 0x" << std::hex << std::uppercase << call[0U]
+                  << "@0x" << call[1U] << std::dec;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 archive member requests:";
+      for (const auto &request : sf2_archive_member_requests) {
+        std::cerr << " " << request.name << "->0x" << std::hex
+                  << std::uppercase << request.destination_slot << ":0x"
+                  << request.mode << "@0x" << request.caller << std::dec;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 INIT resource inputs:";
+      for (const auto &input : sf2_init_resource_inputs) {
+        std::cerr << " mode=0x" << std::hex << std::uppercase << input[0U]
+                  << " descriptor=0x" << input[1U] << " fields=0x"
+                  << input[2U] << "+0x" << input[3U] << " resource=0x"
+                  << input[4U] << " s6=0x" << input[5U] << "@0x"
+                  << input[6U] << std::dec;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 INIT archive paths:";
+      for (const auto &path : sf2_init_archive_paths) {
+        std::cerr << " " << path;
+      }
+      std::cerr << '\n';
+      std::cerr << "SF2 INIT descriptor writes:";
+      for (const auto &write : sf2_init_descriptor_writes) {
+        std::cerr << " value=0x" << std::hex << std::uppercase << write[0U]
+                  << " root=0x" << write[1U] << " prior=0x" << write[2U]
+                  << " result=0x" << write[3U] << " *result=0x"
+                  << write[4U] << " s6=0x" << write[5U] << std::dec;
+      }
+      std::cerr << '\n';
+      if (continuous_state == 1U &&
+          frame.execution.reason == sf::psx::R3000StopReason::alignment_fault &&
+          frame.execution.pc == 0x80026d80U) {
+        continuous_embedded_hog_lifetime_blocked = true;
+        break;
+      }
+      return 7;
+    }
+    if (continuous_states.empty() ||
+        continuous_states.back() != continuous_state) {
+      continuous_states.push_back(continuous_state);
+    }
+    constexpr std::uint32_t retail_render_submission_return = 0x800f181cU;
+    if (vm.runtime().state().gpr[31U] ==
+        retail_render_submission_return) {
+      auto published = sf::game::captureSf2PresentationFrame(
+          vm.runtime().ram(), vm.runtime().state().gpr[5U], continuous_state,
+          continuous_stable_boundaries + 1U, continuous_loading_frames + 1U);
+      if (published) {
+        if (!continuous_best_presentation_frame ||
+            std::tuple{published->draw_command_count,
+                       published->gpu_command_count,
+                       published->gp0_word_count} >
+                std::tuple{
+                    continuous_best_presentation_frame->draw_command_count,
+                    continuous_best_presentation_frame->gpu_command_count,
+                    continuous_best_presentation_frame->gp0_word_count}) {
+          continuous_best_presentation_frame = *published;
+        }
+        if (continuous_presentation_roots.size() ==
+            stable_mission_boundary_count) {
+          continuous_presentation_roots.erase(
+              continuous_presentation_roots.begin());
+        }
+        continuous_presentation_roots.push_back(published->ordering_table_root);
+        continuous_presentation_frame = std::move(published);
+        ++continuous_stable_boundaries;
+      }
+    }
+    const auto retired = vm.resumeCurrentPcClockNeutral(1U);
+    if (retired.execution.reason !=
+        sf::psx::R3000StopReason::instruction_budget) {
+      return 7;
+    }
+    ++continuous_loading_frames;
+    if (continuous_state == 4U) {
+      ++continuous_state4_boundaries;
+    }
+    if (continuous_stable_boundaries >= stable_mission_boundary_count ||
+        continuous_state4_boundaries >= continuous_state4_probe_limit) {
+      break;
+    }
+  }
+  const auto continuous_ram = vm.runtime().ram();
+  const auto continuous_overlay_offset =
+      guest_profile.mission_overlay_load_address & 0x1fffffU;
+  auto continuous_overlay_bytes = std::size_t{};
+  while (continuous_overlay_bytes < expected_overlay.size() &&
+         continuous_overlay_offset + continuous_overlay_bytes <
+             continuous_ram.size() &&
+         continuous_ram[continuous_overlay_offset + continuous_overlay_bytes] ==
+             expected_overlay[continuous_overlay_bytes]) {
+    ++continuous_overlay_bytes;
+  }
+  const auto continuous_overlay_prefix =
+      expected_overlay.size() >= 16U
+          ? std::search(continuous_ram.begin(), continuous_ram.end(),
+                        expected_overlay.begin(), expected_overlay.begin() + 16)
+          : continuous_ram.end();
+  const auto continuous_overlay_address =
+      continuous_overlay_prefix == continuous_ram.end()
+          ? 0U
+          : 0x80000000U + static_cast<std::uint32_t>(continuous_overlay_prefix -
+                                                     continuous_ram.begin());
+  std::array<std::uint32_t, 8U> continuous_state4_words{};
+  std::uint32_t continuous_title_state{};
+  std::uint32_t continuous_title_timer{};
+  std::uint32_t continuous_title_selection{};
+  std::uint32_t continuous_title_phase{};
+  static_cast<void>(vm.runtime().read32(0x80156bdcU, continuous_title_state));
+  static_cast<void>(vm.runtime().read32(0x8011f668U, continuous_title_timer));
+  static_cast<void>(
+      vm.runtime().read32(0x801582d4U, continuous_title_selection));
+  static_cast<void>(vm.runtime().read32(0x80156be4U, continuous_title_phase));
+  for (std::size_t index = 0U; index < continuous_state4_words.size();
+       ++index) {
+    static_cast<void>(vm.runtime().read32(
+        0x80153e24U + static_cast<std::uint32_t>(index * 4U),
+        continuous_state4_words[index]));
+  }
+  std::cerr << "SF2 continuous loading diagnostic: frames="
+            << continuous_loading_frames << " state=" << continuous_state
+            << " overlay=" << continuous_overlay_bytes << '/'
+            << expected_overlay.size() << "@0x" << std::hex << std::uppercase
+            << continuous_overlay_address << std::dec << " states=";
+  for (std::size_t index = 0U; index < continuous_states.size(); ++index) {
+    std::cerr << (index == 0U ? "" : "/") << continuous_states[index];
+  }
+  std::cerr << " background-slices=" << continuous_background_slices
+            << " cd-sync-polls=" << continuous_cd_sync_polls
+            << " state4-boundaries=" << continuous_state4_boundaries
+            << " stable-boundaries=" << continuous_stable_boundaries
+            << " title-state=" << continuous_title_state
+            << " title-timer=" << continuous_title_timer
+            << " title-selection=" << continuous_title_selection
+            << " title-phase=" << continuous_title_phase
+            << " loading-confirm=" << continuous_loading_pad_polls << '/'
+            << (continuous_loading_confirm_sent ? 1 : 0)
+            << " pad-polls=" << sf2_pad_poll_bridges
+            << " resident-file=" << sf2_resident_file_open_bridges << '/'
+            << sf2_resident_file_load_bridges << " state4-code=";
+  for (std::size_t index = 0U; index < continuous_state4_words.size();
+       ++index) {
+    std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+              << continuous_state4_words[index];
+  }
+  std::cerr << std::dec << " presentation=";
+  if (continuous_presentation_frame) {
+    std::cerr << "valid@0x" << std::hex << std::uppercase
+              << continuous_presentation_frame->ordering_table_root << std::dec
+              << ",packets:" << continuous_presentation_frame->packets.size()
+              << ",words:" << continuous_presentation_frame->gp0_word_count
+              << ",commands:"
+              << continuous_presentation_frame->gpu_command_count
+              << ",draws:" << continuous_presentation_frame->draw_command_count
+              << ",roots:";
+    for (std::size_t index = 0U; index < continuous_presentation_roots.size();
+         ++index) {
+      std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+                << continuous_presentation_roots[index];
+    }
+  } else {
+    std::cerr << "missing";
+  }
+  std::cerr << std::dec << ",best:";
+  if (continuous_best_presentation_frame) {
+    std::cerr << "packets:"
+              << continuous_best_presentation_frame->packets.size()
+              << ",words:" << continuous_best_presentation_frame->gp0_word_count
+              << ",commands:"
+              << continuous_best_presentation_frame->gpu_command_count
+              << ",draws:"
+              << continuous_best_presentation_frame->draw_command_count
+              << ",opcodes:";
+    const auto opcode_count = std::min<std::size_t>(
+        32U, continuous_best_presentation_frame->packets.size());
+    for (std::size_t index = 0U; index < opcode_count; ++index) {
+      const auto &packet = continuous_best_presentation_frame->packets[index];
+      std::cerr << (index == 0U ? "" : "/") << std::hex << std::uppercase
+                << (packet.gp0_words.front() >> 24U);
+    }
+    if (opcode_count < continuous_best_presentation_frame->packets.size()) {
+      std::cerr << "/...";
+    }
+  } else {
+    std::cerr << "missing";
+  }
+  std::cerr << std::dec << '\n';
+  std::cerr << "SF2 application-state calls:";
+  for (const auto &call : sf2_application_state_calls) {
+    std::cerr << " " << call[0U] << ":" << call[1U] << "@0x" << std::hex
+              << std::uppercase << call[2U] << std::dec;
+  }
+  std::cerr << '\n';
+  std::cerr << "SF2 overlay requests:";
+  for (const auto &[name, address, mode, caller] : sf2_overlay_requests) {
+    std::cerr << " " << name << "@0x" << std::hex << std::uppercase
+              << address << ":0x" << mode << "@0x" << caller << std::dec;
+  }
+  std::cerr << '\n';
+  constexpr std::array expected_continuous_state_prefix{0U, 1U, 8U, 0U};
+  constexpr std::array expected_lifetime_blocked_state_prefix{9U, 1U};
+  const auto lifetime_blocker_valid =
+      continuous_embedded_hog_lifetime_blocked &&
+      continuous_states.size() >=
+          expected_lifetime_blocked_state_prefix.size() &&
+      std::ranges::equal(
+          expected_lifetime_blocked_state_prefix,
+          std::span{continuous_states}.first(
+              expected_lifetime_blocked_state_prefix.size()));
+  const auto continuous_mission_checkpoint_valid =
+      !continuous_embedded_hog_lifetime_blocked &&
+      continuous_stable_boundaries >= stable_mission_boundary_count &&
+      continuous_states.size() >= expected_continuous_state_prefix.size() &&
+      std::ranges::equal(expected_continuous_state_prefix,
+                         std::span{continuous_states}.first(
+                             expected_continuous_state_prefix.size())) &&
+      continuous_overlay_bytes >= 0x1000U &&
+      sf2_resident_overlay_load_bridges != 0U &&
+      sf2_resident_file_open_bridges != 0U &&
+      sf2_resident_file_load_bridges >= 1U &&
+      continuous_presentation_frame && continuous_presentation_frame->valid() &&
+      continuous_best_presentation_frame &&
+      continuous_best_presentation_frame->valid();
+  if (!lifetime_blocker_valid && !continuous_mission_checkpoint_valid) {
+    return 7;
+  }
+  if (continuous_mission_checkpoint_valid) {
+    std::cout << "SF2 Mission 3 retail transition passed: states=";
+    for (std::size_t index = 0U; index < continuous_states.size(); ++index) {
+      std::cout << (index == 0U ? "" : "/") << continuous_states[index];
+    }
+    std::cout << " frames=" << continuous_loading_frames
+              << " stable-boundaries=" << continuous_stable_boundaries
+              << " presentation=valid,packets:"
+              << continuous_best_presentation_frame->packets.size()
+              << ",words:"
+              << continuous_best_presentation_frame->gp0_word_count
+              << ",commands:"
+              << continuous_best_presentation_frame->gpu_command_count
+              << ",draws:"
+              << continuous_best_presentation_frame->draw_command_count
+              << '\n';
+    return 0;
+  }
+
+  // Preserve the already-published deterministic HWAY checkpoint while the
+  // title-owned input/selection continuation remains a separate gate. Replay
+  // the prior mission snapshot for the exact HWAY assertions below; the
+  // continuous experiment may stop at the documented embedded-HOG lifetime
+  // boundary after states 9 -> 1.
+  if (!vm.restoreSnapshot(resident_loop_snapshot)) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Could not restore SF2 presentation checkpoint"};
+  }
+  if (!vm.runtime().loadBytes(0x80158878U, init_overlay)) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Could not restore retail SF2 INIT overlay"};
+  }
+  suppress_guest_interrupts = false;
+  vm.bindPsxBiosCoreVector();
+  enable_sf2_mission_search = false;
+  enable_sf2_resident_overlay_load = false;
+  enable_sf2_resident_file_access = false;
+  sf2_resident_open_files.clear();
+  sf2_search_calls = 0U;
+  sf2_search_matches = 0U;
+  sf2_last_search_path.clear();
+  sf2_catalog_after_copy.fill(std::byte{});
+  sf2_catalog_copy_observations = 0U;
+  sf2_catalog_repair_bridges = 0U;
+  sf2_slf_open_bridges = 0U;
+  sf2_slf_load_bridges = 0U;
+  sf2_resident_file_open_bridges = 0U;
+  sf2_resident_file_load_bridges = 0U;
+  sf2_pad_poll_bridges = 0U;
+  sf2_resident_callback_table_bridges = 0U;
+  sf2_resident_overlay_load_bridges = 0U;
+  vm.bindHostCall(0x8015ba54U, [&sf2_resident_callback_table_bridges](
+                                   sf::game::LegacyHostCallContext &context) {
+    ++sf2_resident_callback_table_bridges;
+    context.setReturnValue(0U);
+  });
+  constexpr std::uint32_t probe_call_stack = 0x8000f000U;
+  vm.runtime().setRegister(29U, probe_call_stack);
+  vm.runtime().setRegister(30U, probe_call_stack);
+  constexpr std::array seeded_init_arguments{4U};
+  const auto seeded_init =
+      invoke_scheduled(guest_profile.common_init_entry, seeded_init_arguments);
+  if (!seeded_init.completed()) {
+    std::cerr << "Seeded SF2 Common_Init(4) failed: reason="
+              << sf::psx::toString(seeded_init.execution.reason) << " pc=0x"
+              << std::hex << std::uppercase << seeded_init.execution.pc
+              << " instruction=0x" << seeded_init.execution.instruction
+              << std::dec << '\n';
+    return 7;
+  }
+  enable_sf2_mission_search = true;
+  enable_sf2_resident_overlay_load = true;
+  // MissionArchive_Open consumes the allocator marker normally established
+  // by the resident INIT lifecycle. The probe publishes that heap boundary
+  // explicitly while the GLOBAL.DAT resource path remains disconnected.
+  constexpr std::uint32_t resident_init_state_entry = 0x8015d0ccU;
+  constexpr std::array resident_init_state_arguments{1U};
+  const auto resident_init_state = invoke_scheduled(
+      resident_init_state_entry, resident_init_state_arguments);
+  std::uint32_t resident_application_state{};
+  std::uint32_t resident_application_depth{};
+  if (!resident_init_state.completed() ||
+      !vm.runtime().read32(guest_profile.application_state,
+                           resident_application_state) ||
+      !vm.runtime().read32(guest_profile.application_state_depth,
+                           resident_application_depth)) {
+    std::cerr << "Seeded SF2 resident INIT state failed: reason="
+              << sf::psx::toString(resident_init_state.execution.reason)
+              << " pc=0x" << std::hex << std::uppercase
+              << resident_init_state.execution.pc << " instruction=0x"
+              << resident_init_state.execution.instruction << " ra=0x"
+              << vm.runtime().state().gpr[31U] << " sp=0x"
+              << vm.runtime().state().gpr[29U] << " a0=0x"
+              << vm.runtime().state().gpr[4U] << std::dec
+              << " instructions=" << resident_init_state.execution.instructions
+              << '\n';
+    return 7;
+  }
+  if (resident_application_state == 1U && resident_application_depth != 0U) {
+    const auto resident_state_pop =
+        invoke_scheduled(guest_profile.application_state_pop_entry, {});
+    if (!resident_state_pop.completed() ||
+        !vm.runtime().read32(guest_profile.application_state,
+                             resident_application_state) ||
+        resident_application_state != 0U) {
+      std::cerr << "SF2 resident INIT state-1 pop failed\n";
+      return 7;
+    }
+  }
+  std::uint32_t resident_heap_marker{};
+  std::uint32_t resident_heap_current{};
+  auto resident_heap_state_read =
+      vm.runtime().read32(0x8011ef00U, resident_heap_marker) &&
+      vm.runtime().read32(0x8011ee2cU, resident_heap_current);
+  auto resident_heap_marker_bridged = false;
+  if (resident_heap_state_read && resident_heap_marker == 0U &&
+      resident_heap_current != 0U) {
+    resident_heap_state_read =
+        vm.runtime().write32(0x8011ef00U, resident_heap_current);
+    resident_heap_marker = resident_heap_current;
+    resident_heap_marker_bridged = resident_heap_state_read;
+  }
+  constexpr std::array mission_open_arguments{mission_selection_index, 1U, 1U};
+  const auto mission_open = invoke_scheduled(
+      guest_profile.mission_archive_open_entry, mission_open_arguments);
+  std::uint32_t mission_open_state{};
+  std::uint32_t mission_open_depth{};
+  std::uint32_t mission_open_transition{};
+  std::uint32_t mission_pending_state{};
+  if (!mission_open.completed() ||
+      !vm.runtime().read32(guest_profile.application_state,
+                           mission_open_state) ||
+      !vm.runtime().read32(guest_profile.application_state_depth,
+                           mission_open_depth) ||
+      !vm.runtime().read32(guest_profile.application_transition,
+                           mission_open_transition) ||
+      !vm.runtime().read32(guest_profile.application_state_stack +
+                               mission_open_depth * sizeof(std::uint32_t),
+                           mission_pending_state)) {
+    std::uint32_t failed_heap_marker{};
+    std::uint32_t failed_heap_current{};
+    std::uint32_t failed_heap_base{};
+    const auto failed_heap_state_read =
+        vm.runtime().read32(0x8011ef00U, failed_heap_marker) &&
+        vm.runtime().read32(0x8011ee2cU, failed_heap_current) &&
+        vm.runtime().read32(0x8011ee28U, failed_heap_base);
+    std::cerr << "SF2 MissionArchive_Open failed: reason="
+              << sf::psx::toString(mission_open.execution.reason) << " pc=0x"
+              << std::hex << std::uppercase << mission_open.execution.pc
+              << " instruction=0x" << mission_open.execution.instruction
+              << " t1=0x" << vm.runtime().state().gpr[9U] << std::dec
+              << " instructions=" << mission_open.execution.instructions
+              << " cd-search=" << sf2_search_matches << '/' << sf2_search_calls
+              << " last-path=" << sf2_last_search_path
+              << " resident-callback-table="
+              << sf2_resident_callback_table_bridges
+              << " resident-overlay-load=" << sf2_resident_overlay_load_bridges
+              << " catalog-copy=" << sf2_catalog_copy_observations << '/'
+              << std::ranges::mismatch(
+                     sf2_catalog_after_copy,
+                     std::span<const std::byte>{fog_bytes}.first(std::min(
+                         fog_bytes.size(), sf2_catalog_after_copy.size())))
+                         .in1 -
+                     sf2_catalog_after_copy.begin()
+              << " catalog-repair=" << sf2_catalog_repair_bridges
+              << " slf-open=" << sf2_slf_open_bridges
+              << " slf-load=" << sf2_slf_load_bridges
+              << " pad-polls=" << sf2_pad_poll_bridges << " heap-marker=0x"
+              << std::hex << std::uppercase << failed_heap_marker
+              << " heap-current=0x" << failed_heap_current << " heap-base=0x"
+              << failed_heap_base << " s0=0x" << vm.runtime().state().gpr[16U]
+              << " a0=0x" << vm.runtime().state().gpr[4U] << " v1=0x"
+              << vm.runtime().state().gpr[3U] << " gp=0x"
+              << vm.runtime().state().gpr[28U]
+              << (failed_heap_state_read ? "" : "(read-failed)")
+              << " resident-heap-marker=0x" << resident_heap_marker
+              << " resident-heap-current=0x" << resident_heap_current
+              << " resident-heap-store="
+              << (resident_heap_marker_bridged ? "probe-bridged" : "retail")
+              << (resident_heap_state_read ? "" : "(read-failed)") << std::dec
+              << '\n';
+    return 7;
+  }
+  constexpr std::uint32_t fog_catalog_pointer_address = 0x8011ee68U;
+  constexpr std::uint32_t heap_end_address = 0x8011ee2cU;
+  constexpr std::uint32_t fog_catalog_address = 0x80126058U;
+  constexpr std::size_t fog_catalog_size = 0x240U;
+  std::uint32_t fog_catalog_pointer{};
+  std::uint32_t mission_heap_end{};
+  std::array<std::byte, fog_catalog_size> guest_fog_catalog{};
+  const auto fog_catalog_read =
+      vm.runtime().read32(fog_catalog_pointer_address, fog_catalog_pointer) &&
+      vm.runtime().read32(heap_end_address, mission_heap_end) &&
+      vm.runtime().copyBytes(fog_catalog_address, guest_fog_catalog);
+  auto matching_fog_catalog_bytes = std::size_t{};
+  while (matching_fog_catalog_bytes < guest_fog_catalog.size() &&
+         matching_fog_catalog_bytes < fog_bytes.size() &&
+         guest_fog_catalog[matching_fog_catalog_bytes] ==
+             fog_bytes[matching_fog_catalog_bytes]) {
+    ++matching_fog_catalog_bytes;
+  }
+  const auto locate_fog_prefix = [&]() {
+    constexpr std::size_t prefix_size = 16U;
+    if (fog_bytes.size() < prefix_size) {
+      return std::optional<std::uint32_t>{};
+    }
+    const auto ram = vm.runtime().ram();
+    const auto prefix =
+        std::span<const std::byte>{fog_bytes}.first(prefix_size);
+    const auto match =
+        std::search(ram.begin(), ram.end(), prefix.begin(), prefix.end());
+    return match == ram.end()
+               ? std::optional<std::uint32_t>{}
+               : std::optional<std::uint32_t>{
+                     0x80000000U +
+                     static_cast<std::uint32_t>(match - ram.begin())};
+  };
+  const auto fog_prefix_address = locate_fog_prefix();
+  auto mission_transition_bridged = false;
+  std::uint32_t loading_state_callback{};
+  std::uint8_t loading_state_ready{};
+  std::uint8_t loading_state_complete{};
+  std::uint16_t loading_state_timer{};
+  const auto loading_state_read =
+      vm.runtime().read32(0x8011f534U, loading_state_callback) &&
+      vm.runtime().read8(0x8011f544U, loading_state_ready) &&
+      vm.runtime().read8(0x8011f54cU, loading_state_complete) &&
+      vm.runtime().read16(0x8011f548U, loading_state_timer);
+  std::array<std::uint32_t, 8U> application_stack{};
+  const auto read_application_stack = [&]() {
+    auto valid = true;
+    for (std::size_t index = 0U; index < application_stack.size(); ++index) {
+      valid = valid &&
+              vm.runtime().read32(
+                  guest_profile.application_state_stack +
+                      static_cast<std::uint32_t>(index * sizeof(std::uint32_t)),
+                  application_stack[index]);
+    }
+    return valid;
+  };
+  auto application_stack_valid = read_application_stack();
+  auto mission_state_queued =
+      application_stack_valid &&
+      std::ranges::find(application_stack, 12U) != application_stack.end();
+  if (!mission_state_queued) {
+    // MissionArchive_Open's retail heap clear currently reaches the synthetic
+    // invoke stack and erases its saved a2 flag before the final state push.
+    // Re-issue that exact final retail call as a narrow probe-only bridge.
+    constexpr std::array mission_state_arguments{12U};
+    const auto state_push = invoke_scheduled(
+        guest_profile.application_state_push_entry, mission_state_arguments);
+    if (!state_push.completed() ||
+        !vm.runtime().read32(guest_profile.application_state_depth,
+                             mission_open_depth) ||
+        !vm.runtime().read32(guest_profile.application_state_stack +
+                                 mission_open_depth * sizeof(std::uint32_t),
+                             mission_pending_state)) {
+      std::cerr << "SF2 mission state-12 push failed\n";
+      return 7;
+    }
+    mission_transition_bridged = true;
+    application_stack_valid = read_application_stack();
+    mission_state_queued =
+        application_stack_valid &&
+        std::ranges::find(application_stack, 12U) != application_stack.end();
+  }
+  const auto mission_overlay_placed =
+      !expected_overlay.empty() &&
+      vm.runtime().loadBytes(guest_profile.mission_overlay_load_address,
+                             expected_overlay);
+  if (!mission_overlay_placed) {
+    std::cerr << "Could not place untouched SF2 HWAY overlay\n";
+    return 7;
+  }
+  std::uint32_t fog_header_heap_top{};
+  const auto fog_header_heap_address =
+      vm.runtime().read32(0x8011ee2cU, fog_header_heap_top) &&
+              fog_header_heap_top >= fog_header.size()
+          ? (fog_header_heap_top -
+             static_cast<std::uint32_t>(fog_header.size())) &
+                ~std::uint32_t{3U}
+          : 0U;
+  if (fog_header_heap_address == 0U ||
+      !vm.runtime().loadBytes(fog_header_heap_address, fog_header) ||
+      !vm.runtime().write32(0x8011ee2cU, fog_header_heap_address) ||
+      !vm.runtime().write32(0x8011ee68U, fog_header_heap_address)) {
+    std::cerr << "Could not preserve exact SF2 HWAY FOG header\n";
+    return 7;
+  }
+  auto loading_state_frames = std::size_t{};
+  std::uint32_t post_loading_state = mission_open_state;
+  constexpr std::array<std::uint32_t, 0U> no_loading_state_arguments{};
+  while (post_loading_state == 9U && loading_state_frames < 80U) {
+    const auto loading_frame =
+        invoke_scheduled(0x8002b8d0U, no_loading_state_arguments);
+    if (!loading_frame.completed() ||
+        !vm.runtime().read32(guest_profile.application_state,
+                             post_loading_state)) {
+      std::cerr << "SF2 loading state frame failed: frame="
+                << loading_state_frames << " reason="
+                << sf::psx::toString(loading_frame.execution.reason) << " pc=0x"
+                << std::hex << std::uppercase << loading_frame.execution.pc
+                << " instruction=0x" << loading_frame.execution.instruction;
+      std::uint32_t failed_loading_state{};
+      const auto failed_loading_state_read = vm.runtime().read32(
+          guest_profile.application_state, failed_loading_state);
+      std::cerr << std::dec << " state=" << failed_loading_state
+                << (failed_loading_state_read ? "" : "(read-failed)") << '\n';
+      return 7;
+    }
+    ++loading_state_frames;
+  }
+  auto state12_popped = false;
+  if (post_loading_state == 12U) {
+    const auto state12_ready =
+        invoke_scheduled(0x8002bdccU, no_loading_state_arguments);
+    if (!state12_ready.completed()) {
+      std::cerr << "SF2 state-12 readiness check failed\n";
+      return 7;
+    }
+    if (state12_ready.return_value == 0U) {
+      const auto state_pop =
+          invoke_scheduled(0x8002bc80U, no_loading_state_arguments);
+      if (!state_pop.completed() ||
+          !vm.runtime().read32(guest_profile.application_state,
+                               post_loading_state)) {
+        std::cerr << "SF2 state-12 retail pop failed: reason="
+                  << sf::psx::toString(state_pop.execution.reason) << " pc=0x"
+                  << std::hex << std::uppercase << state_pop.execution.pc
+                  << " instruction=0x" << state_pop.execution.instruction
+                  << std::dec << '\n';
+        return 7;
+      }
+      state12_popped = true;
+    }
+  }
+  std::cout << "SF2 MissionArchive_Open returned: state=" << mission_open_state
+            << " depth=" << mission_open_depth
+            << " pending-state=" << mission_pending_state
+            << " transition=" << mission_open_transition << " state-push="
+            << (mission_transition_bridged ? "probe-bridged" : "retail")
+            << " seeded-init-instructions="
+            << seeded_init.execution.instructions
+            << " resident-init-state-instructions="
+            << resident_init_state.execution.instructions
+            << " resident-callback-table="
+            << sf2_resident_callback_table_bridges
+            << " resident-overlay-load=" << sf2_resident_overlay_load_bridges
+            << " resident-heap-store="
+            << (resident_heap_marker_bridged ? "probe-bridged" : "retail")
+            << " catalog-copy=" << sf2_catalog_copy_observations
+            << " catalog-repair=" << sf2_catalog_repair_bridges
+            << " slf-open=" << sf2_slf_open_bridges
+            << " slf-load=" << sf2_slf_load_bridges
+            << " pad-polls=" << sf2_pad_poll_bridges
+            << " instructions=" << mission_open.execution.instructions
+            << " gp=0x" << std::hex << std::uppercase
+            << vm.runtime().state().gpr[28U] << " loading=0x"
+            << loading_state_callback << std::dec << '/'
+            << static_cast<unsigned int>(loading_state_ready) << '/'
+            << static_cast<unsigned int>(loading_state_complete) << '/'
+            << loading_state_timer
+            << (loading_state_read ? "" : "(read-failed)")
+            << " loading-frames=" << loading_state_frames
+            << " post-loading-state=" << post_loading_state
+            << " state12-pop=" << (state12_popped ? "retail" : "pending")
+            << " mission-overlay=exact-placed"
+            << " fog-header=exact@0x" << std::hex << std::uppercase
+            << fog_header_heap_address << std::dec << " stack=";
+  for (std::size_t index = 0U; index < application_stack.size(); ++index) {
+    std::cout << (index == 0U ? "" : "/") << application_stack[index];
+  }
+  std::cout << " cd-search=" << sf2_search_matches << '/' << sf2_search_calls
+            << " last-path=" << sf2_last_search_path
+            << " fog-catalog-pointer=0x" << std::hex << std::uppercase
+            << fog_catalog_pointer << " heap-end=0x" << mission_heap_end
+            << std::dec << " fog-catalog=" << matching_fog_catalog_bytes << '/'
+            << guest_fog_catalog.size()
+            << (fog_catalog_read ? "" : "(read-failed)") << " fog-prefix=";
+  if (fog_prefix_address) {
+    std::cout << "0x" << std::hex << std::uppercase << *fog_prefix_address
+              << std::dec;
+  } else {
+    std::cout << "missing";
+  }
+  const auto cd_state_after_open = vm.machine().cdrom().captureState();
+  std::cout << " cd-lba=" << cd_state_after_open.current_lba
+            << " catalog-copy=" << sf2_catalog_copy_observations << '/'
+            << std::ranges::mismatch(
+                   sf2_catalog_after_copy,
+                   std::span<const std::byte>{fog_bytes}.first(std::min(
+                       fog_bytes.size(), sf2_catalog_after_copy.size())))
+                       .in1 -
+                   sf2_catalog_after_copy.begin()
+            << " catalog-prefix=";
+  for (std::size_t index = 0U;
+       index < std::min<std::size_t>(32U, guest_fog_catalog.size()); ++index) {
+    if (index != 0U) {
+      std::cout << ':';
+    }
+    std::cout << std::hex << std::uppercase
+              << static_cast<unsigned int>(
+                     std::to_integer<std::uint8_t>(guest_fog_catalog[index]));
+  }
+  std::cout << std::dec << '\n';
+  // The interpreter has no retail exception-vector owner yet. Keep the
+  // deterministic probe on its explicit VSync/CD scheduler instead of
+  // repeatedly entering the uninitialized low-memory IRQ vector.
+  suppress_guest_interrupts = true;
+  vm.runtime().setExternalInterrupt(false);
+
+  const auto locate_in_guest_ram = [&](std::span<const std::byte> bytes) {
+    const auto ram = vm.runtime().ram();
+    const auto match =
+        std::search(ram.begin(), ram.end(), bytes.begin(), bytes.end());
+    return match == ram.end()
+               ? std::optional<std::uint32_t>{}
+               : std::optional<std::uint32_t>{
+                     0x80000000U +
+                     static_cast<std::uint32_t>(match - ram.begin())};
+  };
+  auto fog_header_address = locate_in_guest_ram(fog_header);
+  auto overlay_loaded = false;
+  auto stable_boundaries = std::size_t{};
+  auto mission_boundaries = std::size_t{};
+  auto state_loop_restarts = std::size_t{};
+  std::vector<std::uint32_t> mission_states;
+  std::optional<sf::game::Sf2PresentationFrame> presentation_frame;
+  std::vector<std::uint32_t> presentation_roots;
+  // Continue after the state-loop prologue/Common_Init call. The probe has
+  // already executed the retail initializer and mission transition directly.
+  // Recreate only the fixed frame/register setup consumed by 0x800297DC.
+  constexpr std::uint32_t state_loop_stack = probe_call_stack - 0x70U;
+  vm.runtime().setRegister(29U, state_loop_stack);
+  vm.runtime().setRegister(18U, 1U);
+  vm.runtime().setRegister(19U, 0x8012a574U);
+  vm.runtime().setRegister(20U, 0xfffffffcU);
+  vm.runtime().setRegister(21U, 0x80114710U);
+  if (!vm.runtime().write32(state_loop_stack + 0x68U,
+                            sf::psx::R3000Runtime::return_sentinel) ||
+      !vm.runtime().beginCall(guest_profile.state_loop_dispatch_entry)) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Could not enter SF2 mission application loop"};
+  }
+  while (mission_boundaries < mission_boundary_limit) {
+    const auto boundary =
+        run_scheduled_until_boundary(guest_profile.gpu_submission_entry);
+    if (!boundary.stoppedAtHostBoundary()) {
+      if (boundary.execution.reason == sf::psx::R3000StopReason::returned &&
+          state_loop_restarts < 64U &&
+          vm.runtime().beginCall(guest_profile.state_loop_entry)) {
+        ++state_loop_restarts;
+        continue;
+      }
+      std::uint32_t failed_state{};
+      if (!vm.runtime().read32(guest_profile.application_state, failed_state)) {
+        failed_state = std::numeric_limits<std::uint32_t>::max();
+      }
+      const auto ram = vm.runtime().ram();
+      const auto overlay_offset =
+          guest_profile.mission_overlay_load_address & 0x1fffffU;
+      auto matching_overlay_bytes = std::size_t{};
+      while (matching_overlay_bytes < expected_overlay.size() &&
+             overlay_offset + matching_overlay_bytes < ram.size() &&
+             ram[overlay_offset + matching_overlay_bytes] ==
+                 expected_overlay[matching_overlay_bytes]) {
+        ++matching_overlay_bytes;
+      }
+      std::cerr << "SF2 mission transition stopped before GPU boundary "
+                << mission_boundaries
+                << ": reason=" << sf::psx::toString(boundary.execution.reason)
+                << " pc=0x" << std::hex << std::uppercase
+                << boundary.execution.pc << " instruction=0x"
+                << boundary.execution.instruction << std::dec
+                << " state=" << failed_state << " t1=0x" << std::hex
+                << std::uppercase << vm.runtime().state().gpr[9U]
+                << " status=0x" << vm.runtime().state().cop0_status
+                << " cause=0x" << vm.runtime().state().cop0_cause << " epc=0x"
+                << vm.runtime().state().cop0_epc << " s0=0x"
+                << vm.runtime().state().gpr[16U] << " a0=0x"
+                << vm.runtime().state().gpr[4U] << " ra=0x"
+                << vm.runtime().state().gpr[31U] << " sp=0x"
+                << vm.runtime().state().gpr[29U] << std::dec << " fog-header="
+                << (fog_header_address ? "present" : "missing")
+                << " matching-overlay-bytes=" << matching_overlay_bytes << '/'
+                << expected_overlay.size() << " states=";
+      for (std::size_t index = 0U; index < mission_states.size(); ++index) {
+        std::cerr << (index == 0U ? "" : "/") << mission_states[index];
+      }
+      std::cerr << '\n';
+      return 8;
+    }
+    std::uint32_t state{};
+    if (!vm.runtime().read32(guest_profile.application_state, state)) {
+      return 8;
+    }
+    if (mission_states.empty() || mission_states.back() != state) {
+      mission_states.push_back(state);
+    }
+    if (!fog_header_address) {
+      fog_header_address = locate_in_guest_ram(fog_header);
+    }
+    std::vector<std::byte> guest_overlay(expected_overlay.size());
+    overlay_loaded =
+        vm.runtime().copyBytes(guest_profile.mission_overlay_load_address,
+                               guest_overlay) &&
+        std::ranges::equal(guest_overlay, expected_overlay);
+    constexpr std::uint32_t retail_render_submission_return = 0x800f181cU;
+    if (overlay_loaded &&
+        vm.runtime().state().gpr[31U] == retail_render_submission_return) {
+      auto published = sf::game::captureSf2PresentationFrame(
+          vm.runtime().ram(), vm.runtime().state().gpr[5U], state,
+          stable_boundaries + 1U, mission_boundaries + 1U);
+      if (published) {
+        presentation_roots.push_back(published->ordering_table_root);
+        presentation_frame = std::move(published);
+        ++stable_boundaries;
+      }
+    }
+
+    const auto retired = vm.resumeCurrentPcClockNeutral(1U);
+    if (retired.execution.reason !=
+        sf::psx::R3000StopReason::instruction_budget) {
+      return 8;
+    }
+    ++mission_boundaries;
+    if (stable_boundaries == stable_mission_boundary_count) {
+      break;
+    }
+  }
+
+  std::cout << "SF2 Mission 3 transition: mission-open-state="
+            << mission_open_state
+            << " mission-open-depth=" << mission_open_depth
+            << " mission-open-transition=" << mission_open_transition
+            << " resident-init=retail-seeded"
+            << " state-push="
+            << (mission_transition_bridged ? "probe-bridged" : "retail")
+            << " states=";
+  for (std::size_t index = 0U; index < mission_states.size(); ++index) {
+    std::cout << (index == 0U ? "" : "/") << mission_states[index];
+  }
+  std::cout << " boundaries=" << mission_boundaries
+            << " state-loop-restarts=" << state_loop_restarts
+            << " fog-header=" << (fog_header_address ? "0x" : "missing");
+  if (fog_header_address) {
+    std::cout << std::hex << std::uppercase << *fog_header_address << std::dec;
+  }
+  std::cout << " overlay="
+            << (overlay_loaded ? "exact" : "missing-or-different")
+            << " stable-boundaries=" << stable_boundaries
+            << " bridges=search:" << sf2_search_matches
+            << ",catalog:" << sf2_catalog_repair_bridges
+            << ",resident-overlay:" << sf2_resident_overlay_load_bridges
+            << ",slf-open:" << sf2_slf_open_bridges
+            << ",slf-load:" << sf2_slf_load_bridges
+            << ",pad-polls:" << sf2_pad_poll_bridges << " presentation=";
+  if (presentation_frame) {
+    std::cout << "valid@" << std::hex << std::uppercase
+              << presentation_frame->ordering_table_root << std::dec
+              << ",packets:" << presentation_frame->packets.size()
+              << ",words:" << presentation_frame->gp0_word_count
+              << ",commands:" << presentation_frame->gpu_command_count
+              << ",draws:" << presentation_frame->draw_command_count
+              << ",state:" << presentation_frame->application_state
+              << ",roots:";
+    for (std::size_t index = 0U; index < presentation_roots.size(); ++index) {
+      std::cout << (index == 0U ? "" : "/") << std::hex << std::uppercase
+                << presentation_roots[index] << std::dec;
+    }
+  } else {
+    std::cout << "missing";
+  }
+  std::cout << '\n';
+  if (!mission_state_queued || !fog_header_address || !overlay_loaded ||
+      stable_boundaries != stable_mission_boundary_count ||
+      !presentation_frame || !presentation_frame->valid()) {
+    return 9;
+  }
+  return 0;
+}
+
+int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
+                           bool forward, bool combat, bool crouch) {
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, 2U};
+  if (!runtime.ready()) {
+    std::cerr << "SF2 product runtime failed: " << runtime.faultDetail()
+              << '\n';
+    return 7;
+  }
+  sf::game::LegacyHostPadState pad;
+  pad.buttons = forward ? 0x0010U : crouch ? 0x4000U : 0U;
+  pad.face_axis_buttons = 0U;
+  pad.use_explicit_face_axis_buttons = crouch;
+  pad.left_y = forward ? 0x00U : 0x80U;
+  runtime.setHostPadState(pad);
+  std::vector<std::array<std::uint32_t, 4U>> display_environments;
+  auto observed_sequence = std::uint64_t{};
+  std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+  auto pcm_frames = std::uint64_t{};
+  auto nonzero_pcm_frames = std::uint64_t{};
+  auto peak_pcm_sample = std::uint16_t{};
+  const auto inspect_pcm = [&](std::size_t count) {
+    for (const auto &sample : std::span{pcm}.first(count)) {
+      const auto left = static_cast<std::int32_t>(sample.left);
+      const auto right = static_cast<std::int32_t>(sample.right);
+      if (left != 0 || right != 0) {
+        ++nonzero_pcm_frames;
+      }
+      const auto magnitude = [](std::int32_t value) {
+        return static_cast<std::uint16_t>(
+            std::min<std::int32_t>(std::abs(value), 32767));
+      };
+      peak_pcm_sample =
+          std::max({peak_pcm_sample, magnitude(left), magnitude(right)});
+    }
+  };
+  auto first_restore_frame = std::uint32_t{};
+  auto first_sprite_frame = std::uint32_t{};
+  auto maximum_sprite_commands = std::size_t{};
+  auto maximum_active_spu_voices = std::size_t{};
+  auto minimum_player_health = std::numeric_limits<std::uint16_t>::max();
+  auto first_xa_frame = std::uint32_t{};
+  auto maximum_cd_lba = std::uint32_t{};
+  auto maximum_relative_cd_lba = std::uint32_t{};
+  for (std::uint32_t frame = 0U; frame < frames; ++frame) {
+    if (combat && frame >= 1'000U) {
+      sf::game::PlayerInput input;
+      input.run = true;
+      input.move = 1.0;
+      input.turn = ((frame / 180U) & 1U) == 0U ? 0.45 : -0.45;
+      input.strafe = ((frame / 240U) & 1U) == 0U ? 1.0 : -1.0;
+      input.target_lock_held = (frame % 180U) < 120U;
+      input.aim = (frame % 360U) >= 240U;
+      input.aim_sight_yaw =
+          input.aim ? (((frame / 30U) & 1U) == 0U ? 0.75 : -0.75) : 0.0;
+      input.aim_sight_pitch =
+          input.aim ? (((frame / 45U) & 1U) == 0U ? 0.5 : -0.5) : 0.0;
+      input.fire_held = (frame % 24U) < 8U;
+      input.reload = (frame % 600U) == 0U;
+      pad = sf::game::legacyPadStateFromPlayerInput(input);
+      if ((frame % 420U) < 4U) {
+        pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
+      }
+    }
+    runtime.setHostPadState(pad);
+    if (!runtime.advanceHostUpdate()) {
+      std::cerr << "SF2 product runtime stopped at frame " << frame << ": "
+                << runtime.faultDetail() << '\n';
+      return 7;
+    }
+    while (const auto count = runtime.takePcm(pcm)) {
+      pcm_frames += count;
+      inspect_pcm(count);
+    }
+    const auto frame_diagnostics = runtime.diagnostics();
+    minimum_player_health =
+        std::min(minimum_player_health, frame_diagnostics.player_health);
+    maximum_active_spu_voices =
+        std::max(maximum_active_spu_voices,
+                 frame_diagnostics.active_spu_voices);
+    maximum_cd_lba = std::max(maximum_cd_lba, frame_diagnostics.cd_lba);
+    if (frame_diagnostics.cd_lba < 4096U) {
+      maximum_relative_cd_lba =
+          std::max(maximum_relative_cd_lba, frame_diagnostics.cd_lba);
+    }
+    if (first_xa_frame == 0U &&
+        frame_diagnostics.xa_stream_set != 0U) {
+      first_xa_frame = frame + 1U;
+    }
+    if (first_restore_frame == 0U &&
+        frame_diagnostics.checkpoint_restores != 0U) {
+      first_restore_frame = frame + 1U;
+    }
+    const auto &published = runtime.presentationFrame();
+    if (!published || published->sequence == observed_sequence) {
+      continue;
+    }
+    observed_sequence = published->sequence;
+    const auto sprite_commands = std::ranges::count_if(
+        published->packets, [](const auto &packet) {
+          if (packet.gp0_words.empty()) {
+            return false;
+          }
+          const auto opcode = packet.gp0_words.front() >> 24U;
+          return opcode >= 0x60U && opcode <= 0x7fU;
+        });
+    maximum_sprite_commands =
+        std::max(maximum_sprite_commands,
+                 static_cast<std::size_t>(sprite_commands));
+    if (first_sprite_frame == 0U && sprite_commands != 0) {
+      first_sprite_frame = frame + 1U;
+    }
+    std::array<std::uint32_t, 4U> environment{};
+    for (const auto &packet : published->packets) {
+      if (packet.gp0_words.empty() ||
+          (packet.gp0_words.front() >> 24U) < 0xe1U) {
+        continue;
+      }
+      for (const auto word : packet.gp0_words) {
+        const auto opcode = word >> 24U;
+        if (opcode == 0xe1U) {
+          environment[0U] = word;
+        } else if (opcode == 0xe3U) {
+          environment[1U] = word;
+        } else if (opcode == 0xe4U) {
+          environment[2U] = word;
+        } else if (opcode == 0xe5U) {
+          environment[3U] = word;
+        }
+      }
+    }
+    if ((display_environments.empty() ||
+         display_environments.back() != environment) &&
+        display_environments.size() < 16U) {
+      display_environments.push_back(environment);
+    }
+  }
+  const auto &presentation = runtime.presentationFrame();
+  if (!presentation || !presentation->valid()) {
+    std::cerr << "SF2 product runtime did not publish a valid frame\n";
+    return 7;
+  }
+  while (const auto count = runtime.takePcm(pcm)) {
+    pcm_frames += count;
+    inspect_pcm(count);
+  }
+  const auto diagnostics = runtime.diagnostics();
+  std::vector<std::uint32_t> presentation_words;
+  presentation_words.reserve(presentation->gp0_word_count);
+  for (const auto &packet : presentation->packets) {
+    presentation_words.insert(presentation_words.end(),
+                              packet.gp0_words.begin(),
+                              packet.gp0_words.end());
+  }
+  std::cout << "SF2 product runtime completed: frames=" << frames
+            << " input="
+            << (combat ? "combat"
+                       : (forward ? "forward"
+                                  : (crouch ? "crouch" : "neutral")))
+            << " guest-frame=" << presentation->guest_frame
+            << " packets=" << presentation->packets.size()
+            << " words=" << presentation->gp0_word_count
+            << " commands=" << presentation->gpu_command_count
+            << " draws=" << presentation->draw_command_count
+            << " pcm=" << pcm_frames
+            << ":" << nonzero_pcm_frames << "/" << peak_pcm_sample
+            << " pad-samples=" << runtime.inputSampleCount()
+            << " pad-caller=0x" << std::hex << std::uppercase
+            << diagnostics.last_pad_caller << std::dec
+            << " pad-index=" << diagnostics.last_pad_index
+            << " state=" << diagnostics.application_state
+            << " clock=" << diagnostics.system_clock
+            << " player=0x" << std::hex << std::uppercase
+            << diagnostics.player_instance << std::dec << ":"
+            << diagnostics.player_x << "/" << diagnostics.player_y << "/"
+            << diagnostics.player_z << ":"
+            << diagnostics.player_health << "/" << diagnostics.player_armor
+            << ":item=" << diagnostics.player_equipped_item << ":owned=0x"
+            << std::hex << diagnostics.player_owned_items[0] << "/"
+            << diagnostics.player_owned_items[1] << std::dec
+            << " checkpoint-restores="
+            << diagnostics.checkpoint_restores
+            << " first-restore-frame=" << first_restore_frame
+            << " min-health=" << minimum_player_health
+            << " first-sprite-frame=" << first_sprite_frame
+            << " max-sprites=" << maximum_sprite_commands
+            << " last-restore=0x" << std::hex << std::uppercase
+            << diagnostics.last_restore_caller << std::dec << ":"
+            << diagnostics.pre_restore_player_x << "/"
+            << diagnostics.pre_restore_player_y << "/"
+            << diagnostics.pre_restore_player_z << ":"
+            << diagnostics.pre_restore_player_health
+            << " damage-events=" << diagnostics.damage_events
+            << " last-damage=0x" << std::hex << std::uppercase
+            << diagnostics.last_damage_caller << ":"
+            << diagnostics.last_damage_arguments[0U] << "/"
+            << diagnostics.last_damage_arguments[1U] << "/"
+            << diagnostics.last_damage_arguments[2U] << "/"
+            << diagnostics.last_damage_arguments[3U] << std::dec
+            << " player-damage-events=" << diagnostics.player_damage_events
+            << " last-player-damage=0x" << std::hex << std::uppercase
+            << diagnostics.last_player_damage_caller << ":";
+  for (const auto word : diagnostics.last_player_damage_request) {
+    std::cout << word << "/";
+  }
+  std::cout << std::dec
+            << " audio=" << diagnostics.spu_mixed_frames << ":"
+            << diagnostics.active_spu_voices << "/max:"
+            << maximum_active_spu_voices << "/"
+            << "keys:" << diagnostics.spu_key_on_writes << "/"
+            << diagnostics.spu_key_off_writes << ":0x" << std::hex
+            << diagnostics.spu_last_key_on_mask << "/"
+            << diagnostics.spu_last_key_off_mask << std::dec << "/"
+            << diagnostics.spu_control << "/" << diagnostics.spu_status << "/"
+            << diagnostics.spu_cd_frames << "/"
+            << static_cast<unsigned int>(diagnostics.cd_muted) << "/"
+            << static_cast<unsigned int>(diagnostics.cd_adpcm_muted) << ":"
+            << diagnostics.cd_lba << "/"
+            << static_cast<unsigned int>(diagnostics.cd_reading) << "/"
+            << static_cast<unsigned int>(diagnostics.cd_interrupt_flags) << "/"
+            << static_cast<unsigned int>(diagnostics.cd_pending_command) << "/"
+            << static_cast<unsigned int>(diagnostics.cd_command_phase) << "/"
+            << static_cast<unsigned int>(diagnostics.cd_data_valid) << "/"
+            << static_cast<unsigned int>(
+                   diagnostics.cd_sector_event_pending)
+            << "/"
+            << static_cast<unsigned int>(diagnostics.xa_stream_set) << "/"
+            << static_cast<unsigned int>(diagnostics.xa_file) << "/"
+            << static_cast<unsigned int>(diagnostics.xa_channel)
+            << " first-xa-frame=" << first_xa_frame
+            << " max-cd-lba=" << maximum_cd_lba
+            << "/" << maximum_relative_cd_lba
+            << " scripts=" << diagnostics.script_archive_loads << ":"
+            << diagnostics.script_program_count << "/"
+            << diagnostics.script_level_starts << "/"
+            << diagnostics.script_dispatches << "/"
+            << diagnostics.script_program_dispatches << "/"
+            << diagnostics.script_activations
+            << " level=0x" << std::hex << std::uppercase
+            << diagnostics.script_level_program << "/"
+            << diagnostics.script_level_name_pointer << ":"
+            << diagnostics.script_level_name_words[0U] << "/"
+            << diagnostics.script_level_name_words[1U] << ":"
+            << diagnostics.script_lookup_name_words[0U] << "/"
+            << diagnostics.script_lookup_name_words[1U] << std::dec
+            << " xa-calls=" << diagnostics.scene_xa_archive_opens << "/"
+            << diagnostics.scene_speech_starts << "/"
+            << diagnostics.scene_speech_callbacks << ":"
+            << static_cast<unsigned int>(diagnostics.scene_speech_stage) << "/"
+            << static_cast<unsigned int>(diagnostics.scene_speech_io_ready)
+            << ":" << diagnostics.spatial_sound_starts << "/"
+            << diagnostics.scene_sound_cue_plays << ":callbacks="
+            << std::hex << std::uppercase;
+  for (const auto callback : diagnostics.interrupt_callbacks) {
+    std::cout << callback << "/";
+  }
+  std::cout << ":"
+            << std::hex << std::uppercase;
+  for (const auto value : diagnostics.last_scene_speech_arguments) {
+    std::cout << value << "/";
+  }
+  std::cout << ":";
+  for (const auto value : diagnostics.scene_speech_io_state) {
+    std::cout << value << "/";
+  }
+  std::cout << ":";
+  for (const auto value : diagnostics.xa_globals) {
+    std::cout << value << "/";
+  }
+  std::cout << diagnostics.xa_status_source << "/"
+            << diagnostics.xa_status_result << std::dec << "/"
+            << diagnostics.xa_cue_plays << "/"
+            << diagnostics.xa_stream_starts
+            << " async-file=" << diagnostics.async_file_services << "/"
+            << diagnostics.async_file_completions << ":0x"
+            << std::hex
+            << std::uppercase << diagnostics.last_async_completion_caller
+            << std::dec
+            << " sp=0x" << std::hex << std::uppercase
+            << diagnostics.stack_pointer << "/"
+            << diagnostics.minimum_stack_pointer << "/"
+            << diagnostics.maximum_stack_pointer
+            << " gp=0x" << diagnostics.global_pointer << std::dec
+            << " gp0-sha256="
+            << sf::core::toHex(sf::core::sha256(
+                   std::as_bytes(std::span{presentation_words})));
+  const auto first_draw = std::ranges::find_if(
+      presentation->packets, [](const auto &packet) {
+        return sf::game::sf2GpuCommandKind(packet) ==
+               sf::game::Sf2GpuCommandKind::draw;
+      });
+  if (first_draw != presentation->packets.end()) {
+    std::cout << " first-draw=";
+    for (const auto word : first_draw->gp0_words) {
+      std::cout << std::hex << std::uppercase << word << '/';
+    }
+    std::cout << std::dec;
+  }
+  std::array<std::size_t, 256U> opcode_counts{};
+  for (const auto &packet : presentation->packets) {
+    if (!packet.gp0_words.empty()) {
+      ++opcode_counts[packet.gp0_words.front() >> 24U];
+    }
+  }
+  std::cout << " opcodes=";
+  for (std::size_t opcode = 0U; opcode < opcode_counts.size(); ++opcode) {
+    if (opcode_counts[opcode] != 0U) {
+      std::cout << std::hex << std::uppercase << opcode << std::dec << ':'
+                << opcode_counts[opcode] << '/';
+    }
+  }
+  std::cout << " display-envs=";
+  for (std::size_t index = 0U; index < display_environments.size(); ++index) {
+    std::cout << (index == 0U ? "" : ",");
+    for (const auto word : display_environments[index]) {
+      std::cout << std::hex << std::uppercase << word << '/';
+    }
+    std::cout << std::dec;
+  }
+  std::cout << '\n';
+  const auto restore_stability_missing =
+      first_restore_frame != 0U &&
+      frames - first_restore_frame < 300U;
+  if (frames >= 800U &&
+      (nonzero_pcm_frames == 0U || peak_pcm_sample == 0U ||
+       maximum_active_spu_voices == 0U ||
+       diagnostics.spu_key_on_writes <= 2U ||
+       diagnostics.player_instance == 0U ||
+       runtime.inputSampleCount() == 0U ||
+       restore_stability_missing)) {
+    std::cerr << "SF2 playable-alpha gate failed: PCM, SPU voices, player, "
+                 "PAD cadence, or post-checkpoint stability is missing\n";
+    return 8;
+  }
   return 0;
 }
 
@@ -7470,8 +10953,7 @@ int main(int argc, char **argv) {
       }
       return inspectMission(argv[2], mission_index);
     }
-    if (argc == 4 &&
-        std::string_view{argv[1]} == "inspect-mission-archive") {
+    if (argc == 4 && std::string_view{argv[1]} == "inspect-mission-archive") {
       return inspectMissionArchive(argv[2], argv[3]);
     }
     if (argc == 4 && std::string_view{argv[1]} == "extract-exe") {
@@ -7525,8 +11007,7 @@ int main(int argc, char **argv) {
         std::string_view{argv[1]} == "compare-mission-script-opcodes") {
       return compareMissionScriptOpcodes(argv[2], argv[3], argv[4]);
     }
-    if (argc == 4 &&
-        std::string_view{argv[1]} == "map-mission-script-events") {
+    if (argc == 4 && std::string_view{argv[1]} == "map-mission-script-events") {
       return mapMissionScriptEvents(argv[2], argv[3]);
     }
     if (argc == 4 &&
@@ -7564,6 +11045,38 @@ int main(int argc, char **argv) {
         }
       }
       return probeExecutableEntry(argv[2], budget);
+    }
+    if ((argc == 3 || argc == 4) &&
+        (std::string_view{argv[1]} == "probe-sf2-guest-bootstrap" ||
+         std::string_view{argv[1]} == "probe-sf2-mission-transition")) {
+      auto budget = std::uint64_t{5'000'000U};
+      if (argc == 4) {
+        const auto text = std::string_view{argv[3]};
+        const auto [pointer, error] =
+            std::from_chars(text.data(), text.data() + text.size(), budget);
+        if (error != std::errc{} || pointer != text.data() + text.size() ||
+            budget == 0U) {
+          throw sf::core::Error{
+              sf::core::ErrorCode::invalid_argument,
+              "Instruction budget must be a positive integer"};
+        }
+      }
+      return probeSf2GuestBootstrap(argv[2], budget,
+                                    std::string_view{argv[1]} ==
+                                        "probe-sf2-mission-transition");
+    }
+    if ((argc >= 3 && argc <= 5) &&
+        std::string_view{argv[1]} == "probe-sf2-product-runtime") {
+      const auto mode =
+          argc == 5 ? std::string_view{argv[4]} : std::string_view{};
+      if (!mode.empty() && mode != "forward" && mode != "combat" &&
+          mode != "crouch") {
+        printUsage();
+        return 1;
+      }
+      return probeSf2ProductRuntime(
+          argv[2], argc >= 4 ? parseFrameCount(argv[3]) : 64U,
+          mode == "forward", mode == "combat", mode == "crouch");
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {
       return probeLegacyCd(argv[2]);

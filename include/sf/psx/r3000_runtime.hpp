@@ -33,6 +33,14 @@ struct R3000RunResult {
     std::uint32_t instruction{};
 };
 
+struct R3000WriteWatchHit {
+    std::uint32_t address{};
+    std::uint32_t value{};
+    std::uint32_t pc{};
+    std::uint32_t instruction{};
+    std::uint8_t width{};
+};
+
 enum class R3000AccessWidth : std::uint8_t {
     byte = 1U,
     halfword = 2U,
@@ -111,6 +119,12 @@ public:
     void setRegister(std::uint8_t reg, std::uint32_t value) noexcept;
     void attachMmioBus(R3000MmioBus* bus) noexcept { mmio_bus_ = bus; }
     void setExternalInterrupt(bool active) noexcept;
+    void setWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
+    void addWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
+    void clearWriteWatchHit() noexcept { write_watch_hit_ = {}; }
+    [[nodiscard]] const R3000WriteWatchHit& writeWatchHit() const noexcept {
+        return write_watch_hit_;
+    }
 
     [[nodiscard]] bool interruptPending() const noexcept;
 
@@ -158,12 +172,20 @@ private:
     void flushLoadDelay() noexcept;
     void clearLoadDelay() noexcept;
     void takeInterrupt() noexcept;
+    void recordWriteWatch(std::uint32_t address, std::uint8_t width,
+                          std::uint32_t value) noexcept;
 
     std::vector<std::byte> ram_;
     std::array<std::byte, scratchpad_size> scratchpad_{};
     std::array<std::byte, mmio_size> mmio_{};
     R3000State state_{};
     R3000MmioBus* mmio_bus_{};
+    std::array<std::uint32_t, 4U> write_watch_begins_{};
+    std::array<std::uint32_t, 4U> write_watch_ends_{};
+    std::size_t write_watch_count_{};
+    std::uint32_t executing_pc_{};
+    std::uint32_t executing_instruction_{};
+    R3000WriteWatchHit write_watch_hit_{};
 };
 
 } // namespace sf::psx

@@ -717,6 +717,17 @@ void testMachineCdRomDmaAndSnapshot() {
   const auto checkpoint = machine.captureState();
   const std::vector<std::byte> ram_checkpoint(runtime.ram().begin(),
                                               runtime.ram().end());
+  require(runtime.write8(cdrom + 1U, 0x09U) &&
+              machine.cdrom().commandSchedule().pending != 0U &&
+              machine.cdrom().sectorSchedule().pending != 0U &&
+              machine.cdrom().commandSchedule().delay_ticks <
+                  machine.cdrom().sectorSchedule().delay_ticks &&
+              machine.completeNextPendingCdRomEvent() &&
+              (machine.cdrom().captureState().interrupt_flags & 0x07U) == 3U &&
+              runtime.restoreRam(ram_checkpoint) &&
+              machine.restoreState(checkpoint),
+          "Clock-neutral CD event completion did not select the earliest "
+          "pending command before an older sector event");
   std::size_t sector_event_index = sf::psx::EventSchedulerState::capacity;
   for (std::size_t index = 0U; index < checkpoint.scheduler.event_count;
        ++index) {
@@ -1747,8 +1758,7 @@ void testLegacyGameplayVmBoundary() {
   std::uint32_t staged_strafe{};
   require(aim_movement_result.completed() &&
               vm.runtime().read32(aim_movement_state + 0x7cU, staged_move) &&
-              vm.runtime().read32(aim_movement_state + 0x74U,
-                                  staged_strafe) &&
+              vm.runtime().read32(aim_movement_state + 0x74U, staged_strafe) &&
               std::bit_cast<std::int32_t>(staged_move) == 4096 &&
               std::bit_cast<std::int32_t>(staged_strafe) == -2048,
           "Manual-aim movement hook did not stage retail fixed-point axes");
@@ -1765,8 +1775,7 @@ void testLegacyGameplayVmBoundary() {
   const auto disabled_aim_movement =
       vm.invoke(aim_movement_boundary, std::array{aim_movement_state});
   require(disabled_aim_movement.completed() &&
-              vm.runtime().read32(aim_movement_state + 0x74U,
-                                  staged_strafe) &&
+              vm.runtime().read32(aim_movement_state + 0x74U, staged_strafe) &&
               staged_strafe == 0x12345678U,
           "Disabled manual-aim hook modified retail movement state");
 
@@ -2177,17 +2186,19 @@ void testLegacyGameplayVmBoundary() {
   require(vm.unbindHostCall(cd_ready_callback),
           "Could not remove the CD ready callback fixture");
 
-  // SF2/SF3 register their libcd data-ready entry directly rather than
-  // reading the SF1 callback-pointer global. Keep both executable layouts on
-  // the same hardware acknowledgement path.
+  // Some executable profiles bind a fixed data-ready entry. Keep direct and
+  // guest-owned callback-pointer layouts on the same acknowledgement path.
   constexpr std::uint32_t direct_cd_ready_callback = 0x80022040U;
   constexpr std::uint32_t direct_cd_ready_result = 0x80125460U;
   std::uint32_t direct_cd_ready_count{};
+  std::uint32_t direct_cd_ready_stack{};
   std::array<std::uint32_t, 2U> direct_cd_ready_arguments{};
   vm.bindHostCall(direct_cd_ready_callback,
-                  [&direct_cd_ready_count, &direct_cd_ready_arguments](
+                  [&direct_cd_ready_count, &direct_cd_ready_stack,
+                   &direct_cd_ready_arguments](
                       sf::game::LegacyHostCallContext &context) {
                     ++direct_cd_ready_count;
+                    direct_cd_ready_stack = context.registerValue(29U);
                     direct_cd_ready_arguments = {context.argument(0),
                                                  context.argument(1)};
                     context.setReturnValue(0U);
@@ -2198,20 +2209,229 @@ void testLegacyGameplayVmBoundary() {
   ready_cdrom.response[0] = 0x22U;
   vm.bindPsxCdReadyCallback(direct_cd_ready_callback, direct_cd_ready_result,
                             0U, false);
+  const auto interrupted_cd_ready_state = vm.runtime().state();
   require(vm.machine().cdrom().restoreState(ready_cdrom) &&
               vm.servicePsxCdReadyCallback(),
           "Direct executable CD ready callback dispatch failed");
   std::uint8_t direct_cd_ready_response{};
   require(
       direct_cd_ready_count == 1U &&
+          direct_cd_ready_stack == 0x807f0000U &&
           direct_cd_ready_arguments == std::array{1U, direct_cd_ready_result} &&
           vm.runtime().read8(direct_cd_ready_result,
                              direct_cd_ready_response) &&
           direct_cd_ready_response == 0x22U &&
-          (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U,
+          (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U &&
+          sameCpuState(interrupted_cd_ready_state, vm.runtime().state()),
       "Direct executable CD ready callback state mismatch");
   require(vm.unbindHostCall(direct_cd_ready_callback),
           "Could not remove the direct CD ready callback fixture");
+
+  // Retail interrupt tables store callbacks in guest RAM. Dispatching a slot
+  // must run its exact guest/host target atomically and restore the
+  // interrupted CPU context while preserving the callback's RAM side effects.
+  constexpr std::uint32_t callback_slot = 0x80125470U;
+  constexpr std::uint32_t slotted_callback = 0x80022060U;
+  constexpr std::uint32_t callback_result_address = 0x80125474U;
+  std::uint32_t slotted_callback_count{};
+  vm.bindHostCall(
+      slotted_callback,
+      [&slotted_callback_count,
+       callback_result_address](sf::game::LegacyHostCallContext &context) {
+        ++slotted_callback_count;
+        static_cast<void>(context.write32(callback_result_address,
+                                          0x534c4f54U));
+        context.setReturnValue(0xdeadbeefU);
+      });
+  vm.runtime().setRegister(2U, 0x12345678U);
+  vm.runtime().setRegister(29U, 0x801ff000U);
+  const auto interrupted_callback_state = vm.runtime().state();
+  std::uint32_t slotted_callback_result{};
+  require(vm.runtime().write32(callback_slot, slotted_callback) &&
+              vm.servicePsxCallbackSlot(callback_slot, 0x801fe000U) &&
+              slotted_callback_count == 1U &&
+              vm.runtime().read32(callback_result_address,
+                                  slotted_callback_result) &&
+              slotted_callback_result == 0x534c4f54U &&
+              sameCpuState(interrupted_callback_state, vm.runtime().state()),
+          "Retail callback-slot dispatch did not preserve interrupted CPU state");
+  require(vm.unbindHostCall(slotted_callback),
+          "Could not remove callback-slot fixture");
+
+  // SF2's async libcd path polls a guest command word and copies its
+  // completion byte from a paired result buffer. Preserve both pieces when
+  // the low-level controller call is host-bound.
+  constexpr std::uint32_t async_cd_pending_entry = 0x80022064U;
+  constexpr std::uint32_t async_cd_control_entry = 0x80022068U;
+  constexpr std::uint32_t cd_pending_state = 0x80125478U;
+  constexpr std::uint32_t cd_response_pointer = 0x8012547cU;
+  constexpr std::uint32_t cd_completion_state = 0x80125480U;
+  constexpr std::uint32_t cd_active_response = 0x80125484U;
+  constexpr std::uint32_t cd_completion_response = 0x8012548cU;
+  constexpr std::uint32_t cd_setloc_state = 0x80125498U;
+  constexpr std::uint32_t cd_mode_state = 0x8012549cU;
+  vm.bindPsxCdPendingCommandCall(
+      async_cd_pending_entry, cd_pending_state, cd_response_pointer,
+      cd_completion_state, cd_completion_response);
+  vm.bindPsxCdControlCall(async_cd_control_entry, cd_setloc_state,
+                          cd_mode_state);
+  constexpr std::uint32_t cd_completion_callback_slot = 0x80125494U;
+  constexpr std::uint32_t cd_completion_callback = 0x8002206cU;
+  std::uint32_t cd_completion_callback_count{};
+  std::uint32_t cd_completion_callback_stack{};
+  std::array<std::uint32_t, 2U> cd_completion_callback_arguments{};
+  vm.bindHostCall(
+      cd_completion_callback,
+      [&cd_completion_callback_count, &cd_completion_callback_stack,
+       &cd_completion_callback_arguments](
+          sf::game::LegacyHostCallContext &context) {
+        ++cd_completion_callback_count;
+        cd_completion_callback_stack = context.registerValue(29U);
+        cd_completion_callback_arguments = {context.argument(0),
+                                            context.argument(1)};
+        context.setReturnValue(0U);
+      });
+  vm.bindPsxCdCompletionCallback(cd_completion_callback_slot,
+                                cd_completion_response, true);
+  auto direct_completion = vm.machine().cdrom().captureState();
+  direct_completion.interrupt_flags = 2U;
+  direct_completion.response_position = 0U;
+  direct_completion.response_count = 1U;
+  direct_completion.response[0] = 0x02U;
+  vm.runtime().setRegister(2U, 0x2468ace0U);
+  vm.runtime().setRegister(29U, 0x801fd000U);
+  const auto interrupted_cd_completion_state = vm.runtime().state();
+  require(
+      vm.runtime().write32(cd_completion_callback_slot,
+                           cd_completion_callback) &&
+          vm.runtime().write16(cd_pending_state, 0x15U) &&
+          vm.runtime().write8(cd_completion_state, 0U) &&
+          vm.runtime().write32(cd_response_pointer, cd_active_response) &&
+          vm.machine().cdrom().restoreState(direct_completion) &&
+          vm.servicePsxCdReadyCallback(),
+      "Direct executable CD completion callback dispatch failed");
+  std::uint16_t direct_completion_pending{};
+  std::uint8_t direct_completion_state{};
+  std::uint8_t direct_completion_active_response{};
+  std::uint8_t observed_completion_response{};
+  require(
+      cd_completion_callback_count == 1U &&
+          cd_completion_callback_stack == 0x807f0000U &&
+          cd_completion_callback_arguments ==
+              std::array{2U, cd_completion_response} &&
+          vm.runtime().read16(cd_pending_state, direct_completion_pending) &&
+          vm.runtime().read8(cd_completion_state, direct_completion_state) &&
+          vm.runtime().read8(cd_active_response,
+                             direct_completion_active_response) &&
+          vm.runtime().read8(cd_completion_response,
+                             observed_completion_response) &&
+          direct_completion_pending == 0U && direct_completion_state == 5U &&
+          direct_completion_active_response == 0x02U &&
+          observed_completion_response == 0x02U &&
+          (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U &&
+          sameCpuState(interrupted_cd_completion_state, vm.runtime().state()),
+      "Direct executable CD completion callback state mismatch");
+  vm.bindPsxCdCompletionCallback(0U, 0U, false);
+  require(vm.unbindHostCall(cd_completion_callback),
+          "Could not remove the direct CD completion callback fixture");
+
+  PatternCdRomMedia callback_cd_media;
+  vm.machine().setCdRomMedia(&callback_cd_media);
+  vm.machine().cdrom().reset();
+  constexpr std::uint32_t cd_control_parameters = 0x801254a0U;
+  constexpr std::array<std::byte, 4U> setloc_parameters{
+      std::byte{0x00U}, std::byte{0x02U}, std::byte{0x16U}, std::byte{0x7fU}};
+  const std::array mirrored_setloc_arguments{0x02U, cd_control_parameters, 0U};
+  const std::array mirrored_setfilter_arguments{
+      0x0dU, cd_control_parameters, 0U};
+  const std::array mirrored_setmode_arguments{0x0eU, cd_control_parameters, 0U};
+  std::array<std::byte, 4U> mirrored_setloc{};
+  std::uint8_t mirrored_mode{};
+  require(
+      vm.runtime().loadBytes(cd_control_parameters, setloc_parameters) &&
+          vm.invoke(async_cd_control_entry, mirrored_setloc_arguments, 1U)
+              .completed() &&
+          vm.runtime().copyBytes(cd_setloc_state, mirrored_setloc) &&
+          mirrored_setloc == setloc_parameters &&
+          vm.runtime().write8(cd_control_parameters, 0x01U) &&
+          vm.runtime().write8(cd_control_parameters + 1U, 0x07U) &&
+          vm.invoke(async_cd_control_entry, mirrored_setfilter_arguments, 1U)
+              .completed() &&
+          vm.machine().cdrom().captureState().filter_file == 0x01U &&
+          vm.machine().cdrom().captureState().filter_channel == 0x07U &&
+          vm.runtime().write8(cd_control_parameters, 0x80U) &&
+          vm.invoke(async_cd_control_entry, mirrored_setmode_arguments, 1U)
+              .completed() &&
+          vm.runtime().read8(cd_mode_state, mirrored_mode) &&
+          mirrored_mode == 0x80U && vm.machine().cdrom().mode() == 0x80U,
+      "Host-bound CdControl did not preserve PsyQ Setloc/Setmode state");
+  const std::array seek_arguments{0x15U, 0U, 0U};
+  const auto seek_started =
+      vm.invoke(async_cd_control_entry, seek_arguments, 1U);
+  std::uint16_t pending_seek{};
+  require(seek_started.completed() && seek_started.return_value == 0U &&
+              vm.runtime().read16(cd_pending_state, pending_seek) &&
+              pending_seek == 0x15U,
+          "Host-bound CdControl did not publish the async seek state");
+  auto completed_seek = vm.machine().cdrom().captureState();
+  completed_seek.pending_command = 0U;
+  completed_seek.command_phase = sf::psx::CdRomCommandPhase::idle;
+  completed_seek.command_event = {};
+  completed_seek.seeking = 0U;
+  completed_seek.motor_on = 1U;
+  completed_seek.interrupt_flags = 2U;
+  completed_seek.response_position = 0U;
+  completed_seek.response_count = 1U;
+  completed_seek.response[0] = 2U;
+  require(vm.runtime().write32(cd_response_pointer, cd_active_response) &&
+              vm.machine().cdrom().restoreState(completed_seek),
+          "Could not seed async CD completion state");
+  const auto seek_polled = vm.invoke(async_cd_pending_entry, {}, 1U);
+  std::uint8_t completion_state{};
+  std::uint8_t active_response{};
+  std::uint8_t completion_response{};
+  require(
+      seek_polled.completed() && seek_polled.return_value == 0U &&
+          vm.runtime().read16(cd_pending_state, pending_seek) &&
+          vm.runtime().read8(cd_completion_state, completion_state) &&
+          vm.runtime().read8(cd_active_response, active_response) &&
+          vm.runtime().read8(cd_completion_response, completion_response) &&
+          pending_seek == 0U && completion_state == 5U &&
+          active_response == 2U && completion_response == 2U &&
+          (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U,
+      "Async CD completion did not synchronize PsyQ's paired result buffers");
+
+  // Retail's file reader finishes a transfer with Stop and can submit Setloc
+  // immediately, before Stop's delayed INT2 has reached the interrupt latch.
+  // The host-bound low-level call must retire that owned completion first
+  // rather than collide with the controller's still-active command phase.
+  vm.machine().cdrom().reset();
+  vm.bindPsxCdCompletionCallback(cd_completion_callback_slot,
+                                cd_completion_response, true);
+  const std::array stop_arguments{0x09U, 0U, 0U};
+  const auto stop_started =
+      vm.invoke(async_cd_control_entry, stop_arguments, 1U);
+  const auto stop_scheduled = vm.machine().cdrom().captureState();
+  require(stop_started.completed() && stop_started.return_value == 0U &&
+              vm.runtime().read16(cd_pending_state, pending_seek) &&
+              pending_seek == 0x09U &&
+              stop_scheduled.command_event.pending != 0U,
+          "Host-bound Stop did not retain its delayed completion");
+  require(vm.runtime().loadBytes(cd_control_parameters, setloc_parameters),
+          "Could not restore Setloc parameters after Stop");
+  const auto setloc_after_stop =
+      vm.invoke(async_cd_control_entry, mirrored_setloc_arguments, 1U);
+  const auto handed_off_cdrom = vm.machine().cdrom().captureState();
+  require(
+      setloc_after_stop.completed() &&
+          setloc_after_stop.return_value == 0U &&
+          vm.runtime().read16(cd_pending_state, pending_seek) &&
+          pending_seek == 0U && handed_off_cdrom.target_lba == 16U &&
+          handed_off_cdrom.command_phase ==
+              sf::psx::CdRomCommandPhase::idle &&
+          handed_off_cdrom.command_event.pending == 0U,
+      "Back-to-back Stop/Setloc did not retire the delayed completion");
+  vm.bindPsxCdCompletionCallback(0U, 0U, false);
 
   // Non-data CD interrupts belong to the guest CD handler, not to the audio
   // scheduler. In retail gameplay an INT2/INT3 can remain latched while a room
@@ -2237,8 +2457,7 @@ void testLegacyGameplayVmBoundary() {
               vm.runtime().write8(cdrom_register_base + 3U, 0x1fU) &&
               vm.runtime().write8(cdrom_register_base, 0U),
           "Could not acknowledge the command-complete interrupt fixture");
-  const auto acknowledged_command_cdrom =
-      vm.machine().cdrom().captureState();
+  const auto acknowledged_command_cdrom = vm.machine().cdrom().captureState();
   require((acknowledged_command_cdrom.interrupt_flags & 0x07U) == 0U &&
               acknowledged_command_cdrom.response_position == 0U &&
               acknowledged_command_cdrom.response_count == 0U,
@@ -2252,10 +2471,10 @@ void testLegacyGameplayVmBoundary() {
   vm.machine().advanceTicks(audio_ticks_per_frame * 2U);
   const auto overdue_target = overdue_start + audio_ticks_per_frame * 2U;
   require(
-          vm.advanceAudioFrameClock(audio_profile) &&
-              vm.machine().currentTick() >= overdue_target &&
-              vm.machine().currentTick() <= overdue_target + 16U &&
-              audio_callback_count == 14U,
+      vm.advanceAudioFrameClock(audio_profile) &&
+          vm.machine().currentTick() >= overdue_target &&
+          vm.machine().currentTick() <= overdue_target + 16U &&
+          audio_callback_count == 14U,
       "Overdue retail audio IRQs were not coalesced at a streaming boundary");
 
   vm.clearPcm();
@@ -4597,7 +4816,7 @@ void testLegacyGameplayVmBoundary() {
           "BIOS random seed HLE mismatch");
   vm.clearHostCalls();
 
-  vm.bindPsxBiosCoreVector();
+  vm.bindPsxBiosCoreVector(true);
   constexpr std::array bios_source{
       std::byte{0x12},
       std::byte{0x34},
@@ -4616,10 +4835,92 @@ void testLegacyGameplayVmBoundary() {
               bios_copy == bios_source,
           "BIOS vector memcpy HLE mismatch");
 
+  constexpr std::array left_string{
+      std::byte{'H'}, std::byte{'W'}, std::byte{'A'},
+      std::byte{'Y'}, std::byte{'.'}, std::byte{'F'},
+      std::byte{'O'}, std::byte{'G'}, std::byte{},
+  };
+  constexpr std::array right_string{
+      std::byte{'H'}, std::byte{'W'}, std::byte{'A'},
+      std::byte{'Y'}, std::byte{'.'}, std::byte{'B'},
+      std::byte{'I'}, std::byte{'N'}, std::byte{},
+  };
+  require(vm.runtime().loadBytes(0x80010600U, left_string) &&
+              vm.runtime().loadBytes(0x80010700U, right_string),
+          "Could not seed BIOS strncmp strings");
+  vm.runtime().setRegister(9U, 0x18U);
+  constexpr std::array equal_prefix_arguments{0x80010600U, 0x80010700U, 5U};
+  const auto equal_prefix = vm.invoke(0x000000a0U, equal_prefix_arguments, 1U);
+  vm.runtime().setRegister(9U, 0x18U);
+  constexpr std::array unequal_prefix_arguments{0x80010600U, 0x80010700U, 8U};
+  const auto unequal_prefix =
+      vm.invoke(0x000000a0U, unequal_prefix_arguments, 1U);
+  require(equal_prefix.completed() && equal_prefix.return_value == 0U &&
+              unequal_prefix.completed() &&
+              std::bit_cast<std::int32_t>(unequal_prefix.return_value) > 0,
+          "BIOS vector strncmp HLE mismatch");
+
+  constexpr std::array path_prefix{
+      std::byte{'F'}, std::byte{'O'}, std::byte{'G'},
+      std::byte{'/'}, std::byte{},
+  };
+  constexpr std::array path_suffix{
+      std::byte{'H'}, std::byte{'W'}, std::byte{'A'},
+      std::byte{'Y'}, std::byte{'.'}, std::byte{'F'},
+      std::byte{'O'}, std::byte{'G'}, std::byte{},
+  };
+  require(vm.runtime().loadBytes(0x80010800U, path_prefix) &&
+              vm.runtime().loadBytes(0x80010900U, path_suffix),
+          "Could not seed BIOS strcat strings");
+  vm.runtime().setRegister(9U, 0x15U);
+  constexpr std::array strcat_arguments{0x80010800U, 0x80010900U};
+  const auto strcat = vm.invoke(0x000000a0U, strcat_arguments, 1U);
+  std::array<std::byte, 13U> joined_path{};
+  require(strcat.completed() && strcat.return_value == 0x80010800U &&
+              vm.runtime().copyBytes(0x80010800U, joined_path) &&
+              joined_path ==
+                  std::array{std::byte{'F'}, std::byte{'O'}, std::byte{'G'},
+                             std::byte{'/'}, std::byte{'H'}, std::byte{'W'},
+                             std::byte{'A'}, std::byte{'Y'}, std::byte{'.'},
+                             std::byte{'F'}, std::byte{'O'}, std::byte{'G'},
+                             std::byte{}},
+          "BIOS vector strcat HLE mismatch");
+
+  vm.runtime().setRegister(9U, 0x30U);
+  constexpr std::array core_seed_arguments{0x13579bdfU};
+  const auto core_seed =
+      vm.invoke(0x000000a0U, core_seed_arguments, 1U);
+  vm.runtime().setRegister(9U, 0x2fU);
+  const auto core_random = vm.invoke(0x000000a0U, {}, 1U);
+  constexpr auto core_expected_seed =
+      core_seed_arguments[0] * 0x41c64e6dU + 0x3039U;
+  std::uint32_t core_random_seed{};
+  require(core_seed.completed() && core_seed.return_value == 0U &&
+              core_random.completed() &&
+              core_random.return_value ==
+                  ((core_expected_seed >> 16U) & 0x7fffU) &&
+              vm.runtime().read32(0xa0009010U, core_random_seed) &&
+              core_random_seed == core_expected_seed,
+          "BIOS core-vector rand/srand HLE mismatch");
+
+  vm.runtime().setRegister(9U, 0x56U);
+  const auto bios_c0_table = vm.invoke(0x000000b0U, {}, 1U);
+  std::uint32_t exception_handler{};
+  std::uint32_t patch_high{};
+  std::uint32_t patch_low{};
+  require(bios_c0_table.completed() &&
+              bios_c0_table.return_value == 0x00000674U &&
+              vm.runtime().read32(0x00000674U + 6U * 4U, exception_handler) &&
+              exception_handler == 0x00000c80U &&
+              vm.runtime().read32(exception_handler + 0x70U, patch_high) &&
+              vm.runtime().read32(exception_handler + 0x74U, patch_low) &&
+              ((patch_high & 0xffffU) << 16U) + (patch_low & 0xffffU) + 0x28U ==
+                  0x8000d100U,
+          "BIOS GetC0Table guest patch contract mismatch");
+
   vm.runtime().setRegister(9U, 0x08U);
   const std::array open_event_arguments{0xf0000009U, 0x20U, 0x2000U, 0U};
-  const auto bios_open_event =
-      vm.invoke(0x000000b0U, open_event_arguments, 1U);
+  const auto bios_open_event = vm.invoke(0x000000b0U, open_event_arguments, 1U);
   vm.runtime().setRegister(9U, 0x0cU);
   const auto bios_enable_event =
       vm.invoke(0x000000b0U, std::array{bios_open_event.return_value}, 1U);
@@ -4628,6 +4929,12 @@ void testLegacyGameplayVmBoundary() {
               bios_enable_event.completed() &&
               bios_enable_event.return_value == 1U,
           "BIOS event bootstrap HLE mismatch");
+
+  vm.runtime().setRegister(9U, 0xabU);
+  const auto bios_card_info =
+      vm.invoke(0x000000a0U, std::array{0U, 0U, 0U, 0U}, 1U);
+  require(bios_card_info.completed() && bios_card_info.return_value == 0U,
+          "BIOS _card_info neutral no-card contract mismatch");
 
   vm.runtime().setRegister(9U, 0x0aU);
   const std::array enable_clear_counter{3U, 1U};
@@ -5929,8 +6236,9 @@ void testLegacyGameplayVmBoundary() {
   require(vm.runtime().loadBytes(0x80010600U, bios_suffix),
           "Could not seed BIOS strcat source");
   vm.runtime().setRegister(9U, 0x15U);
-  constexpr std::array strcat_arguments{0x80010500U, 0x80010600U};
-  const auto strcat_result = vm.invoke(0x000000a0U, strcat_arguments, 1U);
+  constexpr std::array sf2_strcat_arguments{0x80010500U, 0x80010600U};
+  const auto sf2_strcat_result =
+      vm.invoke(0x000000a0U, sf2_strcat_arguments, 1U);
   constexpr std::array expected_concatenated{
       std::byte{'S'}, std::byte{'U'}, std::byte{'B'}, std::byte{'W'},
       std::byte{'A'}, std::byte{'Y'}, std::byte{'.'}, std::byte{'H'},
@@ -5940,8 +6248,8 @@ void testLegacyGameplayVmBoundary() {
       std::byte{},
   };
   std::array<std::byte, expected_concatenated.size()> concatenated_bytes{};
-  require(strcat_result.completed() &&
-              strcat_result.return_value == 0x80010500U &&
+  require(sf2_strcat_result.completed() &&
+              sf2_strcat_result.return_value == 0x80010500U &&
               vm.runtime().copyBytes(0x80010500U, concatenated_bytes) &&
               concatenated_bytes == expected_concatenated,
           "BIOS A0:15 strcat HLE mismatch");

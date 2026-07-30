@@ -422,6 +422,18 @@ void testNonAudioDataKeepsInt1AndDmaPath() {
   require(controller.readDmaWord(first_word) &&
               first_word == expected_first_word,
           "DMA3 read the wrong MODE2 user-data bytes");
+  std::uint32_t continued_word{};
+  auto expected_continued_word = static_cast<std::uint32_t>(seed + 4U);
+  expected_continued_word +=
+      static_cast<std::uint32_t>(seed + 5U) * 0x100U;
+  expected_continued_word +=
+      static_cast<std::uint32_t>(seed + 6U) * 0x10000U;
+  expected_continued_word +=
+      static_cast<std::uint32_t>(seed + 7U) * 0x1000000U;
+  require(controller.writeRegister(3U, 0x80U) &&
+              controller.readDmaWord(continued_word) &&
+              continued_word == expected_continued_word,
+          "Reasserting the active DMA3 request rewound the sector FIFO");
 
   auto checkpoint =
       std::make_unique<sf::psx::CdRomState>(controller.captureState());

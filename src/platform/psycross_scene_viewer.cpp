@@ -14,12 +14,14 @@
 #include "sf/game/dynamic_lighting.hpp"
 #include "sf/game/effects.hpp"
 #include "sf/game/gameplay.hpp"
+#include "sf/game/legacy_first_mission_runtime.hpp"
 #include "sf/game/legacy_presentation_bridge.hpp"
 #include "sf/game/localization.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/pause_menu.hpp"
 #include "sf/game/pause_menu_data.hpp"
 #include "sf/game/retail_cheats.hpp"
+#include "sf/game/sf2_runtime.hpp"
 #include "sf/platform/player_input.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
 #include "sf/platform/stable_frame_vector.hpp"
@@ -39,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -53,6 +56,7 @@
 #include <vector>
 
 extern "C" void DpqColor(CVECTOR *input, int depth_cue, CVECTOR *output);
+void PsyX_TakeScreenshot();
 
 namespace sf::platform::detail {
 namespace {
@@ -2217,7 +2221,7 @@ public:
     const auto hud_atlas = mission.runtimeProfile().hud_atlas;
     const auto is_sf1 = hud_atlas == game::HudAtlasKind::sf1;
     std::vector<HudTextureAsset> retail_fonts;
-    const auto required = [](std::string_view name) {
+    const auto required = [is_sf1](std::string_view name) {
       // The three font sheets and SYMBOL are shared by the original
       // gameplay and pause interfaces. Keep them in the same restored
       // VRAM atlas as the weapon silhouettes.
@@ -11182,9 +11186,19 @@ void drawOriginalScope(const HudTextureAtlas &textures, game::WeaponId weapon,
   }
 }
 
+std::span<const std::string_view>
+sf2HudWeaponIconLayers(game::WeaponId weapon) noexcept {
+  static constexpr std::array<std::string_view, 2U> pistol{
+      "PISTOL2A.TIM", "PISTOL2B.TIM"};
+  if (weapon == game::WeaponId::pistol_9mm) {
+    return pistol;
+  }
+  return game::weaponDefinition(weapon).icon.layers();
+}
+
 void drawOriginalWeaponMenu(const HudTextureAtlas &textures,
                             const game::GameplayHud &hud, int offset_x,
-                            int offset_y) {
+                            int offset_y, bool sf2_icons = false) {
   if (hud.weaponMenuFrames() == 0U) {
     return;
   }
@@ -11247,7 +11261,9 @@ void drawOriginalWeaponMenu(const HudTextureAtlas &textures,
   constexpr int origin_y = screen_height / 2 - 0x50;
   const auto weapons = hud.weaponMenuWindow();
   for (std::size_t slot = 0; slot < weapons.size(); ++slot) {
-    const auto layers = game::weaponDefinition(weapons[slot]).icon.layers();
+    const auto layers =
+        sf2_icons ? sf2HudWeaponIconLayers(weapons[slot])
+                  : game::weaponDefinition(weapons[slot]).icon.layers();
     if (layers.empty()) {
       continue;
     }
@@ -12995,6 +13011,677 @@ void PsyCrossCampaignSaveRenderer::drawLoadSlots(
   DrawSync(0);
 }
 
+namespace {
+
+void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
+                        unsigned int texture_bank) {
+  const auto kind = game::sf2GpuCommandKind(packet);
+  if (kind == game::Sf2GpuCommandKind::upload_vram) {
+    const auto transfer = game::sf2GpuTransfer(packet);
+    if (!transfer) {
+      return;
+    }
+    RECT16 rectangle{
+        static_cast<short>(transfer->x),
+        static_cast<short>(transfer->y),
+        static_cast<short>(transfer->width),
+        static_cast<short>(transfer->height),
+    };
+    LoadImage(
+        &rectangle,
+        reinterpret_cast<u_long *>(
+            const_cast<std::uint32_t *>(transfer->payload.data())));
+    return;
+  }
+  if (kind == game::Sf2GpuCommandKind::copy_vram &&
+      packet.gp0_words.size() >= 4U) {
+    const auto source = packet.gp0_words[1U];
+    const auto destination = packet.gp0_words[2U];
+    const auto size = packet.gp0_words[3U];
+    RECT16 rectangle{
+        static_cast<short>(source & 0xffffU),
+        static_cast<short>(source >> 16U),
+        static_cast<short>((size & 0xffffU) == 0U ? 1024U
+                                                  : size & 0xffffU),
+        static_cast<short>((size >> 16U) == 0U ? 512U : size >> 16U),
+    };
+    static_cast<void>(MoveImage(
+        &rectangle, static_cast<int>(destination & 0xffffU),
+        static_cast<int>(destination >> 16U)));
+    return;
+  }
+  if (kind == game::Sf2GpuCommandKind::fill_vram) {
+    const auto transfer = game::sf2GpuTransfer(packet);
+    if (!transfer) {
+      return;
+    }
+    const auto color = packet.gp0_words.front();
+    RECT16 rectangle{
+        static_cast<short>(transfer->x),
+        static_cast<short>(transfer->y),
+        static_cast<short>(transfer->width),
+        static_cast<short>(transfer->height),
+    };
+    ClearImage(&rectangle, static_cast<u_char>(color),
+               static_cast<u_char>(color >> 8U),
+               static_cast<u_char>(color >> 16U));
+    return;
+  }
+  if (kind != game::Sf2GpuCommandKind::draw &&
+      kind != game::Sf2GpuCommandKind::draw_environment) {
+    return;
+  }
+  if (kind == game::Sf2GpuCommandKind::draw) {
+    const auto &words = packet.gp0_words;
+    const auto opcode = static_cast<std::uint8_t>(words.front() >> 24U);
+    const auto base_opcode = static_cast<std::uint8_t>(opcode & 0xfcU);
+    // Ordering-table coordinates precede the retail GP0 E5 draw offset. The
+    // same frame replays that packet below, so adding a host centre here
+    // applies the offset twice and shifts half the scene out of view.
+    const auto x = [&words](std::size_t index) {
+      return static_cast<float>(packedScreenX(words[index]));
+    };
+    const auto y = [&words](std::size_t index) {
+      return static_cast<float>(packedScreenY(words[index]));
+    };
+    if (base_opcode == 0x3cU && words.size() == 12U) {
+      POLY_GT4 primitive{};
+      setPolyGT4(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setPacketColor(words[3U], primitive.r1, primitive.g1, primitive.b1);
+      setPacketColor(words[6U], primitive.r2, primitive.g2, primitive.b2);
+      setPacketColor(words[9U], primitive.r3, primitive.g3, primitive.b3);
+      setXY4(&primitive, x(1U), y(1U), x(4U), y(4U), x(7U), y(7U),
+             x(10U), y(10U));
+      setUV4(&primitive, static_cast<std::uint8_t>(words[2U]),
+             static_cast<std::uint8_t>(words[2U] >> 8U),
+             static_cast<std::uint8_t>(words[5U]),
+             static_cast<std::uint8_t>(words[5U] >> 8U),
+             static_cast<std::uint8_t>(words[8U]),
+             static_cast<std::uint8_t>(words[8U] >> 8U),
+             static_cast<std::uint8_t>(words[11U]),
+             static_cast<std::uint8_t>(words[11U] >> 8U));
+      const auto source_clut =
+          static_cast<std::uint16_t>(words[2U] >> 16U);
+      const auto source_tpage =
+          static_cast<std::uint16_t>(words[5U] >> 16U);
+      primitive.clut =
+          relocateClut(source_clut, source_tpage, texture_bank);
+      primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x38U && words.size() == 8U) {
+      POLY_G4 primitive{};
+      setPolyG4(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setPacketColor(words[2U], primitive.r1, primitive.g1, primitive.b1);
+      setPacketColor(words[4U], primitive.r2, primitive.g2, primitive.b2);
+      setPacketColor(words[6U], primitive.r3, primitive.g3, primitive.b3);
+      setXY4(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U),
+             x(7U), y(7U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x34U && words.size() == 9U) {
+      POLY_GT3 primitive{};
+      setPolyGT3(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setPacketColor(words[3U], primitive.r1, primitive.g1, primitive.b1);
+      setPacketColor(words[6U], primitive.r2, primitive.g2, primitive.b2);
+      setXY3(&primitive, x(1U), y(1U), x(4U), y(4U), x(7U), y(7U));
+      setUV3(&primitive, static_cast<std::uint8_t>(words[2U]),
+             static_cast<std::uint8_t>(words[2U] >> 8U),
+             static_cast<std::uint8_t>(words[5U]),
+             static_cast<std::uint8_t>(words[5U] >> 8U),
+             static_cast<std::uint8_t>(words[8U]),
+             static_cast<std::uint8_t>(words[8U] >> 8U));
+      const auto source_clut =
+          static_cast<std::uint16_t>(words[2U] >> 16U);
+      const auto source_tpage =
+          static_cast<std::uint16_t>(words[5U] >> 16U);
+      primitive.clut =
+          relocateClut(source_clut, source_tpage, texture_bank);
+      primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x30U && words.size() == 6U) {
+      POLY_G3 primitive{};
+      setPolyG3(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setPacketColor(words[2U], primitive.r1, primitive.g1, primitive.b1);
+      setPacketColor(words[4U], primitive.r2, primitive.g2, primitive.b2);
+      setXY3(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x2cU && words.size() == 9U) {
+      POLY_FT4 primitive{};
+      setPolyFT4(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY4(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U),
+             x(7U), y(7U));
+      setUV4(&primitive, static_cast<std::uint8_t>(words[2U]),
+             static_cast<std::uint8_t>(words[2U] >> 8U),
+             static_cast<std::uint8_t>(words[4U]),
+             static_cast<std::uint8_t>(words[4U] >> 8U),
+             static_cast<std::uint8_t>(words[6U]),
+             static_cast<std::uint8_t>(words[6U] >> 8U),
+             static_cast<std::uint8_t>(words[8U]),
+             static_cast<std::uint8_t>(words[8U] >> 8U));
+      const auto source_clut =
+          static_cast<std::uint16_t>(words[2U] >> 16U);
+      const auto source_tpage =
+          static_cast<std::uint16_t>(words[4U] >> 16U);
+      primitive.clut =
+          relocateClut(source_clut, source_tpage, texture_bank);
+      primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x28U && words.size() == 5U) {
+      POLY_F4 primitive{};
+      setPolyF4(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY4(&primitive, x(1U), y(1U), x(2U), y(2U), x(3U), y(3U),
+             x(4U), y(4U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x24U && words.size() == 7U) {
+      POLY_FT3 primitive{};
+      setPolyFT3(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY3(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U));
+      setUV3(&primitive, static_cast<std::uint8_t>(words[2U]),
+             static_cast<std::uint8_t>(words[2U] >> 8U),
+             static_cast<std::uint8_t>(words[4U]),
+             static_cast<std::uint8_t>(words[4U] >> 8U),
+             static_cast<std::uint8_t>(words[6U]),
+             static_cast<std::uint8_t>(words[6U] >> 8U));
+      const auto source_clut =
+          static_cast<std::uint16_t>(words[2U] >> 16U);
+      const auto source_tpage =
+          static_cast<std::uint16_t>(words[4U] >> 16U);
+      primitive.clut =
+          relocateClut(source_clut, source_tpage, texture_bank);
+      primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x20U && words.size() == 4U) {
+      POLY_F3 primitive{};
+      setPolyF3(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY3(&primitive, x(1U), y(1U), x(2U), y(2U), x(3U), y(3U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x40U && words.size() == 3U) {
+      LINE_F2 primitive{};
+      setLineF2(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY2(&primitive, x(1U), y(1U), x(2U), y(2U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x64U && words.size() == 4U) {
+      SPRT primitive{};
+      setSprt(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY0(&primitive, x(1U), y(1U));
+      setUV0(&primitive, static_cast<std::uint8_t>(words[2U]),
+             static_cast<std::uint8_t>(words[2U] >> 8U));
+      primitive.clut = relocateClut(
+          static_cast<std::uint16_t>(words[2U] >> 16U), 0U, texture_bank);
+      setWH(&primitive, static_cast<std::uint16_t>(words[3U]),
+            static_cast<std::uint16_t>(words[3U] >> 16U));
+      DrawPrim(&primitive);
+      return;
+    }
+  }
+
+  // PsyCross's host primitive header contains a native pointer and optional
+  // PGXP index, while the retail packet begins with a 32-bit DMA tag. Rebuild
+  // only that host header; the GP0 command words remain byte-exact.
+  const auto byte_count =
+      (P_LEN + packet.gp0_words.size()) * sizeof(std::uint32_t);
+  std::vector<std::uint64_t> storage(
+      (byte_count + sizeof(std::uint64_t) - 1U) /
+      sizeof(std::uint64_t));
+  auto *tag = reinterpret_cast<P_TAG *>(storage.data());
+  std::memset(tag, 0, P_LEN * sizeof(std::uint32_t));
+  setlen(tag, packet.gp0_words.size());
+  termPrim(tag);
+  auto *gp0 = reinterpret_cast<std::uint32_t *>(tag) + P_LEN;
+  std::memcpy(gp0, packet.gp0_words.data(),
+              packet.gp0_words.size() * sizeof(std::uint32_t));
+  for (auto index = std::size_t{}; index < packet.gp0_words.size(); ++index) {
+    const auto opcode = gp0[index] >> 24U;
+    if (opcode == 0xe1U) {
+      // The PS1 renders into VRAM even when E1's draw-to-display bit is clear.
+      // PsyCross interprets that bit as an offscreen-FBO selection, which
+      // leaves the native swap target black. Keep retail's draw mode and
+      // relocated texture page, but publish to the host display target.
+      gp0[index] =
+          (gp0[index] & 0xffff0000U) |
+          relocateTexturePage(static_cast<std::uint16_t>(gp0[index]),
+                              texture_bank) |
+          0x00000400U;
+    } else if (opcode == 0xe3U || opcode == 0xe4U) {
+      // SF2 alternates 384x240 draw areas at VRAM y=0 and y=240. PsyCross has
+      // one native framebuffer, so retain the logical coordinate while
+      // removing only the second-page address component.
+      auto y = (gp0[index] >> 10U) & 0x03ffU;
+      if (y >= static_cast<std::uint32_t>(screen_height) &&
+          y < static_cast<std::uint32_t>(screen_height * 2)) {
+        y -= static_cast<std::uint32_t>(screen_height);
+      }
+      gp0[index] = (gp0[index] & ~0x000ffc00U) | (y << 10U);
+    } else if (opcode == 0xe5U) {
+      auto y = (gp0[index] >> 11U) & 0x07ffU;
+      if (y >= static_cast<std::uint32_t>(screen_height) &&
+          y < static_cast<std::uint32_t>(screen_height * 2)) {
+        y -= static_cast<std::uint32_t>(screen_height);
+      }
+      gp0[index] = (gp0[index] & ~0x003ff800U) | (y << 11U);
+    }
+  }
+  DrawPrim(tag);
+}
+
+void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
+                       unsigned int texture_bank) {
+  GR_EnableDepth(0);
+  GR_SetDepthState(0, 0);
+  for (const auto &packet : frame.packets) {
+    drawSf2GuestPacket(packet, texture_bank);
+  }
+  DrawSync(0);
+}
+
+void beginSf2GuestFrame() {
+  // The SF2 scene owns a persistent inner presentation loop. EndScene swaps
+  // and closes PsyCross's current scene, so every subsequent guest frame must
+  // explicitly begin a new one. Establish a native-only clear environment
+  // first: collapsing retail's alternating PS1 display pages onto one host
+  // framebuffer without this clear accumulates old snow/world pixels and
+  // produces mouse-trail ghosting. PsyX_BeginScene clears the render target;
+  // unlike ClearImage, it does not erase the emulated VRAM HUD atlas.
+  DRAWENV environment{};
+  SetDefDrawEnv(&environment, 0, 0, screen_width, screen_height);
+  environment.isbg = 1;
+  setRGB0(&environment, 0U, 0U, 0U);
+  PutDrawEnv(&environment);
+  static_cast<void>(PsyX_BeginScene());
+}
+
+void drawSf2GuestHud(const HudTextureAtlas &textures,
+                     const game::GameplayHud &hud) {
+  DrawSync(0);
+  // The guest frame leaves its centre-origin E5 draw offset active. Native
+  // HUD helpers use top-left 384x240 coordinates, so establish an isolated
+  // display-sized draw environment before emitting any overlay primitive.
+  DRAWENV environment{};
+  SetDefDrawEnv(&environment, 0, 0, screen_width, screen_height);
+  PutDrawEnv(&environment);
+  GR_SetBlendMode(BM_NONE);
+  GR_EnableDepth(0);
+  const auto primary_status = game::localizeTextCopy(
+      game::originalPrimaryStatusLabel(hud.primaryStatus()));
+  drawOriginalHudTextSolid(textures, primary_status, 20, 18);
+  const auto health_color = hud.healthBarColor();
+  drawOriginalStatusBar(26, hud.displayedPrimaryTrail(), hud.primaryReveal(),
+                        health_color.red, health_color.green, health_color.blue,
+                        0, 0);
+  drawOriginalStatusBar(26, hud.displayedPrimaryBar(), hud.primaryReveal(),
+                        150U, 150U, 255U, 0, 0);
+  drawOriginalStatusScale(0, 0);
+  drawOriginalWeaponMenu(textures, hud, 0, 0, true);
+
+  const auto &definition = hud.inventory().currentDefinition();
+  const auto reveal_remaining =
+      static_cast<int>(game::GameplayHud::reveal_duration) -
+      static_cast<int>(hud.revealFrame());
+  const auto reveal_slide =
+      reveal_remaining * 271 /
+      static_cast<int>(game::GameplayHud::reveal_duration);
+  const auto switch_slide =
+      static_cast<int>(hud.weaponSwitchFrames()) * 98 /
+      static_cast<int>(game::GameplayHud::weapon_switch_duration);
+  const auto horizontal_slide = reveal_slide + switch_slide;
+  const auto icon_layers = sf2HudWeaponIconLayers(definition.id);
+  if (!icon_layers.empty()) {
+    std::array<int, game::maximum_weapon_icon_layers> widths{};
+    std::array<int, game::maximum_weapon_icon_layers> heights{};
+    for (auto index = std::size_t{}; index < icon_layers.size(); ++index) {
+      const auto &image = textures.image(icon_layers[index]);
+      widths[index] = static_cast<int>(image.displayWidth());
+      heights[index] = static_cast<int>(image.displayHeight());
+    }
+    const auto offsets = game::originalWeaponIconOffsets(
+        std::span<const int>{widths.data(), icon_layers.size()});
+    constexpr int icon_origin_x = screen_width / 2 + 133;
+    constexpr int icon_origin_y = screen_height / 2 + 91;
+    for (auto index = std::size_t{}; index < icon_layers.size(); ++index) {
+      drawHudSprite(textures.image(icon_layers[index]),
+                    icon_origin_x + horizontal_slide + offsets[index],
+                    icon_origin_y - heights[index] / 2);
+    }
+  }
+  if (definition.shows_ammo) {
+    const auto ammo =
+        game::originalAmmoText(definition, hud.inventory().currentState());
+    constexpr int ammo_x = screen_width / 2 + 118;
+    constexpr int ammo_y = screen_height / 2 + 94;
+    drawOriginalHudText(textures, ammo, ammo_x + horizontal_slide, ammo_y);
+  }
+  DrawSync(0);
+}
+
+SceneViewerResult runSf2GuestScene(
+    const game::MissionPackage &mission, PADRAW &pad,
+    std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
+    const KeyboardMouseBindings &input,
+    game::GameplaySession &native_residency) {
+  game::Sf2GuestMissionRuntime runtime{cue_path, mission.definition().index};
+  if (!runtime.ready()) {
+    const auto detail = runtime.faultDetail();
+    PsyX_Log_Error("SF2 guest runtime bootstrap failed: %.*s\n",
+                   static_cast<int>(detail.size()), detail.data());
+    return SceneViewerResult{previous_buttons,
+                             SceneExitReason::return_to_title};
+  }
+  // The guest VM owns draw commands but its emulated GPU intentionally drains
+  // DMA without retaining a second framebuffer. Seed PsyCross with the same
+  // parsed retail VLF/VRAM pages used by the native scene shell; GP0 tpage,
+  // CLUT and UV values then address their authored mission residency.
+  TextureStreamer textures{mission};
+  textures.ensure(native_residency);
+  HudTextureAtlas hud_textures{mission};
+  game::GameplayHud guest_hud;
+  guest_hud.inventory().resetUnarmed();
+  PsyCrossAudioOutput audio;
+  RelativeMouseCapture mouse_capture;
+  mouse_capture.set(true);
+  // One runtime update is one complete retail display submission. SF2 owns
+  // its 20 Hz gameplay/PAD cadence internally by ticking every third 60 Hz
+  // presentation frame.
+  constexpr double simulation_step = 1.0 / 60.0;
+  constexpr double maximum_frame_time = 0.25;
+  constexpr unsigned int maximum_updates = 4U;
+  auto simulation_accumulator = 0.0;
+  auto previous_counter = SDL_GetPerformanceCounter();
+  const auto frequency = SDL_GetPerformanceFrequency();
+  auto pause_was_down = false;
+  auto previous_quick_weapon = false;
+  auto previous_next_weapon = false;
+  auto previous_previous_weapon = false;
+  game::Sf2WeaponSelectPulseQueue weapon_select{
+      runtime.inputSampleCount()};
+  game::Sf2SampledMouseAccumulator mouse_motion{
+      runtime.inputSampleCount()};
+  auto hud_input_sample = runtime.inputSampleCount();
+  auto checkpoint_restores = runtime.diagnostics().checkpoint_restores;
+  auto texture_room = native_residency.currentRoom();
+  auto texture_bank = static_cast<unsigned int>(
+      native_residency.textureBankAt(runtime.diagnostics().player_x,
+                                     runtime.diagnostics().player_z));
+  auto presented_frames = std::uint64_t{};
+  auto screenshot_captured = false;
+  const auto screenshot_frame = [] {
+    const auto *value = SDL_getenv("SF2_CAPTURE_FRAME");
+    if (value == nullptr) {
+      return std::optional<std::uint64_t>{};
+    }
+    char *end{};
+    const auto parsed = std::strtoull(value, &end, 10);
+    return std::optional<std::uint64_t>{
+        end != value && end != nullptr && *end == '\0' ? parsed : 29U};
+  }();
+  std::array<psx::SpuPcmFrame, 4096U> pcm{};
+
+  PsyX_Log_Info(
+      "SF2 guest alpha: retail TITLE->HWAY runtime, direct GP0/SPU handoff\n");
+  for (;;) {
+    const auto counter = SDL_GetPerformanceCounter();
+    const auto elapsed = std::clamp(
+        frequency == 0U
+            ? 0.0
+            : static_cast<double>(counter - previous_counter) /
+                  static_cast<double>(frequency),
+        0.0, maximum_frame_time);
+    previous_counter = counter;
+    simulation_accumulator =
+        std::min(simulation_accumulator + elapsed,
+                 simulation_step * 5.0);
+
+    PsyX_UpdateInput();
+    const auto buttons = readButtons(pad);
+    const auto held = static_cast<std::uint16_t>(~buttons);
+    int keyboard_count{};
+    const auto *keyboard = SDL_GetKeyboardState(&keyboard_count);
+    const auto keyboard_pad_mask =
+        keyboardOriginPadMask(keyboard, keyboard_count, g_cfg_keyboardMapping);
+    // PADRAW includes PsyCross's legacy keyboard-to-pad emulation. SF2 also
+    // maps the configured PC actions below, so retain only physical-controller
+    // bits here; otherwise one key can trigger both mappings (C was Cross
+    // crouch plus D-pad Down/backward with the default PsyCross layout).
+    const auto controller_held = static_cast<std::uint16_t>(
+        held & static_cast<std::uint16_t>(~keyboard_pad_mask));
+    const auto keyboard_state =
+        keyboard != nullptr && keyboard_count > 0
+            ? std::span<const std::uint8_t>{
+                  keyboard, static_cast<std::size_t>(keyboard_count)}
+            : std::span<const std::uint8_t>{};
+    const auto mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
+    const auto actions = sampleKeyboardMouseActions(
+        input, KeyboardMouseDeviceState{
+                   .keyboard = keyboard_state,
+                   .mouse_left =
+                       (mouse_buttons & SDL_BUTTON_LMASK) != 0U,
+                   .mouse_right =
+                       (mouse_buttons & SDL_BUTTON_RMASK) != 0U,
+                   .mouse_middle =
+                       (mouse_buttons & SDL_BUTTON_MMASK) != 0U,
+                   .mouse_x1 = (mouse_buttons & SDL_BUTTON_X1MASK) != 0U,
+                   .mouse_x2 = (mouse_buttons & SDL_BUTTON_X2MASK) != 0U,
+                   .mouse_wheel_delta = consumePsyCrossMouseWheel(),
+               });
+    const auto raw = pcPlayerInputFromKeyboardMouseActions(actions);
+    const auto pause_down = actions[KeyboardMouseAction::pause];
+    if (pause_down && !pause_was_down) {
+      mouse_capture.set(false);
+      return SceneViewerResult{buttons, SceneExitReason::return_to_title};
+    }
+    pause_was_down = pause_down;
+
+    int mouse_x{};
+    int mouse_y{};
+    SDL_GetRelativeMouseState(&mouse_x, &mouse_y);
+    const auto current_input_sample = runtime.inputSampleCount();
+    mouse_motion.add(current_input_sample, mouse_x, mouse_y);
+    const auto add_weapon_pulses = [&weapon_select](unsigned int count) {
+      weapon_select.enqueue(count);
+    };
+    if ((raw.quick_weapon && !previous_quick_weapon) ||
+        (raw.next_weapon && !previous_next_weapon) ||
+        (raw.previous_weapon && !previous_previous_weapon)) {
+      add_weapon_pulses(1U);
+    }
+    if (raw.weapon_cycle_delta != 0) {
+      add_weapon_pulses(static_cast<unsigned int>(std::min<std::int64_t>(
+          std::abs(static_cast<std::int64_t>(raw.weapon_cycle_delta)), 16)));
+    }
+    previous_quick_weapon = raw.quick_weapon;
+    previous_next_weapon = raw.next_weapon;
+    previous_previous_weapon = raw.previous_weapon;
+    const auto weapon_select_down =
+        weapon_select.update(current_input_sample);
+    const auto pc_move =
+        static_cast<double>(raw.move_forward) -
+        static_cast<double>(raw.move_backward);
+    const auto pc_turn =
+        static_cast<double>(raw.turn_right) -
+        static_cast<double>(raw.turn_left);
+    const auto pc_strafe =
+        static_cast<double>(raw.strafe_right) -
+        static_cast<double>(raw.strafe_left);
+    auto guest_input = game::GameplayInput{
+        .move = pc_move,
+        .turn = std::clamp(
+            pc_turn +
+                (raw.aim
+                     ? 0.0
+                     : static_cast<double>(mouse_motion.x()) / 96.0),
+            -1.0, 1.0),
+        .run = !raw.run,
+        .aim = raw.aim,
+        .strafe = pc_strafe,
+        .aim_sight_yaw =
+            raw.aim
+                ? std::clamp(
+                      static_cast<double>(mouse_motion.x()) / 96.0,
+                      -1.0, 1.0)
+                : 0.0,
+        .aim_sight_pitch =
+            raw.aim
+                ? std::clamp(
+                      static_cast<double>(mouse_motion.y()) / 96.0,
+                      -1.0, 1.0)
+                : 0.0,
+        .fire_held = raw.fire,
+        .roll = raw.roll,
+        .reload = raw.reload,
+        .kneel = raw.crouch,
+        .interact = raw.interact,
+        .target_lock_held = raw.target_lock,
+        .quick_turn = raw.quick_turn,
+    };
+    auto host_pad = game::legacyPadStateFromPlayerInput(guest_input);
+    if (weapon_select_down) {
+      // SF2's default controller layout assigns Change Weapon to Select.
+      // Hold the synthesized edge until the guest's 20 Hz PAD sampler sees
+      // it, then provide a sampled release before another queued wheel notch.
+      host_pad.buttons =
+          static_cast<std::uint16_t>(host_pad.buttons | 0x0001U);
+    }
+    host_pad.buttons =
+        static_cast<std::uint16_t>(host_pad.buttons | controller_held);
+    host_pad.face_axis_buttons = controller_held;
+    host_pad.use_explicit_face_axis_buttons = true;
+    const auto analog_active = [](std::uint8_t value) {
+      return std::abs(static_cast<int>(value) - 128) > 20;
+    };
+    if (analog_active(pad.analog[2]) || analog_active(pad.analog[3])) {
+      host_pad.left_x = pad.analog[2];
+      host_pad.left_y = pad.analog[3];
+    }
+    host_pad.right_x = pad.analog[0];
+    host_pad.right_y = pad.analog[1];
+    runtime.setHostPadState(host_pad);
+    previous_buttons = buttons;
+
+    auto updates = 0U;
+    while (updates < maximum_updates &&
+           simulation_accumulator + 1.0e-9 >= simulation_step) {
+      if (!runtime.advanceHostUpdate()) {
+        const auto detail = runtime.faultDetail();
+        PsyX_Log_Error("SF2 guest runtime stopped: %.*s\n",
+                       static_cast<int>(detail.size()), detail.data());
+        mouse_capture.set(false);
+        return SceneViewerResult{previous_buttons,
+                                 SceneExitReason::return_to_title};
+      }
+      simulation_accumulator =
+          std::max(0.0, simulation_accumulator - simulation_step);
+      ++updates;
+      const auto completed_restores =
+          runtime.diagnostics().checkpoint_restores;
+      if (completed_restores != checkpoint_restores) {
+        // The guest snapshot owns its SPU/CD generation, while samples
+        // already submitted to OpenAL belong to the retired generation.
+        // Drop that host tail atomically before accepting restarted PCM.
+        audio.reset("sf2-checkpoint-restore");
+        checkpoint_restores = completed_restores;
+      }
+      while (const auto count = runtime.takePcm(pcm)) {
+        audio.queue(std::span<const psx::SpuPcmFrame>{pcm}.first(count));
+      }
+    }
+    audio.update();
+    if (const auto &frame = runtime.presentationFrame()) {
+      const auto diagnostics = runtime.diagnostics();
+      native_residency.synchronizeGuestResidency(
+          static_cast<double>(diagnostics.player_x),
+          static_cast<double>(diagnostics.player_y),
+          static_cast<double>(diagnostics.player_z));
+      textures.ensure(native_residency);
+      const auto next_texture_room = native_residency.currentRoom();
+      const auto next_texture_bank = static_cast<unsigned int>(
+          native_residency.textureBankAt(
+              static_cast<double>(diagnostics.player_x),
+              static_cast<double>(diagnostics.player_z)));
+      if (next_texture_room != texture_room ||
+          next_texture_bank != texture_bank) {
+        PsyX_Log_Info(
+            "SF2 guest texture residency: room=%u bank=%u player=(%d,%d,%d)\n",
+            next_texture_room, next_texture_bank, diagnostics.player_x,
+            diagnostics.player_y, diagnostics.player_z);
+        texture_room = next_texture_room;
+        texture_bank = next_texture_bank;
+      }
+      game::projectSf2GuestHud(guest_hud, diagnostics);
+      const auto current_hud_sample = runtime.inputSampleCount();
+      if (current_hud_sample != hud_input_sample) {
+        guest_hud.update(game::HudInput{.aiming = raw.aim});
+        hud_input_sample = current_hud_sample;
+      }
+      const auto capture_screenshot =
+          !screenshot_captured && screenshot_frame &&
+          presented_frames >= *screenshot_frame;
+      beginSf2GuestFrame();
+      drawSf2GuestFrame(*frame, texture_bank);
+      // The authored opening lasts roughly fifteen seconds. The retail HUD
+      // callback is absent in this direct TITLE->HWAY path, so keep the
+      // read-only native overlay hidden until the camera handoff.
+      if (diagnostics.system_clock >= 300U) {
+        // The guest world publication replays its authored VRAM setup before
+        // every draw. It can overwrite the native HUD residency without
+        // changing the HUD's logical weapon/font state, so invalidate that
+        // cache and restore the small overlay atlas after the guest frame.
+        hud_textures.invalidate();
+        hud_textures.restoreGameplay(
+            guest_hud, raw.aim,
+            std::span<const game::LegacyDroppedItemBridgeState>{},
+            std::span<const game::GameplayProjectile>{});
+        drawSf2GuestHud(hud_textures, guest_hud);
+      }
+      if (capture_screenshot) {
+        PsyX_TakeScreenshot();
+      }
+      PsyX_EndScene();
+      ++presented_frames;
+      if (capture_screenshot) {
+        screenshot_captured = true;
+      }
+    }
+  }
+}
+
+} // namespace
+
 SceneViewerResult PsyCrossSceneViewer::run(
     const game::MissionPackage &mission, PADRAW &pad,
     std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
@@ -13009,6 +13696,11 @@ SceneViewerResult PsyCrossSceneViewer::run(
 
   if (!preloaded_gameplay) {
     preloaded_gameplay = std::make_unique<game::GameplaySession>(mission);
+  }
+  if (mission.gameId() == game::GameId::syphon_filter_2 &&
+      mission.definition().index == 2U) {
+    return runSf2GuestScene(mission, pad, previous_buttons, cue_path, input_,
+                            *preloaded_gameplay);
   }
   auto &gameplay = *preloaded_gameplay;
   // The retail terminal transition can retire the live mission/inventory

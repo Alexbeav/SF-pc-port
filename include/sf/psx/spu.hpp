@@ -90,6 +90,10 @@ struct SpuState {
 
   std::uint64_t mixed_frames{};
   std::uint64_t sample_clock{};
+  std::uint64_t key_on_writes{};
+  std::uint64_t key_off_writes{};
+  std::uint32_t last_key_on_mask{};
+  std::uint32_t last_key_off_mask{};
   std::uint32_t transfer_address{};
   std::uint32_t reverb_current_address{};
   std::uint32_t endx{};

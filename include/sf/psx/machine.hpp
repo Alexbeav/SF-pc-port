@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace sf::psx {
 
@@ -142,6 +143,10 @@ public:
   [[nodiscard]] const Spu &spu() const noexcept { return spu_; }
   [[nodiscard]] Spu &spu() noexcept { return spu_; }
   [[nodiscard]] const RootTimers &timers() const noexcept { return timers_; }
+  // GPU presentation is host-owned, but linear DMA and direct GP0 writes also
+  // carry persistent VRAM uploads which an ordering-table snapshot cannot
+  // reconstruct. Drain their byte-exact word stream at a product boundary.
+  [[nodiscard]] std::vector<std::uint32_t> takeGpuGp0Words() noexcept;
   [[nodiscard]] PsxMachineState captureState() const;
   [[nodiscard]] bool validateState(const PsxMachineState &state) const noexcept;
   [[nodiscard]] bool restoreState(const PsxMachineState &state) noexcept;
@@ -192,6 +197,7 @@ private:
   CpuClockScale cpu_clock_scale_{};
   std::uint64_t pending_cpu_ticks_{};
   std::uint32_t device_tick_remainder_{};
+  std::vector<std::uint32_t> gpu_gp0_words_;
 
   class SpuDmaPort final : public DmaPort {
   public:
@@ -213,6 +219,25 @@ private:
 
   class NativeGpuDmaPort final : public DmaPort {
   public:
+    explicit NativeGpuDmaPort(
+        std::vector<std::uint32_t> &gp0_words) noexcept
+        : gp0_words_(gp0_words) {}
+
+    [[nodiscard]] bool readDmaWord(std::uint32_t &value) noexcept override {
+      value = 0U;
+      return true;
+    }
+    [[nodiscard]] bool writeDmaWord(std::uint32_t value) noexcept override {
+      gp0_words_.push_back(value);
+      return true;
+    }
+
+  private:
+    std::vector<std::uint32_t> &gp0_words_;
+  };
+
+  class NativeMdecDmaPort final : public DmaPort {
+  public:
     [[nodiscard]] bool readDmaWord(std::uint32_t &value) noexcept override {
       value = 0U;
       return true;
@@ -223,7 +248,8 @@ private:
   };
 
   SpuDmaPort spu_dma_port_{spu_};
-  NativeGpuDmaPort native_gpu_dma_port_;
+  NativeGpuDmaPort native_gpu_dma_port_{gpu_gp0_words_};
+  NativeMdecDmaPort native_mdec_dma_port_;
   std::array<DmaPort *, DmaController::channel_count> dma_ports_{};
 };
 

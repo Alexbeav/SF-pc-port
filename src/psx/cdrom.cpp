@@ -244,7 +244,14 @@ bool CdRomController::writeRegister(std::uint32_t offset,
   case 3U:
     if (state_.index == 0U) {
       if ((value & 0x80U) != 0U && state_.data_valid != 0U) {
-        state_.data_position = state_.data_begin;
+        // Reasserting the request bit while a sector FIFO is already active
+        // continues from its current position. PsyQ's raw CdRead path uses
+        // one short DMA for the 12-byte sector header followed by a second
+        // DMA for the 2048-byte payload; rewinding here shifts every mission
+        // resource by the header size.
+        if (state_.data_requested == 0U) {
+          state_.data_position = state_.data_begin;
+        }
         state_.data_requested = 1U;
       } else if ((value & 0x80U) == 0U) {
         state_.data_requested = 0U;

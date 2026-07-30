@@ -656,6 +656,10 @@ public:
     return active_objects_;
   }
   [[nodiscard]] std::uint8_t textureBankAt(double x, double z) const noexcept;
+  // Advance only the native room-residency shell to an authoritative guest
+  // position. The SF2 guest owns gameplay, but TextureStreamer still needs
+  // the matching active-room set and texture-bank provenance.
+  void synchronizeGuestResidency(double x, double y, double z);
   [[nodiscard]] std::uint8_t
   objectTextureBank(std::uint16_t index) const noexcept;
   [[nodiscard]] std::uint8_t

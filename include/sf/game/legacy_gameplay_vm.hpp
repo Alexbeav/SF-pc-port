@@ -570,6 +570,12 @@ struct LegacyHostPlayerState {
 struct LegacyHostPadState {
   // Active-high standard PlayStation button bits.
   std::uint16_t buttons{};
+  // Physical face buttons also populate the processed PAD's derived
+  // horizontal/vertical face axes. Native PC actions can opt into an
+  // explicit subset so a synthesized action button does not double as
+  // locomotion in sequel control paths.
+  std::uint16_t face_axis_buttons{};
+  bool use_explicit_face_axis_buttons{};
   std::uint8_t left_x{0x80U};
   std::uint8_t left_y{0x80U};
   std::uint8_t right_x{0x80U};
@@ -949,7 +955,7 @@ public:
                                  std::span<const std::byte> bytes) noexcept;
   void bindHostCall(std::uint32_t address, LegacyHostCall call);
   void bindPsxBiosRandomCalls();
-  void bindPsxBiosCoreVector();
+  void bindPsxBiosCoreVector(bool expose_kernel_tables = false);
   void bindPsxLibcStringCalls();
   void bindPsxVideoTimingCall();
   void bindPsxVideoTimingCall(std::uint32_t vsync_address,
@@ -957,13 +963,27 @@ public:
   void bindPsxCdPendingCommandCall(std::uint32_t address,
                                    std::uint32_t state_address,
                                    std::uint32_t response_pointer_address,
-                                   std::uint32_t completion_state_address);
-  void bindPsxCdControlCall(std::uint32_t address);
+                                   std::uint32_t completion_state_address,
+                                   std::uint32_t completion_result_address =
+                                       0U);
+  void bindPsxCdControlCall(std::uint32_t address,
+                            std::uint32_t setloc_state_address = 0U,
+                            std::uint32_t mode_state_address = 0U);
   void bindPsxCdReadyCallback(std::uint32_t callback_address,
                               std::uint32_t result_address,
                               std::uint32_t state_address,
                               bool callback_is_pointer) noexcept;
+  void bindPsxCdCompletionCallback(std::uint32_t callback_address,
+                                   std::uint32_t result_address,
+                                   bool callback_is_pointer) noexcept;
   [[nodiscard]] bool servicePsxCdReadyCallback();
+  // Dispatches one callback registered by the retail interrupt/event tables
+  // without advancing emulated hardware time. The interrupted CPU context is
+  // restored after the callback returns, matching an interrupt boundary.
+  [[nodiscard]] bool
+  servicePsxCallbackSlot(std::uint32_t callback_slot_address,
+                         std::uint32_t callback_stack_address = 0U,
+                         LegacyGameplayVmResult *callback_result = nullptr);
   void bindPsxCriticalSectionCalls();
   void bindPsxGpuSubmissionCall();
   void bindSyphonFilterUsaV11VirtualCdCalls(
@@ -985,8 +1005,7 @@ public:
           syphonFilterUsaV11GameplayTextHookProfile());
   void clearWeaponEvents() noexcept { weapon_events_.clear(); }
   void clearUiMessages() noexcept { ui_messages_.clear(); }
-  void setHostAimLocomotion(bool active, double move,
-                            double strafe) noexcept;
+  void setHostAimLocomotion(bool active, double move, double strafe) noexcept;
   [[nodiscard]] std::span<const LegacyWeaponEventBridgeState>
   weaponEvents() const noexcept {
     return weapon_events_;
@@ -1066,10 +1085,10 @@ public:
           syphonFilterUsaV11NativeMissionBridgeProfile()) noexcept;
   [[nodiscard]] bool setRetailHardMode(bool enabled) noexcept;
   [[nodiscard]] bool setRetailOneShotKills(bool enabled) noexcept;
-  [[nodiscard]] bool
-  weakenRetailEnemySlots(std::span<const std::uint32_t> slots,
-                         const LegacyGameplayBridgeProfile &profile =
-                             syphonFilterUsaV11GameplayBridgeProfile()) noexcept;
+  [[nodiscard]] bool weakenRetailEnemySlots(
+      std::span<const std::uint32_t> slots,
+      const LegacyGameplayBridgeProfile &profile =
+          syphonFilterUsaV11GameplayBridgeProfile()) noexcept;
   [[nodiscard]] bool
   synchronizeHostRoom(std::int16_t room,
                       const LegacyNativeMissionBridgeProfile &profile =
@@ -1106,6 +1125,10 @@ public:
   [[nodiscard]] LegacyGameplayVmResult
   invoke(std::uint32_t address, std::span<const std::uint32_t> arguments = {},
          std::uint64_t execution_budget = 1'000'000U);
+  [[nodiscard]] LegacyGameplayVmResult invokeClockNeutral(
+      std::uint32_t address,
+      std::span<const std::uint32_t> arguments = {},
+      std::uint64_t execution_budget = 1'000'000U);
   // Continue from the current CPU state without replacing PC, RA or the
   // active call frame. This is the execution path used by a continuous
   // guest loop after its initial entry has been established.
@@ -1121,6 +1144,9 @@ public:
   [[nodiscard]] LegacyGameplayVmResult
   runCurrentPcUntilHostBoundary(std::uint32_t boundary_address,
                                 std::uint64_t execution_budget = 1'000'000U);
+  [[nodiscard]] LegacyGameplayVmResult runCurrentPcUntilHostBoundaryClockNeutral(
+      std::uint32_t boundary_address,
+      std::uint64_t execution_budget = 1'000'000U);
   [[nodiscard]] LegacyGameplayVmResult
   tickRetailFrame(const LegacyRetailFrameProfile &profile =
                       syphonFilterUsaV11RetailFrameProfile(),
@@ -1195,9 +1221,9 @@ private:
   invokeFrameCall(std::uint32_t address,
                   std::span<const std::uint32_t> arguments,
                   std::uint64_t execution_budget);
-  [[nodiscard]] bool advanceAudioClockCallbacks(
-      const LegacyRetailAudioProfile &profile,
-      std::uint32_t callback_count) noexcept;
+  [[nodiscard]] bool
+  advanceAudioClockCallbacks(const LegacyRetailAudioProfile &profile,
+                             std::uint32_t callback_count) noexcept;
   [[nodiscard]] bool finalizeDeadActorDropsBeforeRenderer(
       const LegacyGameplayBridgeProfile &profile,
       std::uint64_t execution_budget) noexcept;
@@ -1236,6 +1262,11 @@ private:
   std::uint32_t cd_ready_callback_address_{0x80114cc4U};
   std::uint32_t cd_ready_result_address_{0x80125450U};
   std::uint32_t cd_ready_state_address_{0x80114f9dU};
+  std::uint32_t cd_completion_callback_address_{};
+  std::uint32_t cd_completion_result_address_{};
+  std::uint32_t cd_pending_command_state_address_{};
+  std::uint32_t cd_response_pointer_address_{};
+  std::uint32_t cd_completion_state_address_{};
   std::uint64_t audio_frame_tick_{};
   std::array<std::uint32_t, LegacyGameplayVmSnapshot::interrupt_callback_count>
       interrupt_callbacks_{};
@@ -1255,6 +1286,7 @@ private:
   std::uint64_t host_aim_ray_patch_count_{};
   std::uint64_t enemy_close_aim_patch_count_{};
   bool cd_ready_callback_is_pointer_{true};
+  bool cd_completion_callback_is_pointer_{true};
   bool video_timing_baseline_initialized_{};
   bool audio_frame_tick_initialized_{};
 };

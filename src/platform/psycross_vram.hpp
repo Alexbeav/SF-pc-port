@@ -166,7 +166,9 @@ hudResidentPlacement(const assets::TimBlock &block) noexcept {
   case game::HudAtlasKind::sf1:
     return false;
   case game::HudAtlasKind::sf2:
-    return (block.x == 884U && block.y == 238U &&
+    return (block.x == 808U && block.y == 240U &&
+            block.width_words == 16U && block.height == 16U) ||
+           (block.x == 884U && block.y == 238U &&
             block.width_words == 9U && block.height == 17U) ||
            (block.x == 792U && block.y == 240U &&
             block.width_words == 16U && block.height == 16U) ||

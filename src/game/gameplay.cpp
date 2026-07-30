@@ -6472,6 +6472,13 @@ std::uint8_t GameplaySession::textureBankAt(double x, double z) const noexcept {
                                      containing_bank_mask);
 }
 
+void GameplaySession::synchronizeGuestResidency(double x, double y, double z) {
+  const auto ground = findGround(x, z, y);
+  if (ground.model < models_.size()) {
+    updateCurrentRoom(ground.model, x, z);
+  }
+}
+
 std::uint8_t
 GameplaySession::objectTextureBank(std::uint16_t index) const noexcept {
   if (current_room_ >= models_.size()) {

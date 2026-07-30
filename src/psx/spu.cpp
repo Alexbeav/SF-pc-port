@@ -965,6 +965,8 @@ void Spu::tickVolumeSweep(SpuVolumeSweepState &sweep) noexcept {
 
 void Spu::keyOn(std::uint32_t mask) noexcept {
   mask &= voice_mask;
+  ++state_->key_on_writes;
+  state_->last_key_on_mask = mask;
   state_->endx &= ~mask;
   for (std::size_t voice = 0U; voice < voice_count; ++voice) {
     const auto voice_bit = static_cast<std::uint32_t>(1U << voice);
@@ -994,6 +996,8 @@ void Spu::keyOn(std::uint32_t mask) noexcept {
 
 void Spu::keyOff(std::uint32_t mask) noexcept {
   mask &= voice_mask;
+  ++state_->key_off_writes;
+  state_->last_key_off_mask = mask;
   for (std::size_t voice = 0U; voice < voice_count; ++voice) {
     const auto voice_bit = static_cast<std::uint32_t>(1U << voice);
     auto &voice_state = state_->voices[voice];

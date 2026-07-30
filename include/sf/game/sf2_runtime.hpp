@@ -2,10 +2,302 @@
 
 #include "sf/game/hud.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
+#include <span>
+#include <string_view>
+#include <vector>
+
+namespace sf::psx {
+struct SpuPcmFrame;
+}
 
 namespace sf::game {
+
+struct LegacyHostPadState;
+
+inline constexpr std::size_t sf2_inventory_item_count = 34U;
+
+// Verified resident-executable boundaries for the USA SF2 executable shared
+// by both discs. Mission/overlay bridge addresses will be added only after a
+// deterministic guest probe establishes their live contract.
+struct Sf2GuestRuntimeProfile {
+  std::uint32_t executable_entry;
+  std::uint32_t game_main_entry;
+  std::uint32_t state_loop_entry;
+  std::uint32_t state_loop_dispatch_entry;
+  std::uint32_t common_init_entry;
+  std::uint32_t mission_archive_open_entry;
+  std::uint32_t application_state_push_entry;
+  std::uint32_t application_state_pop_entry;
+  std::uint32_t gpu_submission_entry;
+  std::uint32_t cd_search_file_entry;
+  std::uint32_t mission_overlay_load_address;
+  std::uint32_t application_state;
+  std::uint32_t application_state_depth;
+  std::uint32_t application_state_stack;
+  std::uint32_t application_transition;
+  std::uint32_t system_clock;
+  std::uint32_t task_scheduler_init_entry;
+  std::uint32_t interrupt_callback_table;
+  std::uint32_t cd_completion_result;
+  std::uint32_t cd_setloc_state;
+  std::uint32_t cd_mode_state;
+};
+
+// Immutable guest-to-native presentation handoff. SF2's renderer callback
+// supplies the root of a PSX DMA linked list; native presentation receives a
+// bounded deep copy, never a pointer or view into mutable guest RAM.
+struct Sf2GpuPacket {
+  std::uint32_t guest_address{};
+  std::vector<std::uint32_t> gp0_words;
+};
+
+struct Sf2PresentationFrame {
+  std::uint64_t sequence{};
+  std::uint64_t guest_frame{};
+  std::uint32_t application_state{};
+  std::uint32_t ordering_table_root{};
+  std::vector<Sf2GpuPacket> packets;
+  std::size_t gp0_word_count{};
+  std::size_t gpu_command_count{};
+  std::size_t draw_command_count{};
+
+  [[nodiscard]] bool valid() const noexcept {
+    return sequence != 0U && ordering_table_root != 0U && !packets.empty() &&
+           gp0_word_count != 0U && gpu_command_count == packets.size();
+  }
+};
+
+enum class Sf2GpuCommandKind : std::uint8_t {
+  unsupported,
+  draw,
+  draw_environment,
+  fill_vram,
+  copy_vram,
+  upload_vram,
+};
+
+struct Sf2GpuTransfer {
+  std::uint16_t x{};
+  std::uint16_t y{};
+  std::uint16_t width{};
+  std::uint16_t height{};
+  std::span<const std::uint32_t> payload;
+};
+
+struct Sf2GuestRuntimeDiagnostics {
+  std::uint32_t pc{};
+  std::uint32_t stack_pointer{};
+  std::uint32_t minimum_stack_pointer{};
+  std::uint32_t maximum_stack_pointer{};
+  std::uint32_t return_address{};
+  std::uint32_t global_pointer{};
+  std::uint32_t application_state{};
+  std::uint32_t system_clock{};
+  std::uint32_t last_pad_caller{};
+  std::uint32_t last_pad_index{};
+  std::uint32_t player_instance{};
+  std::int32_t player_x{};
+  std::int32_t player_y{};
+  std::int32_t player_z{};
+  std::uint16_t player_health{};
+  std::uint16_t player_armor{};
+  std::uint32_t player_equipped_item{};
+  std::array<std::uint32_t, 2U> player_owned_items{};
+  std::array<std::uint16_t, sf2_inventory_item_count> player_reserves{};
+  std::array<std::uint16_t, sf2_inventory_item_count> player_magazines{};
+  std::uint32_t last_restore_caller{};
+  std::int32_t pre_restore_player_x{};
+  std::int32_t pre_restore_player_y{};
+  std::int32_t pre_restore_player_z{};
+  std::uint16_t pre_restore_player_health{};
+  std::uint32_t last_damage_caller{};
+  std::array<std::uint32_t, 4U> last_damage_arguments{};
+  std::uint64_t damage_events{};
+  std::uint32_t last_player_damage_caller{};
+  std::array<std::uint32_t, 8U> last_player_damage_request{};
+  std::uint64_t player_damage_events{};
+  std::uint64_t spu_mixed_frames{};
+  std::uint64_t spu_key_on_writes{};
+  std::uint64_t spu_key_off_writes{};
+  std::uint32_t spu_last_key_on_mask{};
+  std::uint32_t spu_last_key_off_mask{};
+  std::size_t active_spu_voices{};
+  std::uint16_t spu_control{};
+  std::uint16_t spu_status{};
+  std::size_t spu_cd_frames{};
+  std::uint8_t cd_muted{};
+  std::uint8_t cd_adpcm_muted{};
+  std::uint32_t cd_lba{};
+  std::uint8_t cd_reading{};
+  std::uint8_t cd_interrupt_flags{};
+  std::uint8_t cd_pending_command{};
+  std::uint8_t cd_command_phase{};
+  std::uint8_t cd_data_valid{};
+  std::uint8_t cd_sector_event_pending{};
+  std::uint8_t xa_stream_set{};
+  std::uint8_t xa_file{};
+  std::uint8_t xa_channel{};
+  std::uint64_t script_archive_loads{};
+  std::uint16_t script_program_count{};
+  std::uint32_t script_level_program{};
+  std::uint32_t script_level_name_pointer{};
+  std::array<std::uint32_t, 2U> script_level_name_words{};
+  std::array<std::uint32_t, 2U> script_lookup_name_words{};
+  std::uint64_t script_level_starts{};
+  std::uint64_t script_dispatches{};
+  std::uint64_t script_program_dispatches{};
+  std::uint64_t script_activations{};
+  std::uint64_t scene_xa_archive_opens{};
+  std::uint64_t scene_speech_starts{};
+  std::uint64_t scene_speech_callbacks{};
+  std::uint8_t scene_speech_stage{};
+  std::uint8_t scene_speech_io_ready{};
+  std::array<std::uint32_t, 4U> last_scene_speech_arguments{};
+  std::array<std::uint32_t, 20U> scene_speech_io_state{};
+  std::uint64_t spatial_sound_starts{};
+  std::uint64_t scene_sound_cue_plays{};
+  std::array<std::uint32_t, 11U> interrupt_callbacks{};
+  std::array<std::uint32_t, 5U> xa_globals{};
+  std::uint32_t xa_status_source{};
+  std::uint32_t xa_status_result{};
+  std::uint64_t xa_cue_plays{};
+  std::uint64_t xa_stream_starts{};
+  std::uint64_t async_file_services{};
+  std::uint64_t async_file_completions{};
+  std::uint32_t last_async_completion_caller{};
+  std::uint64_t input_samples{};
+  std::uint64_t checkpoint_restores{};
+};
+
+// Projects only authoritative guest-owned player state into the native SF2
+// HUD presentation model. It never writes inventory, health or selection back
+// to the guest.
+void projectSf2GuestHud(GameplayHud &hud,
+                        const Sf2GuestRuntimeDiagnostics &guest) noexcept;
+
+// Retains relative mouse motion until the retail 20 Hz PAD sampler advances.
+// This prevents motion collected on the other two 60 Hz presentation frames
+// from being discarded.
+class Sf2SampledMouseAccumulator final {
+public:
+  explicit Sf2SampledMouseAccumulator(
+      std::uint64_t initial_sample = 0U) noexcept;
+  void add(std::uint64_t sample, int delta_x, int delta_y) noexcept;
+  [[nodiscard]] int x() const noexcept { return x_; }
+  [[nodiscard]] int y() const noexcept { return y_; }
+
+private:
+  std::uint64_t sample_{};
+  int x_{};
+  int y_{};
+};
+
+// Converts host weapon-cycle impulses into retail Select edges. Every press is
+// held until sampled and separated from the next queued press by one sampled
+// release.
+class Sf2WeaponSelectPulseQueue final {
+public:
+  explicit Sf2WeaponSelectPulseQueue(
+      std::uint64_t initial_sample = 0U) noexcept;
+  void enqueue(unsigned int count = 1U) noexcept;
+  [[nodiscard]] bool update(std::uint64_t sample) noexcept;
+  [[nodiscard]] unsigned int pending() const noexcept { return pending_; }
+
+private:
+  std::uint64_t sample_{};
+  unsigned int pending_{};
+  bool down_{};
+  bool may_press_{true};
+};
+
+// Classifies one bounded DMA packet for the native presentation backend.
+// Drawing and draw-environment packets retain their exact GP0 words. VRAM
+// commands are exposed separately because PsyCross represents uploads with a
+// host pointer rather than the PSX packet's inline pixel payload.
+[[nodiscard]] Sf2GpuCommandKind
+sf2GpuCommandKind(const Sf2GpuPacket &packet) noexcept;
+
+[[nodiscard]] std::optional<Sf2GpuTransfer>
+sf2GpuTransfer(const Sf2GpuPacket &packet) noexcept;
+
+// Follows the retail GPU DMA chain in a 2 MiB RAM snapshot. Every address,
+// packet length, cycle, and terminator is validated before a frame is
+// published. draw_command_count separately identifies GP0 polygon/line/
+// rectangle opcodes 0x20..0x7f; clear, transfer, and environment-only retail
+// frames remain valid presentation commands.
+[[nodiscard]] std::optional<Sf2PresentationFrame>
+captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
+                            std::uint32_t ordering_table_root,
+                            std::uint32_t application_state,
+                            std::uint64_t sequence,
+                            std::uint64_t guest_frame) noexcept;
+
+// Production owner for the verified Disc 1 TITLE -> HWAY transition. It keeps
+// executable, overlays, CD/SPU state, collision, scripts, HUD and effects in
+// the retail guest; the host supplies only a standard pad sample and consumes
+// immutable GPU/SPU output.
+class Sf2GuestMissionRuntime final {
+public:
+  Sf2GuestMissionRuntime(const std::filesystem::path &cue_path,
+                         std::uint32_t mission_index);
+  ~Sf2GuestMissionRuntime();
+
+  Sf2GuestMissionRuntime(const Sf2GuestMissionRuntime &) = delete;
+  Sf2GuestMissionRuntime &
+  operator=(const Sf2GuestMissionRuntime &) = delete;
+  Sf2GuestMissionRuntime(Sf2GuestMissionRuntime &&) = delete;
+  Sf2GuestMissionRuntime &operator=(Sf2GuestMissionRuntime &&) = delete;
+
+  [[nodiscard]] bool ready() const noexcept;
+  [[nodiscard]] bool faulted() const noexcept;
+  [[nodiscard]] std::string_view faultDetail() const noexcept;
+  void setHostPadState(const LegacyHostPadState &state) noexcept;
+  [[nodiscard]] bool advanceHostUpdate() noexcept;
+  [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
+  presentationFrame() const noexcept;
+  [[nodiscard]] std::size_t
+  takePcm(std::span<psx::SpuPcmFrame> destination) noexcept;
+  void clearPcm() noexcept;
+  [[nodiscard]] std::uint64_t inputSampleCount() const noexcept;
+  [[nodiscard]] Sf2GuestRuntimeDiagnostics diagnostics() const noexcept;
+
+private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+[[nodiscard]] constexpr Sf2GuestRuntimeProfile
+sf2UsaGuestRuntimeProfile() noexcept {
+  return {
+      .executable_entry = 0x800f8598U,
+      .game_main_entry = 0x80029624U,
+      .state_loop_entry = 0x80029700U,
+      .state_loop_dispatch_entry = 0x800297dcU,
+      .common_init_entry = 0x8002a518U,
+      .mission_archive_open_entry = 0x8002a338U,
+      .application_state_push_entry = 0x8002bc44U,
+      .application_state_pop_entry = 0x8002bc80U,
+      .gpu_submission_entry = 0x800f2e24U,
+      .cd_search_file_entry = 0x800f78b8U,
+      .mission_overlay_load_address = 0x8014b978U,
+      .application_state = 0x8011ee90U,
+      .application_state_depth = 0x8011ee8cU,
+      .application_state_stack = 0x8010c5e4U,
+      .application_transition = 0x8011ee94U,
+      .system_clock = 0x8011f668U,
+      .task_scheduler_init_entry = 0x800226a0U,
+      .interrupt_callback_table = 0x8011d0d4U,
+      .cd_completion_result = 0x80141a10U,
+      .cd_setloc_state = 0x8011d1d4U,
+      .cd_mode_state = 0x8011d1d8U,
+  };
+}
 
 // SF2 executable item IDs are not a generic sequel ABI. SF3 must supply its
 // own translation before native actors or pickups can use it.

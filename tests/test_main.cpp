@@ -76,11 +76,15 @@ void testSupportedGames() {
               disc1->layout.streaming_audio_path == "SCENES1.XA" &&
               disc2->layout.streaming_audio_path == "SCENES2.XA" &&
               disc1->executable_layout.vsync_address == 0x800f48f0U &&
-              disc1->executable_layout.retrace_counter_address == 0x8012d0f4U &&
+              disc1->executable_layout.retrace_counter_address == 0x8011d0f4U &&
+              disc1->executable_layout.cd_response_pointer == 0x8011d480U &&
+              disc1->executable_layout.cd_completion_state == 0x8011d498U &&
               disc1->executable_layout.cd_control_address == 0x80103968U &&
               disc1->executable_layout.cd_ready_callback_address ==
-                  0x800f703cU &&
-              !disc1->executable_layout.cd_ready_callback_is_pointer &&
+                  0x8011d1c0U &&
+              disc1->executable_layout.cd_ready_result_address ==
+                  0x8011d49cU &&
+              disc1->executable_layout.cd_ready_callback_is_pointer &&
               games[1].executable_sha256 == games[2].executable_sha256,
           "Syphon Filter 2 disc recognition profile mismatch");
   const auto sf3 = sf::game::identify("SCUS94640", games[3].executable_sha256);
@@ -140,6 +144,7 @@ void testRuntimeProfiles() {
       sf::game::runtimeProfile(sf::game::GameId::syphon_filter_2);
   const auto &sf3 =
       sf::game::runtimeProfile(sf::game::GameId::syphon_filter_3);
+  constexpr auto sf2_guest = sf::game::sf2UsaGuestRuntimeProfile();
   require(
       sf1.kind == sf::game::GameRuntimeKind::sf1 &&
           sf1.uses_legacy_guest_runtime &&
@@ -156,7 +161,26 @@ void testRuntimeProfiles() {
           !sf3.supports_native_mission_interactions &&
           sf3.emd_vertex_index_stride == 2U &&
           sf3.hmd_vertex_index_stride == 8U &&
-          sf3.hud_atlas == sf::game::HudAtlasKind::sf3,
+          sf3.hud_atlas == sf::game::HudAtlasKind::sf3 &&
+          sf2_guest.executable_entry == 0x800f8598U &&
+          sf2_guest.game_main_entry == 0x80029624U &&
+          sf2_guest.state_loop_entry == 0x80029700U &&
+          sf2_guest.state_loop_dispatch_entry == 0x800297dcU &&
+          sf2_guest.common_init_entry == 0x8002a518U &&
+          sf2_guest.mission_archive_open_entry == 0x8002a338U &&
+          sf2_guest.application_state_push_entry == 0x8002bc44U &&
+          sf2_guest.application_state_pop_entry == 0x8002bc80U &&
+          sf2_guest.gpu_submission_entry == 0x800f2e24U &&
+          sf2_guest.cd_search_file_entry == 0x800f78b8U &&
+          sf2_guest.mission_overlay_load_address == 0x8014b978U &&
+          sf2_guest.application_state == 0x8011ee90U &&
+          sf2_guest.application_state_depth == 0x8011ee8cU &&
+          sf2_guest.application_state_stack == 0x8010c5e4U &&
+          sf2_guest.application_transition == 0x8011ee94U &&
+          sf2_guest.system_clock == 0x8011f668U &&
+          sf2_guest.task_scheduler_init_entry == 0x800226a0U &&
+          sf2_guest.interrupt_callback_table == 0x8011d0d4U &&
+          sf2_guest.cd_completion_result == 0x80141a10U,
       "Game runtimes no longer have explicit independent ownership");
 }
 
@@ -166,6 +190,109 @@ void writeLe32(std::span<std::byte> bytes, std::size_t offset,
   bytes[offset + 1] = static_cast<std::byte>(value >> 8U);
   bytes[offset + 2] = static_cast<std::byte>(value >> 16U);
   bytes[offset + 3] = static_cast<std::byte>(value >> 24U);
+}
+
+void testSf2PresentationFrameCapture() {
+  std::vector<std::byte> ram(2U * 1024U * 1024U);
+  writeLe32(ram, 0x100U, 0x00000200U);
+  writeLe32(ram, 0x200U, 0x03ffffffU);
+  writeLe32(ram, 0x204U, 0x20ffffffU);
+  writeLe32(ram, 0x208U, 0x00010002U);
+  writeLe32(ram, 0x20cU, 0x00030004U);
+  const auto frame = sf::game::captureSf2PresentationFrame(
+      ram, 0x80000100U, 1U, 7U, 11U);
+  require(frame && frame->valid() && frame->sequence == 7U &&
+              frame->guest_frame == 11U && frame->application_state == 1U &&
+              frame->ordering_table_root == 0x80000100U &&
+              frame->packets.size() == 1U &&
+              frame->packets[0].guest_address == 0x80000200U &&
+              frame->packets[0].gp0_words.size() == 3U &&
+              frame->gp0_word_count == 3U &&
+              frame->gpu_command_count == 1U &&
+              frame->draw_command_count == 1U,
+          "SF2 presentation did not deep-copy a valid GPU DMA chain");
+
+  writeLe32(ram, 0x200U, 0x03000100U);
+  require(!sf::game::captureSf2PresentationFrame(
+              ram, 0x80000100U, 1U, 8U, 12U),
+          "SF2 presentation accepted a cyclic GPU DMA chain");
+  require(!sf::game::captureSf2PresentationFrame(
+              std::span<const std::byte>{ram}.first(ram.size() - 1U),
+              0x80000100U, 1U, 9U, 13U),
+          "SF2 presentation accepted a non-PSX RAM snapshot");
+
+  const sf::game::Sf2GpuPacket upload{
+      .guest_address = 0x80000400U,
+      .gp0_words = {0xa0000000U, 0x0014000aU, 0x00020003U,
+                    0x22221111U, 0x44443333U, 0x00005555U},
+  };
+  const auto transfer = sf::game::sf2GpuTransfer(upload);
+  require(sf::game::sf2GpuCommandKind(upload) ==
+                  sf::game::Sf2GpuCommandKind::upload_vram &&
+              transfer && transfer->x == 10U && transfer->y == 20U &&
+              transfer->width == 3U && transfer->height == 2U &&
+              transfer->payload.size() == 3U,
+          "SF2 presentation did not expose an inline GP0 VRAM upload");
+  const sf::game::Sf2GpuPacket truncated_upload{
+      .guest_address = 0x80000440U,
+      .gp0_words = {0xa0000000U, 0U, 0x00020003U, 0x22221111U},
+  };
+  require(!sf::game::sf2GpuTransfer(truncated_upload),
+          "SF2 presentation accepted a truncated GP0 VRAM upload");
+
+  sf::game::GameplayHud sf2_hud;
+  sf::game::Sf2GuestRuntimeDiagnostics guest_hud{
+      .player_health = 75U,
+      .player_armor = 300U,
+      .player_equipped_item = 4U,
+  };
+  guest_hud.player_owned_items[0] = 1U << 4U;
+  guest_hud.player_reserves[4U] = 23U;
+  guest_hud.player_magazines[4U] = 7U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  require(sf2_hud.vitals().health == 75U &&
+              sf2_hud.vitals().maximum_health == 150U &&
+              sf2_hud.vitals().armor == 300U &&
+              sf2_hud.vitals().maximum_armor == 600U &&
+              sf2_hud.inventory().current() == sf::game::WeaponId::m_16 &&
+              sf2_hud.inventory().currentState().magazine == 7U &&
+              sf2_hud.inventory().currentState().reserve == 23U &&
+              sf2_hud.weaponSwitchFrames() ==
+                  sf::game::GameplayHud::weapon_switch_duration,
+          "SF2 guest HUD projection lost authoritative vitals, inventory, "
+          "ammunition, or selection");
+  guest_hud.player_owned_items = {1U << 13U, 0U};
+  guest_hud.player_equipped_item = 13U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  require(sf2_hud.inventory().current() == sf::game::WeaponId::unarmed,
+          "Unsupported SF2 item was aliased into the native HUD inventory");
+
+  sf::game::Sf2SampledMouseAccumulator mouse{10U};
+  mouse.add(10U, 5, -7);
+  mouse.add(10U, -2, 3);
+  require(mouse.x() == 3 && mouse.y() == -4,
+          "SF2 mouse motion was not retained within one retail PAD sample");
+  mouse.add(11U, 4, 6);
+  require(mouse.x() == 4 && mouse.y() == 6,
+          "SF2 mouse accumulator did not reset at the sampled boundary");
+  mouse.add(11U, 1'000, -1'000);
+  require(mouse.x() == 384 && mouse.y() == -384,
+          "SF2 sampled mouse motion escaped its bounded range");
+
+  sf::game::Sf2WeaponSelectPulseQueue weapon_select{20U};
+  weapon_select.enqueue(2U);
+  require(weapon_select.update(20U) && weapon_select.pending() == 1U &&
+              weapon_select.update(20U) &&
+              !weapon_select.update(21U) &&
+              !weapon_select.update(21U) &&
+              weapon_select.update(22U) &&
+              weapon_select.pending() == 0U &&
+              !weapon_select.update(23U),
+          "SF2 weapon Select impulses were not separated by sampled releases");
+  weapon_select.enqueue(100U);
+  require(weapon_select.pending() == 16U,
+          "SF2 weapon pulse queue exceeded its bounded capacity");
+
 }
 
 void writeLe16(std::span<std::byte> bytes, std::size_t offset,
@@ -2694,6 +2821,23 @@ void testRawSectorFile() {
                 !media.readDataSector(static_cast<std::uint32_t>(sector_count),
                                       data_sector),
             "Mounted-disc CD-ROM media sector bridge mismatch");
+    media.mapRelativeExtent(19U, 2U);
+    require(
+        media.readDataSector(0U, data_sector) &&
+            std::ranges::all_of(
+                data_sector,
+                [](std::byte value) { return value == std::byte{0xa5}; }) &&
+            media.readRawSector(1U, raw_sector) &&
+            raw_sector[12U] == std::byte{0x00U} &&
+            raw_sector[13U] == std::byte{0x02U} &&
+            raw_sector[14U] == std::byte{0x01U} &&
+            std::ranges::all_of(
+                std::span{raw_sector}.first(12U),
+                [](std::byte value) { return value == std::byte{0x5a}; }) &&
+            std::ranges::all_of(
+                std::span{raw_sector}.subspan(15U),
+                [](std::byte value) { return value == std::byte{0x5a}; }),
+        "Relative extent did not preserve payload and normalize raw MSF");
     const auto raw = disc.readRawSectorFile("movie.str");
     require(raw.sector_size == sector_size, "Raw sector size mismatch");
     require(raw.sector_count == 2, "Raw sector count mismatch");
@@ -3740,6 +3884,7 @@ int main() {
     testSha256();
     testSupportedGames();
     testRuntimeProfiles();
+    testSf2PresentationFrameCapture();
     testDiscSelectionTitles();
     testFogArchive();
     testInvalidFogArchive();
