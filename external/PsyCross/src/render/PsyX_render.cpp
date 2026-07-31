@@ -2506,6 +2506,29 @@ void GR_SwapWindow()
 	//glFinish();
 }
 
+void GR_ReadScreenPixels(int width, int height, unsigned char* pixels)
+{
+#if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
+	if (pixels == nullptr || width <= 0 || height <= 0)
+		return;
+
+	GLint previousFramebuffer = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+	PsyX_ResolveNativeFramebuffer();
+	glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer);
+#if defined(RENDERER_OGL)
+	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+#else
+	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+#endif
+	glBindFramebuffer(GL_FRAMEBUFFER, previousFramebuffer);
+#else
+	(void)width;
+	(void)height;
+	(void)pixels;
+#endif
+}
+
 void GR_SetDepthState(int testEnable, int writeEnable)
 {
 	const int appliedTest = testEnable && g_cfg_pgxpZBuffer ? 1 : 0;

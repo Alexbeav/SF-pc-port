@@ -13681,16 +13681,24 @@ SceneViewerResult runSf2GuestScene(
   auto pending_texture_room_frames = 0U;
   auto presented_frames = std::uint64_t{};
   auto screenshot_captured = false;
-  const auto screenshot_frame = [] {
-    const auto *value = SDL_getenv("SF2_CAPTURE_FRAME");
+  const auto diagnostic_frame = [](const char *name) {
+    const auto *value = SDL_getenv(name);
     if (value == nullptr) {
       return std::optional<std::uint64_t>{};
     }
     char *end{};
     const auto parsed = std::strtoull(value, &end, 10);
-    return std::optional<std::uint64_t>{
-        end != value && end != nullptr && *end == '\0' ? parsed : 29U};
-  }();
+    return end != value && end != nullptr && *end == '\0'
+               ? std::optional<std::uint64_t>{parsed}
+               : std::nullopt;
+  };
+  const auto screenshot_frame = diagnostic_frame("SF2_CAPTURE_FRAME");
+  const auto automatic_quick_save_frame =
+      diagnostic_frame("SF2_QUICK_SAVE_FRAME");
+  const auto automatic_quick_load_frame =
+      diagnostic_frame("SF2_QUICK_LOAD_FRAME");
+  auto automatic_quick_save_completed = false;
+  auto automatic_quick_load_completed = false;
   std::array<psx::SpuPcmFrame, 4096U> pcm{};
 
   PsyX_Log_Info(
@@ -13719,8 +13727,16 @@ SceneViewerResult runSf2GuestScene(
       return keyboard != nullptr && index >= 0 && index < keyboard_count &&
              keyboard[index] != 0U;
     };
-    const auto quick_save_down = key_down(SDL_SCANCODE_F5);
-    const auto quick_load_down = key_down(SDL_SCANCODE_F9);
+    const auto automatic_quick_save_down =
+        automatic_quick_save_frame && !automatic_quick_save_completed &&
+        presented_frames >= *automatic_quick_save_frame;
+    const auto automatic_quick_load_down =
+        automatic_quick_load_frame && !automatic_quick_load_completed &&
+        presented_frames >= *automatic_quick_load_frame;
+    const auto quick_save_down =
+        key_down(SDL_SCANCODE_F5) || automatic_quick_save_down;
+    const auto quick_load_down =
+        key_down(SDL_SCANCODE_F9) || automatic_quick_load_down;
     if (quick_save_down && !quick_save_was_down) {
       if (runtime.captureQuickState()) {
         const auto saved = runtime.diagnostics();
@@ -13736,6 +13752,8 @@ SceneViewerResult runSf2GuestScene(
       } else {
         PsyX_Log_Error("SF2 quick-state capture failed\n");
       }
+      automatic_quick_save_completed =
+          automatic_quick_save_completed || automatic_quick_save_down;
     }
     if (quick_load_down && !quick_load_was_down) {
       if (runtime.restoreQuickState()) {
@@ -13752,6 +13770,27 @@ SceneViewerResult runSf2GuestScene(
         collision_room_record = restored.guest_collision_room_record;
         collision_list = restored.guest_collision_list;
         timeline_event_count = restored.timeline_event_count;
+        // Guest RAM and retained GP0 uploads roll back atomically, but
+        // PsyCross's CPU/GL VRAM mirrors are host presentation state. They
+        // may still contain room, palette, or copy-source texels written
+        // after F5. Re-seed the authored room atlas before replaying the
+        // restored upload journal; otherwise its odd number of LoadImage
+        // operations can expose the two stale host VRAM buffers on
+        // alternating frames.
+        if (restored.guest_current_room <
+            restored.guest_collision_room_count) {
+          static_cast<void>(native_residency.synchronizeGuestRoom(
+              restored.guest_current_room));
+        }
+        textures.invalidate();
+        textures.ensure(native_residency);
+        texture_room = native_residency.currentRoom();
+        texture_bank = static_cast<unsigned int>(
+            native_residency.textureBankAt(
+                static_cast<double>(restored.player_x),
+                static_cast<double>(restored.player_z)));
+        pending_texture_room = 0xffffU;
+        pending_texture_room_frames = 0U;
         hud_textures.invalidate();
         PsyX_Log_Info(
             "SF2 quick state loaded: frame=%llu clock=%u "
@@ -13767,6 +13806,8 @@ SceneViewerResult runSf2GuestScene(
       } else {
         PsyX_Log_Error("SF2 quick-state restore failed\n");
       }
+      automatic_quick_load_completed =
+          automatic_quick_load_completed || automatic_quick_load_down;
     }
     quick_save_was_down = quick_save_down;
     quick_load_was_down = quick_load_down;
@@ -14228,6 +14269,32 @@ SceneViewerResult runSf2GuestScene(
         drawSf2GuestHud(hud_textures, guest_hud);
       }
       if (capture_screenshot) {
+        std::array<std::size_t, 6U> command_kinds{};
+        for (const auto &packet : frame->packets) {
+          const auto kind = game::sf2GpuCommandKind(packet);
+          const auto index = static_cast<std::size_t>(kind);
+          if (index < command_kinds.size()) {
+            ++command_kinds[index];
+          }
+        }
+        DRAWENV captured_environment{};
+        GetDrawEnv(&captured_environment);
+        PsyX_Log_Info(
+            "SF2 capture frame: presented=%llu sequence=%llu guest=%llu "
+            "clock=%u packets=%zu draws=%zu kinds=%zu/%zu/%zu/%zu/%zu/%zu "
+            "env=(%d,%d,%d,%d)/"
+            "(%d,%d)/tpage=0x%04X dtd=%d\n",
+            static_cast<unsigned long long>(presented_frames),
+            static_cast<unsigned long long>(frame->sequence),
+            static_cast<unsigned long long>(frame->guest_frame),
+            diagnostics.system_clock, frame->packets.size(),
+            frame->draw_command_count, command_kinds[0U], command_kinds[1U],
+            command_kinds[2U], command_kinds[3U], command_kinds[4U],
+            command_kinds[5U], captured_environment.clip.x,
+            captured_environment.clip.y, captured_environment.clip.w,
+            captured_environment.clip.h, captured_environment.ofs[0],
+            captured_environment.ofs[1], captured_environment.tpage,
+            captured_environment.dtd);
         PsyX_TakeScreenshot();
       }
       PsyX_EndScene();

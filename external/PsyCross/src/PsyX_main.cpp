@@ -153,6 +153,7 @@ extern void GR_ResetDevice();
 extern void GR_Shutdown();
 extern void GR_BeginScene();
 extern void GR_EndScene();
+extern void GR_ReadScreenPixels(int width, int height, u_char* pixels);
 extern void GR_UpdateSwapIntervalState(int swapInterval);
 
 int g_vmode = -1;
@@ -953,13 +954,19 @@ void PsyX_TakeScreenshot()
 
 	u_char* pixels = (u_char*)malloc(drawableWidth * drawableHeight * 4);
 
-#if defined(RENDERER_OGL)
-	glReadPixels(0, 0, drawableWidth, drawableHeight, GL_BGRA, GL_UNSIGNED_BYTE,
-				 pixels);
-#elif defined(RENDERER_OGLES)
-	glReadPixels(0, 0, drawableWidth, drawableHeight, GL_RGBA, GL_UNSIGNED_BYTE,
-				 pixels); // FIXME: is that correct format?
-#endif
+	GR_ReadScreenPixels(drawableWidth, drawableHeight, pixels);
+	const int rowBytes = drawableWidth * 4;
+	for (int y = 0; y < drawableHeight / 2; ++y)
+	{
+		u_char* top = pixels + y * rowBytes;
+		u_char* bottom = pixels + (drawableHeight - 1 - y) * rowBytes;
+		for (int x = 0; x < rowBytes; ++x)
+		{
+			const u_char value = top[x];
+			top[x] = bottom[x];
+			bottom[x] = value;
+		}
+	}
 
 	SDL_Surface* surface =
 		SDL_CreateRGBSurfaceFrom(pixels, drawableWidth, drawableHeight, 8 * 4,
