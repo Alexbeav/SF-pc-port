@@ -6550,6 +6550,9 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   equipped_item_transitions.emplace_back(0U, last_equipped_item);
   auto observed_renderer_repairs =
       runtime.diagnostics().renderer_text_repairs;
+  auto first_rejected_sound_bank_frame = std::uint32_t{};
+  auto first_rejected_sound_bank_caller = std::uint32_t{};
+  auto first_rejected_sound_bank_magic = std::uint32_t{};
   constexpr std::array<std::array<double, 2U>, 6U>
       objective_waypoints{{
           {3448.0, -25485.0},
@@ -6715,6 +6718,14 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       inspect_pcm(count);
     }
     const auto frame_diagnostics = runtime.diagnostics();
+    if (first_rejected_sound_bank_frame == 0U &&
+        frame_diagnostics.rejected_sound_bank_lookups != 0U) {
+      first_rejected_sound_bank_frame = frame + 1U;
+      first_rejected_sound_bank_caller =
+          frame_diagnostics.last_rejected_sound_bank_caller;
+      first_rejected_sound_bank_magic =
+          frame_diagnostics.last_rejected_sound_bank_magic;
+    }
     if (frame_diagnostics.player_equipped_item != last_equipped_item) {
       last_equipped_item = frame_diagnostics.player_equipped_item;
       equipped_item_transitions.emplace_back(frame + 1U, last_equipped_item);
@@ -6980,8 +6991,15 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.rejected_sound_bank_lookups << ":0x"
             << std::hex << std::uppercase
             << diagnostics.last_rejected_sound_bank << "/"
-            << diagnostics.last_rejected_sound_bank_table << std::dec << "/"
-            << diagnostics.last_rejected_sound_bank_index
+            << diagnostics.last_rejected_sound_bank_table << "/"
+            << diagnostics.last_rejected_sound_bank_caller << "/"
+            << diagnostics.last_rejected_sound_bank_magic << std::dec << "/"
+            << diagnostics.last_rejected_sound_bank_index << "/"
+            << diagnostics.last_rejected_sound_bank_entry_count
+            << ":first@" << first_rejected_sound_bank_frame << "/"
+            << std::hex << std::uppercase
+            << first_rejected_sound_bank_caller << "/"
+            << first_rejected_sound_bank_magic << std::dec
             << " rejected-sound-voices="
             << diagnostics.rejected_sound_voice_updates << ":"
             << diagnostics.last_rejected_sound_voice << "/0x"

@@ -14127,13 +14127,17 @@ SceneViewerResult runSf2GuestScene(
           rejected_sound_bank_lookups) {
         PsyX_Log_Info(
             "SF2 stale sound-bank lookup rejected: count=%llu "
-            "bank=0x%08X table=0x%08X index=%u "
+            "bank=0x%08X table=0x%08X index=%u caller=0x%08X "
+            "magic=0x%08X entries=%u "
             "player=(%d,%d,%d) room=%u\n",
             static_cast<unsigned long long>(
                 diagnostics.rejected_sound_bank_lookups),
             diagnostics.last_rejected_sound_bank,
             diagnostics.last_rejected_sound_bank_table,
             diagnostics.last_rejected_sound_bank_index,
+            diagnostics.last_rejected_sound_bank_caller,
+            diagnostics.last_rejected_sound_bank_magic,
+            diagnostics.last_rejected_sound_bank_entry_count,
             diagnostics.player_x, diagnostics.player_y,
             diagnostics.player_z, diagnostics.guest_current_room);
         rejected_sound_bank_lookups =

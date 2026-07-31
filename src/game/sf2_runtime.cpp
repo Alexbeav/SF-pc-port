@@ -921,6 +921,12 @@ public:
         last_rejected_sound_bank_table_;
     result.last_rejected_sound_bank_index =
         last_rejected_sound_bank_index_;
+    result.last_rejected_sound_bank_caller =
+        last_rejected_sound_bank_caller_;
+    result.last_rejected_sound_bank_magic =
+        last_rejected_sound_bank_magic_;
+    result.last_rejected_sound_bank_entry_count =
+        last_rejected_sound_bank_entry_count_;
     result.rejected_sound_voice_updates =
         rejected_sound_voice_updates_;
     result.last_rejected_sound_voice =
@@ -2197,6 +2203,7 @@ private:
           constexpr std::uint32_t ram_end = 0x80200000U;
           const auto bank = context.argument(0U);
           const auto index = context.argument(1U);
+          std::uint32_t magic{};
           std::uint16_t entry_count{};
           std::uint32_t table{};
           std::uint8_t variant_count{};
@@ -2227,6 +2234,10 @@ private:
             last_rejected_sound_bank_ = bank;
             last_rejected_sound_bank_table_ = table;
             last_rejected_sound_bank_index_ = index;
+            last_rejected_sound_bank_caller_ = context.returnAddress();
+            static_cast<void>(context.read32(bank, magic));
+            last_rejected_sound_bank_magic_ = magic;
+            last_rejected_sound_bank_entry_count_ = entry_count;
             context.setReturnValue(0U);
             return;
           }
@@ -3221,6 +3232,9 @@ private:
   std::uint32_t last_rejected_sound_bank_{};
   std::uint32_t last_rejected_sound_bank_table_{};
   std::uint32_t last_rejected_sound_bank_index_{};
+  std::uint32_t last_rejected_sound_bank_caller_{};
+  std::uint32_t last_rejected_sound_bank_magic_{};
+  std::uint16_t last_rejected_sound_bank_entry_count_{};
   std::uint64_t rejected_sound_voice_updates_{};
   std::uint32_t last_rejected_sound_voice_{};
   std::uint32_t last_rejected_sound_voice_caller_{};
