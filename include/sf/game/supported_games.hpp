@@ -62,6 +62,10 @@ struct SupportedGame {
 [[nodiscard]] std::span<const SupportedGame> supportedGames() noexcept;
 [[nodiscard]] std::span<const GameMissionResource>
 missionResources(GameId game, std::uint8_t disc_number) noexcept;
+
+[[nodiscard]] std::optional<std::uint16_t>
+missionArchiveSelection(GameId game, std::uint8_t disc_number,
+                        std::uint16_t selection_index) noexcept;
 [[nodiscard]] std::optional<SupportedGame> identify(
     std::string_view volume_id,
     const sf::core::Sha256Digest& executable_sha256) noexcept;

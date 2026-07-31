@@ -121,6 +121,28 @@ void testSupportedGames() {
               sf3_resources.back() ==
                   sf::game::GameMissionResource{18U, "SENATE2"},
           "Sequel mission resource mapping mismatch");
+  constexpr std::array<std::uint16_t, 13U> sf2_disc2_archive_selections{
+      10U, 8U, 11U, 12U, 13U, 20U, 14U,
+      15U, 16U, 17U, 18U, 19U, 9U,
+  };
+  for (auto index = std::uint16_t{}; index < 8U; ++index) {
+    require(sf::game::missionArchiveSelection(
+                sf::game::GameId::syphon_filter_2, 1U, index) == index,
+            "SF2 Disc 1 archive selection mapping mismatch");
+  }
+  for (auto offset = std::uint16_t{};
+       offset < sf2_disc2_archive_selections.size(); ++offset) {
+    require(sf::game::missionArchiveSelection(
+                sf::game::GameId::syphon_filter_2, 2U,
+                static_cast<std::uint16_t>(8U + offset)) ==
+                sf2_disc2_archive_selections[offset],
+            "SF2 Disc 2 archive selection mapping mismatch");
+  }
+  require(!sf::game::missionArchiveSelection(
+              sf::game::GameId::syphon_filter_2, 2U, 7U) &&
+              !sf::game::missionArchiveSelection(
+                  sf::game::GameId::syphon_filter_2, 2U, 21U),
+          "SF2 Disc 2 accepted an out-of-range campaign selection");
   require(!sf::game::identify("SCUS94451", games[0].executable_sha256),
           "Supported-game recognition ignored executable identity");
   require(sf::game::missionDefinition(sf::game::GameId::syphon_filter_3, 2U)

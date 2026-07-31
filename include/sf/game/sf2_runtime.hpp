@@ -246,6 +246,9 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_rejected_sound_bank{};
   std::uint32_t last_rejected_sound_bank_table{};
   std::uint32_t last_rejected_sound_bank_index{};
+  std::uint64_t rejected_sound_voice_updates{};
+  std::uint32_t last_rejected_sound_voice{};
+  std::uint32_t last_rejected_sound_voice_caller{};
   std::array<std::uint32_t, 11U> interrupt_callbacks{};
   std::array<std::uint32_t, 5U> xa_globals{};
   std::uint32_t xa_status_source{};

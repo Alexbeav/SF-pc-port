@@ -13669,6 +13669,8 @@ SceneViewerResult runSf2GuestScene(
       runtime.diagnostics().rejected_renderer_list_merges;
   auto rejected_sound_bank_lookups =
       runtime.diagnostics().rejected_sound_bank_lookups;
+  auto rejected_sound_voice_updates =
+      runtime.diagnostics().rejected_sound_voice_updates;
   auto timeline_event_count =
       runtime.diagnostics().timeline_event_count;
   auto texture_room = native_residency.currentRoom();
@@ -14086,6 +14088,20 @@ SceneViewerResult runSf2GuestScene(
             diagnostics.player_z, diagnostics.guest_current_room);
         rejected_sound_bank_lookups =
             diagnostics.rejected_sound_bank_lookups;
+      }
+      if (diagnostics.rejected_sound_voice_updates !=
+          rejected_sound_voice_updates) {
+        PsyX_Log_Info(
+            "SF2 invalid SPU voice update rejected: count=%llu "
+            "voice=%u caller=0x%08X player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(
+                diagnostics.rejected_sound_voice_updates),
+            diagnostics.last_rejected_sound_voice,
+            diagnostics.last_rejected_sound_voice_caller,
+            diagnostics.player_x, diagnostics.player_y,
+            diagnostics.player_z, diagnostics.guest_current_room);
+        rejected_sound_voice_updates =
+            diagnostics.rejected_sound_voice_updates;
       }
       if (diagnostics.timeline_event_count != timeline_event_count) {
         const auto first_event = std::max(

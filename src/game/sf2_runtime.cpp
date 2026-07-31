@@ -404,9 +404,8 @@ public:
         cdrom_media_(disc_.image()), mission_index_(mission_index) {
     try {
       if (!disc_.game() ||
-          disc_.game()->id != GameId::syphon_filter_2 ||
-          disc_.game()->disc_number != 1U) {
-        markFault("SF2 guest runtime currently requires Disc 1");
+          disc_.game()->id != GameId::syphon_filter_2) {
+        markFault("SF2 guest runtime requires a supported SF2 disc");
         return;
       }
       const auto resources =
@@ -922,6 +921,12 @@ public:
         last_rejected_sound_bank_table_;
     result.last_rejected_sound_bank_index =
         last_rejected_sound_bank_index_;
+    result.rejected_sound_voice_updates =
+        rejected_sound_voice_updates_;
+    result.last_rejected_sound_voice =
+        last_rejected_sound_voice_;
+    result.last_rejected_sound_voice_caller =
+        last_rejected_sound_voice_caller_;
     for (const auto &packet : vram_setup_packets_) {
       if (packet.guest_address == 0U ||
           sf2GpuCommandKind(packet) !=
@@ -1763,6 +1768,26 @@ private:
     vm_.machine().setCdRomMedia(&cdrom_media_);
     vm_.bindPsxBiosCoreVector(true);
     installExceptionBridge();
+    vm_.bindHostCall(
+        0x801058acU, [this](LegacyHostCallContext &context) {
+          // Retail SpuSetVoicePitch accepts one of the PS1's 24 hardware
+          // voices. A released sound-bank allocation can remain linked long
+          // enough for the sequence player to reuse and overwrite its
+          // variant record; LABS2 then presents 0xD0 here. The original
+          // routine would address beyond the SPU MMIO bank. Reject only that
+          // impossible hardware index and leave valid retail updates intact.
+          constexpr std::uint32_t spu_voice_count = 24U;
+          const auto voice = context.argument(0U);
+          if (voice >= spu_voice_count) {
+            ++rejected_sound_voice_updates_;
+            last_rejected_sound_voice_ = voice;
+            last_rejected_sound_voice_caller_ =
+                context.registerValue(31U);
+            context.setReturnValue(0U);
+            return;
+          }
+          context.continueGuestInstruction();
+        });
     // The guest's synchronous drain spins inside one emulated instruction
     // slice, while the host CD device advances between slices. Leave queued
     // requests with the retail asynchronous owner instead of deadlocking the
@@ -2433,7 +2458,9 @@ private:
           auto open = open_files_.find(context.argument(0));
           if (open == open_files_.end()) {
             std::uint32_t handle_size{};
-            const auto movie = disc_.image().find("MOVIE1.HOG");
+            const auto movie = disc_.image().find(
+                disc_.game()->disc_number == 2U ? "MOVIE2.HOG"
+                                                : "MOVIE1.HOG");
             if (context.argument(1) != 0U &&
                 context.argument(2) == 0x800U &&
                 context.read32(context.argument(0) + 4U, handle_size) &&
@@ -2843,7 +2870,14 @@ private:
     if (!release.completed() && !release.stoppedAtHostBoundary()) {
       return false;
     }
-    if (!vm_.runtime().write32(0x801582d4U, mission_index_) ||
+    // Disc 2's campaign order and MissionArchive table order differ. Passing
+    // a campaign index directly opens an unrelated FOG whose first sector is
+    // then misinterpreted as common descriptors.
+    const auto archive_selection = missionArchiveSelection(
+        disc_.game()->id, disc_.game()->disc_number,
+        static_cast<std::uint16_t>(mission_index_));
+    if (!archive_selection ||
+        !vm_.runtime().write32(0x801582d4U, *archive_selection) ||
         !vm_.runtime().write32(0x80156bdcU, 17U) ||
         // This is a fresh TITLE-to-mission handoff. Mission overlays use the
         // retail checkpoint-present flag to distinguish their clean-start
@@ -2881,7 +2915,10 @@ private:
     opening_stack_ = vm_.runtime().state().gpr[29U];
     for (std::size_t index = 0U; index < 512U; ++index) {
       auto display_submitted = false;
-      if (advanceGuestBoundary(display_submitted) && display_submitted &&
+      if (!advanceGuestBoundary(display_submitted)) {
+        return false;
+      }
+      if (display_submitted &&
           presentation_frame_ &&
           presentation_frame_->draw_command_count != 0U) {
         return true;
@@ -3184,6 +3221,9 @@ private:
   std::uint32_t last_rejected_sound_bank_{};
   std::uint32_t last_rejected_sound_bank_table_{};
   std::uint32_t last_rejected_sound_bank_index_{};
+  std::uint64_t rejected_sound_voice_updates_{};
+  std::uint32_t last_rejected_sound_voice_{};
+  std::uint32_t last_rejected_sound_voice_caller_{};
   std::uint32_t last_room_texture_activation_{};
   std::uint32_t last_room_texture_page_{};
   std::uint32_t last_room_texture_bank_{};

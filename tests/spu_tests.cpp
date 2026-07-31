@@ -576,6 +576,27 @@ void testInvalidStateRejection() {
           "Invalid SPU voice flag was accepted");
   require(spu->state() == *baseline, "Rejected voice state changed the SPU");
 
+  // A high-pitch voice can consume its final ADPCM sample and become
+  // inactive before advanceVoice reduces the remaining phase below one
+  // sample period. That accumulator is dormant and key-on resets it, so it
+  // must remain save-state compatible.
+  *invalid = *baseline;
+  invalid->voices[0].pitch_counter = 0x3ed9U;
+  require(spu->validateState(*invalid) && spu->restoreState(*invalid) &&
+              spu->state() == *invalid,
+          "Dormant SPU voice phase was not save-state compatible");
+  require(spu->restoreState(*baseline),
+          "Could not restore SPU baseline after dormant-phase test");
+
+  *invalid = *baseline;
+  invalid->voices[0].active = 1U;
+  invalid->voices[0].adsr_phase = sf::psx::SpuAdsrPhase::attack;
+  invalid->voices[0].pitch_counter = 0x1000U;
+  require(!spu->validateState(*invalid) && !spu->restoreState(*invalid),
+          "Out-of-range active SPU voice phase was accepted");
+  require(spu->state() == *baseline,
+          "Rejected active voice phase changed the SPU");
+
   *invalid = *baseline;
   invalid->cd_frame_count = 1U;
   require(!spu->validateState(*invalid) && !spu->restoreState(*invalid),

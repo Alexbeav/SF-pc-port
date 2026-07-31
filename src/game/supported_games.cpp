@@ -175,6 +175,28 @@ missionResources(GameId game, std::uint8_t disc_number) noexcept {
   return {};
 }
 
+std::optional<std::uint16_t>
+missionArchiveSelection(GameId game, std::uint8_t disc_number,
+                        std::uint16_t selection_index) noexcept {
+  if (game != GameId::syphon_filter_2) {
+    return std::nullopt;
+  }
+  if (disc_number == 1U && selection_index < sf2_disc1_missions.size()) {
+    return selection_index;
+  }
+  if (disc_number != 2U || selection_index < 8U ||
+      selection_index >= 8U + sf2_disc2_missions.size()) {
+    return std::nullopt;
+  }
+  // Disc 2's MissionArchive table retains the shared executable order,
+  // while the campaign resource catalog above is in player-facing order.
+  constexpr std::array<std::uint16_t, 13U> disc2_archive_selections{
+      10U, 8U, 11U, 12U, 13U, 20U, 14U,
+      15U, 16U, 17U, 18U, 19U, 9U,
+  };
+  return disc2_archive_selections[selection_index - 8U];
+}
+
 std::optional<SupportedGame> identify(
     std::string_view volume_id,
     const core::Sha256Digest& executable_sha256) noexcept {

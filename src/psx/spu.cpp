@@ -766,7 +766,8 @@ bool Spu::validateState(const SpuState &state) const noexcept {
         (voice_state.block_address & 0x0fU) != 0U ||
         voice_state.repeat_address >= ram_size ||
         (voice_state.repeat_address & 0x0fU) != 0U ||
-        voice_state.pitch_counter >= pitch_one ||
+        (voice_state.active != 0U &&
+         voice_state.pitch_counter >= pitch_one) ||
         voice_state.sample_index >= SpuVoiceState::samples_per_block ||
         voice_state.envelope > 0x7fffU ||
         (voice_state.block_flags & ~adpcm_flag_mask) != 0U ||

@@ -21,6 +21,19 @@ pre-release tags rather than a stable semantic-versioning promise.
   room-14 case. Follow-up disassembly showed that the earlier request-level
   "player floor" classification was shared actor logic, so that unproven
   request rewrite and its misleading probe were retired.
+- Enabled the USA Disc 2 executable and corrected its resident movie catalog
+  bridge to use `MOVIE2.HOG`.
+- Recovered Disc 2's campaign-to-archive permutation and kept mission loading
+  on the retail TITLE handoff. All thirteen Disc 2 packages now reach live
+  gameplay in the headless product runtime; DISCO and LABS2 also pass
+  extended combat, restart, and F5/F9 gates.
+- Contained stale sound variants at the 24-voice SPU hardware boundary.
+  LABS2 no longer faults when a released variant's reused voice byte exceeds
+  the physical voice bank, while valid retail voice updates remain untouched.
+- Fixed F9 rejection after high-pitch sounds finish. Inactive SPU voices may
+  legally retain a phase accumulator above one sample period; snapshot
+  validation now accepts that dormant state while retaining the active-voice
+  bound.
 
 ## 0.1.0-sf2-guest-alpha.2 - 2026-07-31
 
