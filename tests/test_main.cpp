@@ -217,22 +217,38 @@ void writeLe32(std::span<std::byte> bytes, std::size_t offset,
 void testSf2PresentationFrameCapture() {
   std::vector<std::byte> ram(2U * 1024U * 1024U);
   writeLe32(ram, 0x100U, 0x00000200U);
-  writeLe32(ram, 0x200U, 0x03ffffffU);
+  writeLe32(ram, 0x200U, 0x04ffffffU);
   writeLe32(ram, 0x204U, 0x20ffffffU);
   writeLe32(ram, 0x208U, 0x00010002U);
   writeLe32(ram, 0x20cU, 0x00030004U);
+  writeLe32(ram, 0x210U, 0x00050006U);
   const auto frame = sf::game::captureSf2PresentationFrame(
       ram, 0x80000100U, 1U, 7U, 11U);
   require(frame && frame->valid() && frame->sequence == 7U &&
               frame->guest_frame == 11U && frame->application_state == 1U &&
               frame->ordering_table_root == 0x80000100U &&
               frame->packets.size() == 1U &&
-              frame->packets[0].guest_address == 0x80000200U &&
-              frame->packets[0].gp0_words.size() == 3U &&
-              frame->gp0_word_count == 3U &&
+              frame->packets[0].guest_address == 0x80000204U &&
+              frame->packets[0].gp0_words.size() == 4U &&
+              frame->gp0_word_count == 4U &&
               frame->gpu_command_count == 1U &&
               frame->draw_command_count == 1U,
           "SF2 presentation did not deep-copy a valid GPU DMA chain");
+
+  // One DMA payload may contain several GP0 commands. Presentation must
+  // split them so fixed-size UI tiles/sprites reach the typed translator
+  // instead of being handed to PsyCross as one malformed primitive.
+  writeLe32(ram, 0x200U, 0x03ffffffU);
+  writeLe32(ram, 0x204U, 0xe1000400U);
+  writeLe32(ram, 0x208U, 0x700000ffU);
+  writeLe32(ram, 0x20cU, 0x00100020U);
+  const auto bundled = sf::game::captureSf2PresentationFrame(
+      ram, 0x80000100U, 1U, 8U, 12U);
+  require(bundled && bundled->packets.size() == 2U &&
+              bundled->packets[0].gp0_words.size() == 1U &&
+              bundled->packets[1].gp0_words.size() == 2U &&
+              bundled->draw_command_count == 1U,
+          "SF2 presentation did not split bundled GP0 UI commands");
 
   writeLe32(ram, 0x200U, 0x03000100U);
   require(!sf::game::captureSf2PresentationFrame(
@@ -242,6 +258,20 @@ void testSf2PresentationFrameCapture() {
               std::span<const std::byte>{ram}.first(ram.size() - 1U),
               0x80000100U, 1U, 9U, 13U),
           "SF2 presentation accepted a non-PSX RAM snapshot");
+
+  // Hybrid auxiliary rendering can link a CPU descriptor record into an OT.
+  // Its large tag length must not make its data look like GP0 UI/copy packets;
+  // the walker should retain the link and continue to the real primitive.
+  writeLe32(ram, 0x100U, 0x00000300U);
+  writeLe32(ram, 0x300U, 0xff000200U);
+  writeLe32(ram, 0x200U, 0x04ffffffU);
+  const auto skipped_descriptor = sf::game::captureSf2PresentationFrame(
+      ram, 0x80000100U, 1U, 10U, 14U);
+  require(skipped_descriptor && skipped_descriptor->gp0_word_count == 4U &&
+              !skipped_descriptor->packets.empty() &&
+              skipped_descriptor->packets.front().guest_address ==
+                  0x80000204U,
+          "SF2 presentation replayed a linked CPU descriptor as GP0 data");
 
   const sf::game::Sf2GpuPacket upload{
       .guest_address = 0x80000400U,
@@ -261,6 +291,23 @@ void testSf2PresentationFrameCapture() {
   };
   require(!sf::game::sf2GpuTransfer(truncated_upload),
           "SF2 presentation accepted a truncated GP0 VRAM upload");
+
+  const sf::game::Sf2GpuPacket reserved_copy{
+      .guest_address = 0x80000480U,
+      .gp0_words = {0x80000000U, 0xf3fffbffU, 0xfe00fc00U,
+                    0x02000800U},
+  };
+  require(!sf::game::sf2GpuTransfer(reserved_copy),
+          "SF2 presentation accepted reserved bits in a captured VRAM copy");
+  const sf::game::Sf2GpuPacket maximum_copy{
+      .guest_address = 0x800004a0U,
+      .gp0_words = {0x80000000U, 0x00000000U, 0x00000000U,
+                    0x00000000U},
+  };
+  const auto maximum_transfer = sf::game::sf2GpuTransfer(maximum_copy);
+  require(maximum_transfer && maximum_transfer->width == 1024U &&
+              maximum_transfer->height == 512U,
+          "SF2 presentation did not decode zero-sized maximum VRAM copy");
 
   const std::array gp0_stream{
       0x3c808080U, 0x00010002U, 0x00030004U, 0x00050006U,

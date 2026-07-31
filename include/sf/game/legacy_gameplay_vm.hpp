@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sf::game {
@@ -947,6 +948,8 @@ struct LegacyMissionTickResult {
 class LegacyGameplayVm final {
 public:
   static constexpr std::uint32_t updates_per_second = 20U;
+  using HostCallObserver = std::function<void(
+      std::uint32_t, const psx::R3000State &)>;
 
   explicit LegacyGameplayVm(const psx::Executable &executable,
                             psx::CpuClockScale cpu_clock_scale = {});
@@ -954,6 +957,9 @@ public:
   [[nodiscard]] bool loadOverlay(std::uint32_t address,
                                  std::span<const std::byte> bytes) noexcept;
   void bindHostCall(std::uint32_t address, LegacyHostCall call);
+  void setHostCallObserver(HostCallObserver observer) {
+    host_call_observer_ = std::move(observer);
+  }
   void bindPsxBiosRandomCalls();
   void bindPsxBiosCoreVector(bool expose_kernel_tables = false);
   void bindPsxLibcStringCalls();
@@ -1255,6 +1261,7 @@ private:
   psx::PsxMachine machine_;
   std::unordered_map<std::uint32_t, LegacyHostCall> host_calls_;
   std::vector<LegacyHostCall *> ram_host_calls_;
+  HostCallObserver host_call_observer_{};
   std::array<std::uint32_t, 4U> bios_clear_root_counter_flags_{};
   std::shared_ptr<LegacyVirtualCd> virtual_cd_;
   std::uint32_t executable_initial_pc_{};

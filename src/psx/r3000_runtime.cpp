@@ -112,6 +112,7 @@ bool R3000Runtime::loadBytes(
     for (const auto byte : bytes) {
         const auto watched = recordWriteWatch(
             address, 1U, std::to_integer<std::uint8_t>(byte));
+        recordWriteTrace(address, 1U, std::to_integer<std::uint8_t>(byte));
         if (!watched || !suppress_write_watch_) {
             *memoryByte(address) = byte;
         }
@@ -391,6 +392,7 @@ bool R3000Runtime::read32(std::uint32_t address, std::uint32_t& value) const noe
 bool R3000Runtime::write8(std::uint32_t address, std::uint8_t value) noexcept {
     std::uint32_t physical{};
     if (physicalAddress(address, physical) && physical < ram_mirror_end) {
+        recordWriteTrace(address, 1U, value);
         if (recordWriteWatch(address, 1U, value) &&
             suppress_write_watch_) {
             return true;
@@ -416,6 +418,7 @@ bool R3000Runtime::write16(std::uint32_t address, std::uint16_t value) noexcept 
     }
     std::uint32_t physical{};
     if (physicalAddress(address, physical) && physical < ram_mirror_end) {
+        recordWriteTrace(address, 2U, value);
         if (recordWriteWatch(address, 2U, value) &&
             suppress_write_watch_) {
             return true;
@@ -445,6 +448,7 @@ bool R3000Runtime::write32(std::uint32_t address, std::uint32_t value) noexcept 
     }
     std::uint32_t physical{};
     if (physicalAddress(address, physical) && physical < ram_mirror_end) {
+        recordWriteTrace(address, 4U, value);
         if (recordWriteWatch(address, 4U, value) &&
             suppress_write_watch_) {
             return true;
@@ -544,6 +548,48 @@ void R3000Runtime::addWriteWatch(std::uint32_t begin,
     ++write_watch_count_;
 }
 
+void R3000Runtime::setWriteTrace(std::uint32_t begin,
+                                 std::uint32_t end) noexcept {
+    std::uint32_t physical_begin{};
+    std::uint32_t physical_end{};
+    write_trace_begin_ = 0U;
+    write_trace_end_ = 0U;
+    write_trace_hit_ = {};
+    if (begin >= end || !physicalAddress(begin, physical_begin) ||
+        !physicalAddress(end - 1U, physical_end)) {
+        return;
+    }
+    write_trace_begin_ = physical_begin;
+    write_trace_end_ = physical_end + 1U;
+}
+
+void R3000Runtime::recordWriteTrace(std::uint32_t address,
+                                    std::uint8_t width,
+                                    std::uint32_t value) noexcept {
+    if (write_trace_begin_ == write_trace_end_ ||
+        write_trace_hit_.width != 0U) {
+        return;
+    }
+    if (write_trace_pc_begin_ != write_trace_pc_end_ &&
+        (executing_pc_ < write_trace_pc_begin_ ||
+         executing_pc_ >= write_trace_pc_end_)) {
+        return;
+    }
+    std::uint32_t physical{};
+    if (!physicalAddress(address, physical) ||
+        physical >= write_trace_end_ ||
+        physical + width <= write_trace_begin_) {
+        return;
+    }
+    write_trace_hit_ = R3000WriteWatchHit{
+        .address = address,
+        .value = value,
+        .pc = executing_pc_,
+        .instruction = executing_instruction_,
+        .width = width,
+    };
+}
+
 bool R3000Runtime::recordWriteWatch(std::uint32_t address,
                                    std::uint8_t width,
                                    std::uint32_t value) noexcept {
@@ -640,6 +686,9 @@ R3000RunResult R3000Runtime::step() noexcept {
     }
     executing_pc_ = instruction_pc;
     executing_instruction_ = instruction;
+    if (execution_observer_) {
+        execution_observer_(state_, instruction_pc, instruction);
+    }
 
     const auto opcode = static_cast<std::uint8_t>(instruction >> 26U);
     const auto rs = static_cast<std::uint8_t>((instruction >> 21U) & 31U);

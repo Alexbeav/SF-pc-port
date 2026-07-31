@@ -113,12 +113,19 @@ void PsxMachine::reset() noexcept {
   xa_decoder_.reset();
   timers_.reset();
   gpu_gp0_words_.clear();
+  gpu_gp1_words_.clear();
   syncCpuInterruptLine();
 }
 
 std::vector<std::uint32_t> PsxMachine::takeGpuGp0Words() noexcept {
   auto words = std::move(gpu_gp0_words_);
   gpu_gp0_words_.clear();
+  return words;
+}
+
+std::vector<std::uint32_t> PsxMachine::takeGpuGp1Words() noexcept {
+  auto words = std::move(gpu_gp1_words_);
+  gpu_gp1_words_.clear();
   return words;
 }
 
@@ -311,6 +318,7 @@ PsxMachineState PsxMachine::captureState() const {
   state.xa_decoder = xa_decoder_.captureState();
   state.timers = timers_.snapshot();
   state.gpu_gp0_words = gpu_gp0_words_;
+  state.gpu_gp1_words = gpu_gp1_words_;
   state.pending_cpu_ticks = pending_cpu_ticks_;
   state.device_tick_remainder = device_tick_remainder_;
   return state;
@@ -329,7 +337,8 @@ bool PsxMachine::validateState(const PsxMachineState &state) const noexcept {
       !dma.restoreState(state.dma) || !cdrom.restoreState(state.cdrom) ||
       state.spu == nullptr || !spu_.validateState(*state.spu) ||
       !xa_decoder_.validateState(state.xa_decoder) ||
-      state.gpu_gp0_words.size() > maximum_dma_words) {
+      state.gpu_gp0_words.size() > maximum_dma_words ||
+      state.gpu_gp1_words.size() > maximum_dma_words) {
     return false;
   }
 
@@ -449,6 +458,7 @@ bool PsxMachine::restoreState(const PsxMachineState &state) noexcept {
   static_cast<void>(xa_decoder_.restoreState(state.xa_decoder));
   timers_.restoreState(state.timers);
   gpu_gp0_words_ = state.gpu_gp0_words;
+  gpu_gp1_words_ = state.gpu_gp1_words;
   pending_cpu_ticks_ = state.pending_cpu_ticks;
   device_tick_remainder_ = state.device_tick_remainder;
   syncCpuInterruptLine();
@@ -664,8 +674,8 @@ bool PsxMachine::writeMmio(std::uint32_t physical_address,
   } else if (aligned == gpu_gp0 || aligned == gpu_gp1) {
     // The native renderer consumes ordering-table state separately. Accept
     // command writes here so the guest observes a permanently ready GPU.
-    if (aligned == gpu_gp0 && width == R3000AccessWidth::word) {
-      gpu_gp0_words_.push_back(value);
+    if (width == R3000AccessWidth::word) {
+      (aligned == gpu_gp0 ? gpu_gp0_words_ : gpu_gp1_words_).push_back(value);
     }
   } else if (aligned == mdec_command || aligned == mdec_status) {
     // Accept command/control writes. The native MDEC DMA port owns the

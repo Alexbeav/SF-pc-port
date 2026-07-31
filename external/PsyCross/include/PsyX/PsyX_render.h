@@ -199,6 +199,16 @@ extern TextureID	g_whiteTexture;
 extern TextureID	g_vramTexture;
 
 extern void			GR_SwapWindow();
+// Select one of two persistent high-resolution native color pages. The
+// default is page zero; callers must switch only between scenes.
+extern void			GR_SetNativeFramebufferPage(int page);
+// Clear only the selected persistent native page. Used when a new authored
+// world frame replaces that page; intermediate host redraws retain it.
+extern void			GR_ClearNativeFramebufferPage();
+// Clear both persistent native color pages without changing the selected
+// page. Intended for authored scene-to-gameplay transitions, not per-frame
+// rendering.
+extern void			GR_ClearNativeFramebufferPages();
 
 // PSX VRAM operations
 enum GrVRAMWriteKind

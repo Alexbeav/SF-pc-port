@@ -7306,6 +7306,9 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
     }
 
     if (auto *hook = findHostCall(runtime_.state().pc); hook != nullptr) {
+      if (host_call_observer_) {
+        host_call_observer_(runtime_.state().pc, runtime_.state());
+      }
       LegacyHostCallContext context{runtime_};
       (*hook)(context);
       ++host_calls;

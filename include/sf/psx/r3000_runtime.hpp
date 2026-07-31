@@ -6,8 +6,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sf::psx {
@@ -90,6 +92,8 @@ struct R3000State {
 // unclaimed MMIO byte remains available through the compatibility shadow.
 class R3000Runtime final {
 public:
+    using ExecutionObserver = std::function<void(
+        const R3000State&, std::uint32_t, std::uint32_t)>;
     static constexpr std::size_t ram_size = 2U * 1024U * 1024U;
     static constexpr std::size_t scratchpad_size = 1024U;
     static constexpr std::size_t mmio_size = 4U * 1024U;
@@ -119,6 +123,9 @@ public:
     void setRegister(std::uint8_t reg, std::uint32_t value) noexcept;
     void attachMmioBus(R3000MmioBus* bus) noexcept { mmio_bus_ = bus; }
     void setExternalInterrupt(bool active) noexcept;
+    void setExecutionObserver(ExecutionObserver observer) {
+        execution_observer_ = std::move(observer);
+    }
     void setWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
     void addWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
     void setBreakOnWriteWatch(bool enabled) noexcept {
@@ -133,6 +140,17 @@ public:
     }
     [[nodiscard]] bool writeWatchBreakPending() const noexcept {
         return break_on_write_watch_ && write_watch_hit_.width != 0U;
+    }
+    // Independent observation-only range. Unlike the corruption guard above,
+    // traced writes are never suppressed and never stop execution.
+    void setWriteTrace(std::uint32_t begin, std::uint32_t end) noexcept;
+    void setWriteTracePc(std::uint32_t begin, std::uint32_t end) noexcept {
+        write_trace_pc_begin_ = begin;
+        write_trace_pc_end_ = end;
+    }
+    void clearWriteTraceHit() noexcept { write_trace_hit_ = {}; }
+    [[nodiscard]] const R3000WriteWatchHit& writeTraceHit() const noexcept {
+        return write_trace_hit_;
     }
 
     [[nodiscard]] bool interruptPending() const noexcept;
@@ -184,18 +202,26 @@ private:
     [[nodiscard]] bool recordWriteWatch(std::uint32_t address,
                                         std::uint8_t width,
                                         std::uint32_t value) noexcept;
+    void recordWriteTrace(std::uint32_t address, std::uint8_t width,
+                          std::uint32_t value) noexcept;
 
     std::vector<std::byte> ram_;
     std::array<std::byte, scratchpad_size> scratchpad_{};
     std::array<std::byte, mmio_size> mmio_{};
     R3000State state_{};
     R3000MmioBus* mmio_bus_{};
+    ExecutionObserver execution_observer_{};
     std::array<std::uint32_t, 4U> write_watch_begins_{};
     std::array<std::uint32_t, 4U> write_watch_ends_{};
     std::size_t write_watch_count_{};
     std::uint32_t executing_pc_{};
     std::uint32_t executing_instruction_{};
     R3000WriteWatchHit write_watch_hit_{};
+    std::uint32_t write_trace_begin_{};
+    std::uint32_t write_trace_end_{};
+    std::uint32_t write_trace_pc_begin_{};
+    std::uint32_t write_trace_pc_end_{};
+    R3000WriteWatchHit write_trace_hit_{};
     bool break_on_write_watch_{};
     bool suppress_write_watch_{};
 };

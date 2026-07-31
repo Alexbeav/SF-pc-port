@@ -40,10 +40,13 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -13204,19 +13207,28 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
   }
   if (kind == game::Sf2GpuCommandKind::copy_vram &&
       packet.gp0_words.size() >= 4U) {
+    const auto transfer = game::sf2GpuTransfer(packet);
+    if (!transfer) {
+      return;
+    }
     const auto source = packet.gp0_words[1U];
     const auto destination = packet.gp0_words[2U];
     const auto size = packet.gp0_words[3U];
+    if (SDL_getenv("SF2_TRACE_VRAM_COPY") != nullptr) {
+      std::fprintf(stderr,
+                   "SF2 VRAM copy: guest=0x%08x source=0x%08x "
+                   "destination=0x%08x size=0x%08x\n",
+                   packet.guest_address, source, destination, size);
+    }
     RECT16 rectangle{
-        static_cast<short>(source & 0xffffU),
-        static_cast<short>(source >> 16U),
-        static_cast<short>((size & 0xffffU) == 0U ? 1024U
-                                                  : size & 0xffffU),
-        static_cast<short>((size >> 16U) == 0U ? 512U : size >> 16U),
+        static_cast<short>(source & 0x03ffU),
+        static_cast<short>((source >> 16U) & 0x01ffU),
+        static_cast<short>(transfer->width),
+        static_cast<short>(transfer->height),
     };
     static_cast<void>(MoveImage(
-        &rectangle, static_cast<int>(destination & 0xffffU),
-        static_cast<int>(destination >> 16U)));
+        &rectangle, static_cast<int>(destination & 0x03ffU),
+        static_cast<int>((destination >> 16U) & 0x01ffU)));
     return;
   }
   if (kind == game::Sf2GpuCommandKind::fill_vram) {
@@ -13541,8 +13553,14 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
                        unsigned int texture_bank) {
   GR_EnableDepth(0);
   GR_SetDepthState(0, 0);
-  for (const auto &packet : frame.packets) {
-    drawSf2GuestPacket(packet, texture_bank);
+  auto boundary = std::size_t{};
+  for (auto index = std::size_t{}; index < frame.packets.size(); ++index) {
+    drawSf2GuestPacket(frame.packets[index], texture_bank);
+    if (boundary < frame.submission_packet_ends.size() &&
+        index + 1U == frame.submission_packet_ends[boundary]) {
+      DrawSync(0);
+      ++boundary;
+    }
   }
   DrawSync(0);
   // Preserve the complete retail draw environment. SPRT packets do not carry
@@ -13552,36 +13570,131 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
   // intermittently sample world or framebuffer data.
 }
 
-void beginSf2GuestFrame() {
-  // The SF2 scene owns a persistent inner presentation loop. EndScene swaps
-  // and closes PsyCross's current scene, so every subsequent guest frame must
-  // explicitly begin a new one. Establish a native-only clear environment
-  // first: collapsing retail's alternating PS1 display pages onto one host
-  // framebuffer without this clear accumulates old snow/world pixels and
-  // produces mouse-trail ghosting. PsyX_BeginScene clears the render target;
-  // unlike ClearImage, it does not erase the emulated VRAM HUD atlas.
-  // Retail ordering tables do not repeat E3/E4/E5 on every submission; the
-  // PS1 GPU retains that state. Preserve it while selecting a native
-  // full-target environment solely for the host clear, then restore it
-  // before replaying the next OT. Leaving the clear environment active makes
-  // lists that rely on retained centre-origin state draw the world offscreen,
-  // producing alternating black-world/native-HUD frames.
-  DRAWENV guest_environment{};
-  GetDrawEnv(&guest_environment);
-  DRAWENV clear_environment{};
-  SetDefDrawEnv(&clear_environment, 0, 0, screen_width, screen_height);
-  clear_environment.isbg = 1;
-  setRGB0(&clear_environment, 0U, 0U, 0U);
-  PutDrawEnv(&clear_environment);
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
+                              std::uint64_t presented_frame,
+                              std::uint32_t system_clock) {
+  const auto dump_path =
+      std::filesystem::path{"build"} /
+      ("sf2-presentation-frame-" + std::to_string(presented_frame) + ".txt");
+  auto dump = std::ofstream{dump_path, std::ios::trunc};
+  if (!dump) {
+    PsyX_Log_Error("SF2 presentation dump open failed: %s\n",
+                   dump_path.string().c_str());
+    return;
+  }
+
+  dump << "presented=" << presented_frame << " sequence=" << frame.sequence
+       << " guest=" << frame.guest_frame << " clock=" << system_clock
+       << " packets=" << frame.packets.size()
+       << " segments=" << frame.submission_packet_ends.size() << '\n';
+  auto segment = std::size_t{};
+  auto segment_end = frame.submission_packet_ends.empty()
+                         ? frame.packets.size()
+                         : frame.submission_packet_ends.front();
+  for (auto packet_index = std::size_t{};
+       packet_index < frame.packets.size(); ++packet_index) {
+    while (packet_index >= segment_end &&
+           segment + 1U < frame.submission_packet_ends.size()) {
+      ++segment;
+      segment_end = frame.submission_packet_ends[segment];
+    }
+    const auto root = segment < frame.submission_roots.size()
+                          ? frame.submission_roots[segment]
+                          : 0U;
+    const auto &packet = frame.packets[packet_index];
+    dump << "segment=" << std::dec << segment << " root=0x" << std::hex
+         << std::setw(8) << std::setfill('0') << root
+         << " packet=" << std::dec << packet_index << " guest=0x" << std::hex
+         << std::setw(8) << packet.guest_address << " words=" << std::dec
+         << packet.gp0_words.size();
+    for (const auto word : packet.gp0_words) {
+      dump << " 0x" << std::hex << std::setw(8) << word;
+    }
+    dump << '\n';
+  }
+  PsyX_Log_Info("SF2 presentation dump: %s\n",
+                dump_path.string().c_str());
+}
+
+[[nodiscard]] unsigned int sf2GuestFramebufferPage(
+    const game::Sf2PresentationFrame &frame) {
+  auto selected_e3 = std::uint32_t{};
+  auto selected_e3_valid = false;
+  auto selected_textured_polygons = std::size_t{};
+  auto segment_begin = std::size_t{};
+  const auto segment_count = frame.submission_packet_ends.empty()
+                                 ? 1U
+                                 : frame.submission_packet_ends.size();
+  for (auto segment = std::size_t{}; segment < segment_count; ++segment) {
+    const auto segment_end = frame.submission_packet_ends.empty()
+                                 ? frame.packets.size()
+                                 : frame.submission_packet_ends[segment];
+    auto e3 = std::uint32_t{};
+    auto e3_valid = false;
+    auto textured_polygons = std::size_t{};
+    for (auto index = segment_begin; index < segment_end; ++index) {
+      const auto &packet = frame.packets[index];
+      if (packet.gp0_words.empty()) {
+        continue;
+      }
+      const auto opcode = static_cast<std::uint8_t>(
+          packet.gp0_words.front() >> 24U);
+      if (opcode == 0xe3U) {
+        e3 = packet.gp0_words.front();
+        e3_valid = true;
+      }
+      const auto base = static_cast<std::uint8_t>(opcode & 0xfcU);
+      if (base == 0x24U || base == 0x2cU || base == 0x34U ||
+          base == 0x3cU) {
+        ++textured_polygons;
+      }
+    }
+    if (e3_valid &&
+        (!selected_e3_valid ||
+         textured_polygons > selected_textured_polygons)) {
+      selected_e3 = e3;
+      selected_e3_valid = true;
+      selected_textured_polygons = textured_polygons;
+    }
+    segment_begin = segment_end;
+  }
+  if (!selected_e3_valid) {
+    return 0U;
+  }
+  const auto draw_area_y = (selected_e3 >> 10U) & 0x03ffU;
+  return draw_area_y >= static_cast<std::uint32_t>(screen_height) ? 1U : 0U;
+}
+
+void beginSf2GuestFrame(unsigned int framebuffer_page,
+                        bool clear_published_page) {
+  // SF2 alternates two persistent PS1 display pages. PsyCross mirrors those
+  // as two high-resolution native color targets; only depth/stencil are
+  // cleared by BeginScene. Retail OTs own all authored color clearing and
+  // incremental HUD overdraw.
+  GR_SetNativeFramebufferPage(static_cast<int>(framebuffer_page));
+  DRAWENV environment{};
+  if (GetDrawEnv(&environment) != nullptr) {
+    environment.isbg = 0;
+    PutDrawEnv(&environment);
+  }
   static_cast<void>(PsyX_BeginScene());
-  PutDrawEnv(&guest_environment);
+  if (clear_published_page) {
+    GR_ClearNativeFramebufferPage();
+  }
 }
 
 void drawSf2GuestHud(const HudTextureAtlas &textures,
                      const game::GameplayHud &hud,
                      const game::Sf2GuestRuntimeDiagnostics &diagnostics,
                      bool objective_complete_visible,
-                     std::string_view pickup_message) {
+                     std::string_view pickup_message,
+                     std::string_view status_message,
+                     bool guest_status_overlay) {
   DrawSync(0);
   DRAWENV guest_environment{};
   GetDrawEnv(&guest_environment);
@@ -13595,59 +13708,48 @@ void drawSf2GuestHud(const HudTextureAtlas &textures,
   PutDrawEnv(&environment);
   GR_SetBlendMode(BM_NONE);
   GR_EnableDepth(0);
-  const auto primary_status = game::localizeTextCopy(
-      game::originalPrimaryStatusLabel(hud.primaryStatus()));
-  drawOriginalHudTextSolid(textures, primary_status, 20, 18);
-  const auto health_color = hud.healthBarColor();
-  drawOriginalStatusBar(26, hud.displayedPrimaryTrail(), hud.primaryReveal(),
-                        health_color.red, health_color.green, health_color.blue,
-                        0, 0);
-  drawOriginalStatusBar(26, hud.displayedPrimaryBar(), hud.primaryReveal(),
-                        150U, 150U, 255U, 0, 0);
+  if (!guest_status_overlay) {
+    const auto primary_status = game::localizeTextCopy(
+        game::originalPrimaryStatusLabel(hud.primaryStatus()));
+    drawOriginalHudTextSolid(textures, primary_status, 20, 18);
+    const auto health_color = hud.healthBarColor();
+    drawOriginalStatusBar(26, hud.displayedPrimaryTrail(), hud.primaryReveal(),
+                          health_color.red, health_color.green,
+                          health_color.blue, 0, 0);
+    drawOriginalStatusBar(26, hud.displayedPrimaryBar(), hud.primaryReveal(),
+                          150U, 150U, 255U, 0, 0);
 
-  if (hud.dangerReveal() != 0U) {
-    const auto danger = game::localizeTextCopy("DANGER");
-    drawOriginalHudTextSolid(textures, danger, 20, 33);
-    auto red = std::uint8_t{255U};
-    auto green = std::uint8_t{100U};
-    auto blue = std::uint8_t{100U};
-    if (hud.dangerCritical()) {
-      const auto phase = static_cast<double>(hud.tick() & 15U) *
-                         (2.0 * std::numbers::pi / 16.0);
-      red = static_cast<std::uint8_t>(
-          std::lround((std::cos(phase) + 1.0) * 127.5));
-      green = 0U;
-      blue = 0U;
+    if (hud.dangerReveal() != 0U) {
+      const auto danger = game::localizeTextCopy("DANGER");
+      drawOriginalHudTextSolid(textures, danger, 20, 33);
+      auto red = std::uint8_t{255U};
+      auto green = std::uint8_t{100U};
+      auto blue = std::uint8_t{100U};
+      if (hud.dangerCritical()) {
+        const auto phase = static_cast<double>(hud.tick() & 15U) *
+                           (2.0 * std::numbers::pi / 16.0);
+        red = static_cast<std::uint8_t>(
+            std::lround((std::cos(phase) + 1.0) * 127.5));
+        green = 0U;
+        blue = 0U;
+      }
+      drawOriginalStatusBar(41, hud.displayedDangerBar(), hud.dangerReveal(),
+                            red, green, blue, 0, 0);
     }
-    drawOriginalStatusBar(41, hud.displayedDangerBar(), hud.dangerReveal(),
-                          red, green, blue, 0, 0);
-  }
 
-  if (hud.targetReveal() != 0U) {
-    const auto target = game::localizeTextCopy("TARGET");
-    drawOriginalHudTextSolid(textures, target, 20, 48);
-    drawOriginalStatusBar(56, hud.displayedTargetBar(), hud.targetReveal(),
-                          100U, 255U, 100U, 0, 0);
+    if (hud.targetReveal() != 0U) {
+      const auto target = game::localizeTextCopy("TARGET");
+      drawOriginalHudTextSolid(textures, target, 20, 48);
+      drawOriginalStatusBar(56, hud.displayedTargetBar(), hud.targetReveal(),
+                            100U, 255U, 100U, 0, 0);
+    }
+    drawOriginalStatusScale(0, 0);
   }
-  drawOriginalStatusScale(0, 0);
   DrawSync(0);
   drawSf2GuestRadar(
       diagnostics, game::originalRadarGeometry(hud.revealFrame()));
-  if (diagnostics.mission_timer_visible &&
-      diagnostics.mission_timer_ticks > 0) {
-    constexpr auto retail_timer_ticks_per_second = 20U;
-    const auto seconds =
-        (static_cast<unsigned int>(diagnostics.mission_timer_ticks) +
-         retail_timer_ticks_per_second - 1U) /
-        retail_timer_ticks_per_second;
-    const auto minutes = seconds / 60U;
-    const auto remainder = seconds % 60U;
-    auto timer = std::to_string(minutes);
-    timer.push_back(':');
-    if (remainder < 10U) {
-      timer.push_back('0');
-    }
-    timer += std::to_string(remainder);
+  if (diagnostics.mission_timer_visible) {
+    const auto timer = std::string{diagnostics.mission_timer_text.data()};
     constexpr auto radar_center_x = 39;
     drawOriginalHudTextSolid(
         textures, timer,
@@ -13693,12 +13795,29 @@ void drawSf2GuestHud(const HudTextureAtlas &textures,
     constexpr int ammo_y = screen_height / 2 + 94;
     drawOriginalHudText(textures, ammo, ammo_x + horizontal_slide, ammo_y);
   }
-  if (objective_complete_visible) {
-    const auto complete =
-        game::localizeTextCopy("PRIMARY MISSION OBJECTIVE COMPLETE");
-    drawOriginalHudTextSolid(
-        textures, complete,
-        (screen_width - game::originalHudTextWidth(complete)) / 2, 92, 255U);
+  if (!status_message.empty() || objective_complete_visible) {
+    const auto complete = !status_message.empty()
+                              ? game::localizeTextCopy(status_message)
+                              : game::localizeTextCopy(
+                                    "PRIMARY MISSION OBJECTIVE COMPLETE");
+    auto line_start = std::size_t{};
+    auto line_y = 92;
+    while (line_start <= complete.size()) {
+      const auto line_end = complete.find('\n', line_start);
+      const auto line = std::string_view{complete}.substr(
+          line_start, line_end == std::string::npos
+                          ? std::string::npos
+                          : line_end - line_start);
+      drawOriginalHudTextSolid(
+          textures, line,
+          (screen_width - game::originalHudTextWidth(line)) / 2, line_y,
+          255U);
+      if (line_end == std::string::npos) {
+        break;
+      }
+      line_start = line_end + 1U;
+      line_y += 16;
+    }
   }
   if (!pickup_message.empty()) {
     const auto localized = game::localizeTextCopy(pickup_message);
@@ -13716,6 +13835,9 @@ SceneViewerResult runSf2GuestScene(
     std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
     const KeyboardMouseBindings &input,
     game::GameplaySession &native_residency) {
+  struct NativeFramebufferPageReset {
+    ~NativeFramebufferPageReset() { GR_SetNativeFramebufferPage(0); }
+  } native_framebuffer_page_reset;
   game::Sf2GuestMissionRuntime runtime{cue_path, mission.definition().index};
   if (!runtime.ready()) {
     const auto detail = runtime.faultDetail();
@@ -13799,6 +13921,9 @@ SceneViewerResult runSf2GuestScene(
   auto pending_texture_room_frames = 0U;
   auto presented_frames = std::uint64_t{};
   auto screenshot_captured = false;
+  auto retained_world_frame =
+      std::shared_ptr<const game::Sf2PresentationFrame>{};
+  auto quick_state_retained_world_frame = retained_world_frame;
   // The native HUD supplements retail's direct GP0 world publication. Hide
   // it during the initial authored camera sequence, but do not derive that
   // presentation state from the retail clock forever: checkpoint restart
@@ -13823,7 +13948,20 @@ SceneViewerResult runSf2GuestScene(
   auto quick_state_pickup_message_frames = 0U;
   auto pickup_message = std::string{};
   auto quick_state_pickup_message = std::string{};
+  auto pickup_message_queue = std::vector<std::string>{};
+  auto quick_state_pickup_message_queue = std::vector<std::string>{};
+  auto status_message_frames = 0U;
+  auto quick_state_status_message_frames = 0U;
+  auto status_message = std::string{};
+  auto quick_state_status_message = std::string{};
+  auto status_message_queue = std::vector<std::string>{};
+  auto quick_state_status_message_queue = std::vector<std::string>{};
+  auto ui_text_event_count = runtime.diagnostics().ui_text_event_count;
+  auto quick_state_ui_text_event_count = ui_text_event_count;
+  auto last_ui_create_guest_frame = std::uint64_t{};
+  auto quick_state_last_ui_create_guest_frame = std::uint64_t{};
   auto pickup_capture_pending = false;
+  auto ui_text_capture_pending = false;
   auto previous_guest_armor = runtime.diagnostics().player_armor;
   auto quick_state_previous_guest_armor = previous_guest_armor;
   struct ObjectiveAutoplayState {
@@ -13832,6 +13970,7 @@ SceneViewerResult runSf2GuestScene(
     double heading{};
     std::size_t waypoint{};
     std::uint64_t loot_frame{};
+    std::uint32_t truck_guard_frames{};
     std::uint16_t initial_armor{};
     std::array<std::uint32_t, 2U> initial_owned_items{};
     bool heading_known{};
@@ -13855,11 +13994,20 @@ SceneViewerResult runSf2GuestScene(
                ? std::optional<std::uint64_t>{parsed}
                : std::nullopt;
   };
+  const auto diagnostic_path = [](const char *name)
+      -> std::optional<std::filesystem::path> {
+    const auto *value = SDL_getenv(name);
+    return value != nullptr && *value != '\0'
+               ? std::optional<std::filesystem::path>{value}
+               : std::nullopt;
+  };
   const auto screenshot_frame = diagnostic_frame("SF2_CAPTURE_FRAME");
   const auto screenshot_capture_count = static_cast<unsigned int>(
       std::clamp<std::uint64_t>(
           diagnostic_frame("SF2_CAPTURE_COUNT").value_or(1U), 1U, 8U));
   auto screenshot_captures = 0U;
+  const auto dump_presentation_on_capture =
+      diagnostic_frame("SF2_DUMP_PRESENTATION_ON_CAPTURE").value_or(0U) != 0U;
   const auto automatic_objective =
       diagnostic_frame("SF2_AUTOPLAY_OBJECTIVE").value_or(0U) != 0U;
   const auto automatic_objective_skip =
@@ -13870,10 +14018,86 @@ SceneViewerResult runSf2GuestScene(
       diagnostic_frame("SF2_QUICK_LOAD_FRAME");
   const auto automatic_exit_frame =
       diagnostic_frame("SF2_EXIT_FRAME");
+  const auto automatic_exit_clock =
+      diagnostic_frame("SF2_EXIT_CLOCK");
+  const std::array ram_dump_clocks{
+      diagnostic_frame("SF2_DUMP_RAM_CLOCK_A"),
+      diagnostic_frame("SF2_DUMP_RAM_CLOCK_B")};
+  std::array<bool, ram_dump_clocks.size()> ram_dump_completed{};
   const auto automatic_objective_overlay_frame =
       diagnostic_frame("SF2_FORCE_OBJECTIVE_FRAME");
   const auto capture_on_pickup =
       diagnostic_frame("SF2_CAPTURE_ON_PICKUP").value_or(0U) != 0U;
+  const auto capture_on_ui_text =
+      diagnostic_frame("SF2_CAPTURE_ON_UI_TEXT").value_or(0U) != 0U;
+  const auto input_record_path = diagnostic_path("SF2_RECORD_INPUT");
+  const auto input_replay_path = diagnostic_path("SF2_REPLAY_INPUT");
+  const auto pin_recording_health =
+      diagnostic_frame("SF2_PIN_HEALTH").value_or(0U) != 0U;
+  const auto trace_presentation =
+      diagnostic_frame("SF2_TRACE_PRESENTATION").value_or(0U) != 0U;
+  const auto disable_native_hud =
+      diagnostic_frame("SF2_DISABLE_NATIVE_HUD").value_or(0U) != 0U;
+  const auto disable_retail_auxiliary_ui =
+      diagnostic_frame("SF2_DISABLE_RETAIL_AUX_UI").value_or(0U) != 0U;
+  runtime.setRetailAuxiliaryUiEnabled(!disable_retail_auxiliary_ui);
+  auto traced_presentation_sequence = std::uint64_t{};
+  auto traced_gpu_submissions = std::uint64_t{};
+  auto drawn_presentation_sequence = std::uint64_t{};
+  auto input_record = std::ofstream{};
+  if (input_record_path) {
+    input_record.open(*input_record_path, std::ios::out | std::ios::trunc);
+    if (input_record) {
+      input_record << "SF2PAD1 " << mission.definition().index << '\n';
+      input_record.flush();
+      PsyX_Log_Info("SF2 input recording: path=%s pin-health=%u\n",
+                    input_record_path->string().c_str(),
+                    pin_recording_health ? 1U : 0U);
+    } else {
+      PsyX_Log_Error("SF2 input recording open failed: path=%s\n",
+                     input_record_path->string().c_str());
+    }
+  }
+  auto input_replay = std::vector<game::LegacyHostPadState>{};
+  auto input_replay_index = std::size_t{};
+  if (input_replay_path) {
+    auto replay = std::ifstream{*input_replay_path};
+    auto magic = std::string{};
+    auto recorded_mission = std::uint32_t{};
+    if (!(replay >> magic >> recorded_mission) || magic != "SF2PAD1" ||
+        recorded_mission != mission.definition().index) {
+      PsyX_Log_Error(
+          "SF2 input replay rejected: path=%s mission=%u expected=%u\n",
+          input_replay_path->string().c_str(), recorded_mission,
+          mission.definition().index);
+    } else {
+      for (;;) {
+        auto buttons_value = unsigned int{};
+        auto face_value = unsigned int{};
+        auto explicit_value = unsigned int{};
+        auto left_x = unsigned int{};
+        auto left_y = unsigned int{};
+        auto right_x = unsigned int{};
+        auto right_y = unsigned int{};
+        if (!(replay >> buttons_value >> face_value >> explicit_value >> left_x >>
+              left_y >> right_x >> right_y)) {
+          break;
+        }
+        input_replay.push_back(game::LegacyHostPadState{
+            .buttons = static_cast<std::uint16_t>(buttons_value),
+            .face_axis_buttons = static_cast<std::uint16_t>(face_value),
+            .use_explicit_face_axis_buttons = explicit_value != 0U,
+            .left_x = static_cast<std::uint8_t>(left_x),
+            .left_y = static_cast<std::uint8_t>(left_y),
+            .right_x = static_cast<std::uint8_t>(right_x),
+            .right_y = static_cast<std::uint8_t>(right_y),
+        });
+      }
+      PsyX_Log_Info("SF2 input replay: path=%s samples=%zu pin-health=%u\n",
+                    input_replay_path->string().c_str(), input_replay.size(),
+                    pin_recording_health ? 1U : 0U);
+    }
+  }
   const auto exit_on_capture =
       diagnostic_frame("SF2_EXIT_ON_CAPTURE").value_or(0U) != 0U;
   auto automatic_quick_save_completed = false;
@@ -13931,6 +14155,13 @@ SceneViewerResult runSf2GuestScene(
         quick_state_objective_complete_frames = objective_complete_frames;
         quick_state_pickup_message_frames = pickup_message_frames;
         quick_state_pickup_message = pickup_message;
+        quick_state_pickup_message_queue = pickup_message_queue;
+        quick_state_status_message_frames = status_message_frames;
+        quick_state_status_message = status_message;
+        quick_state_status_message_queue = status_message_queue;
+        quick_state_ui_text_event_count = ui_text_event_count;
+        quick_state_last_ui_create_guest_frame = last_ui_create_guest_frame;
+        quick_state_retained_world_frame = retained_world_frame;
         quick_state_previous_guest_armor = previous_guest_armor;
         if (automatic_objective) {
           quick_state_objective_autoplay = objective_autoplay;
@@ -13961,6 +14192,13 @@ SceneViewerResult runSf2GuestScene(
         objective_complete_frames = quick_state_objective_complete_frames;
         pickup_message_frames = quick_state_pickup_message_frames;
         pickup_message = quick_state_pickup_message;
+        pickup_message_queue = quick_state_pickup_message_queue;
+        status_message_frames = quick_state_status_message_frames;
+        status_message = quick_state_status_message;
+        status_message_queue = quick_state_status_message_queue;
+        ui_text_event_count = quick_state_ui_text_event_count;
+        last_ui_create_guest_frame = quick_state_last_ui_create_guest_frame;
+        retained_world_frame = quick_state_retained_world_frame;
         previous_guest_armor = quick_state_previous_guest_armor;
         if (automatic_objective && quick_state_objective_autoplay) {
           objective_autoplay = *quick_state_objective_autoplay;
@@ -13977,6 +14215,7 @@ SceneViewerResult runSf2GuestScene(
             restored.objective_completion_events;
         pickup_presentation_events =
             restored.pickup_presentation_events;
+        ui_text_event_count = restored.ui_text_event_count;
         previous_guest_armor = restored.player_armor;
         checkpoint_restores = restored.checkpoint_restores;
         guest_room = restored.guest_current_room;
@@ -14151,7 +14390,7 @@ SceneViewerResult runSf2GuestScene(
         .quick_turn = raw.quick_turn,
     };
     if (automatic_objective && presented_frames >= 800U) {
-      static_cast<void>(runtime.setPlayerHealthForProbe(1000U));
+      static_cast<void>(runtime.setPlayerHealthForProbe(150U));
       const auto player = runtime.diagnostics();
       if (!objective_autoplay.baseline_captured) {
         objective_autoplay.initial_armor = player.player_armor;
@@ -14215,6 +14454,17 @@ SceneViewerResult runSf2GuestScene(
               !objective_autoplay.looted &&
               objective_autoplay.waypoint == 2U && distance <= 340.0,
       };
+      if (!objective_autoplay.looted && objective_autoplay.waypoint == 1U &&
+          distance <= 2000.0 && objective_autoplay.truck_guard_frames < 180U) {
+        // The guard at the room-boundary bottleneck can body-block the
+        // deterministic route indefinitely and make Gabe spin between rooms
+        // 21 and 22. Use his starting knife through the retail lock/fire path
+        // at that exact waypoint, then continue normally to the truck bed.
+        ++objective_autoplay.truck_guard_frames;
+        guest_input.move = distance > 300.0 ? 0.5 : 0.0;
+        guest_input.target_lock_held = true;
+        guest_input.fire_held = true;
+      }
       if (objective_autoplay.heading_known) {
         constexpr auto pi = 3.14159265358979323846;
         auto error =
@@ -14254,12 +14504,36 @@ SceneViewerResult runSf2GuestScene(
     }
     host_pad.right_x = pad.analog[0];
     host_pad.right_y = pad.analog[1];
-    runtime.setHostPadState(host_pad);
     previous_buttons = buttons;
 
     auto updates = 0U;
     while (updates < maximum_updates &&
            simulation_accumulator + 1.0e-9 >= simulation_step) {
+      auto sampled_pad = host_pad;
+      if (!input_replay.empty()) {
+        if (input_replay_index >= input_replay.size()) {
+          PsyX_Log_Info("SF2 input replay completed: samples=%zu\n",
+                        input_replay.size());
+          return SceneViewerResult{
+              readButtons(pad), SceneExitReason::return_to_title};
+        }
+        sampled_pad = input_replay[input_replay_index++];
+      }
+      runtime.setHostPadState(sampled_pad);
+      if (input_record) {
+        input_record << sampled_pad.buttons << ' '
+                     << sampled_pad.face_axis_buttons << ' '
+                     << (sampled_pad.use_explicit_face_axis_buttons ? 1U : 0U)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.left_x)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.left_y)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.right_x)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.right_y)
+                     << '\n';
+        input_record.flush();
+      }
+      if (pin_recording_health) {
+        static_cast<void>(runtime.setPlayerHealthForProbe(150U));
+      }
       if (!runtime.advanceHostUpdate()) {
         const auto detail = runtime.faultDetail();
         PsyX_Log_Error("SF2 guest runtime stopped: %.*s\n",
@@ -14267,6 +14541,13 @@ SceneViewerResult runSf2GuestScene(
         mouse_capture.set(false);
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
+      }
+      // A slow host frame can execute several fixed guest updates in one
+      // catch-up batch. Drain PCM after each update rather than after the
+      // whole batch so the bounded gameplay FIFO never mistakes ordinary
+      // host catch-up for runaway guest audio production.
+      while (const auto count = runtime.takePcm(pcm)) {
+        audio.queue(std::span<const psx::SpuPcmFrame>{pcm}.first(count));
       }
       simulation_accumulator =
           std::max(0.0, simulation_accumulator - simulation_step);
@@ -14303,13 +14584,111 @@ SceneViewerResult runSf2GuestScene(
         audio.reset("sf2-checkpoint-restore");
         checkpoint_restores = completed_restores;
       }
-      while (const auto count = runtime.takePcm(pcm)) {
-        audio.queue(std::span<const psx::SpuPcmFrame>{pcm}.first(count));
-      }
     }
     audio.update();
     if (const auto &frame = runtime.presentationFrame()) {
       const auto diagnostics = runtime.diagnostics();
+      for (auto index = std::size_t{}; index < ram_dump_clocks.size();
+           ++index) {
+        if (!ram_dump_clocks[index] || ram_dump_completed[index] ||
+            diagnostics.system_clock < *ram_dump_clocks[index]) {
+          continue;
+        }
+        std::vector<std::byte> ram(psx::R3000Runtime::ram_size);
+        const auto path = std::filesystem::path{"build"} /
+                          ("sf2-ram-clock-" +
+                           std::to_string(*ram_dump_clocks[index]) + ".bin");
+        auto output = std::ofstream{path, std::ios::binary | std::ios::trunc};
+        if (runtime.copyGuestRamForProbe(ram) && output &&
+            output.write(reinterpret_cast<const char *>(ram.data()),
+                         static_cast<std::streamsize>(ram.size()))) {
+          PsyX_Log_Info("SF2 guest RAM dump: clock=%u path=%s\n",
+                        diagnostics.system_clock, path.string().c_str());
+        } else {
+          PsyX_Log_Error("SF2 guest RAM dump failed: clock=%u path=%s\n",
+                         diagnostics.system_clock, path.string().c_str());
+        }
+        ram_dump_completed[index] = true;
+      }
+      if (trace_presentation &&
+          diagnostics.observed_gpu_submissions != traced_gpu_submissions) {
+        PsyX_Log_Info(
+            "SF2 raw submission: serial=%llu clock=%u root=0x%08X "
+            "packets=%zu draws=%zu copies=%zu uploads=%zu "
+            "copy=%u,%u->%u,%u+%ux%u draw-buffer=%u build-buffer=%u "
+            "draw-range=0x%08X..0x%08X text-render=%llu/%llu "
+            "0x%08X/f%04X/lists=%08X,%08X,%08X\n",
+            static_cast<unsigned long long>(
+                diagnostics.observed_gpu_submissions),
+            diagnostics.last_gpu_submission_clock,
+            diagnostics.last_gpu_submission_root,
+            diagnostics.last_gpu_submission_packet_count,
+            diagnostics.last_gpu_submission_draw_count,
+            diagnostics.last_gpu_submission_copy_count,
+            diagnostics.last_gpu_submission_upload_count,
+            diagnostics.last_gpu_submission_copy_source_x,
+            diagnostics.last_gpu_submission_copy_source_y,
+            diagnostics.last_gpu_submission_copy.x,
+            diagnostics.last_gpu_submission_copy.y,
+            diagnostics.last_gpu_submission_copy.width,
+            diagnostics.last_gpu_submission_copy.height,
+            diagnostics.last_gpu_submission_draw_buffer,
+            diagnostics.last_gpu_submission_build_buffer,
+            diagnostics.last_gpu_submission_first_draw_packet,
+            diagnostics.last_gpu_submission_last_draw_packet,
+            static_cast<unsigned long long>(
+                diagnostics.text_renderer_calls[0U]),
+            static_cast<unsigned long long>(
+                diagnostics.text_renderer_calls[1U]),
+            diagnostics.text_renderer, diagnostics.text_renderer_flags,
+            diagnostics.text_renderer_list_heads[0U],
+            diagnostics.text_renderer_list_heads[1U],
+            diagnostics.text_renderer_list_heads[2U]);
+        if (diagnostics.hud_primitive_registrations != 0U) {
+          std::fprintf(stderr, "  HUD primitive registrations: %llu",
+                       static_cast<unsigned long long>(
+                           diagnostics.hud_primitive_registrations));
+          for (auto index = std::size_t{};
+               index < diagnostics.hud_primitive_registration_callers.size();
+               ++index) {
+            if (diagnostics.hud_primitive_registration_callers[index] == 0U) {
+              continue;
+            }
+            std::fprintf(
+                stderr, " %08X>%08X:%08X/%llu/m%02X",
+                diagnostics.hud_primitive_registration_callers[index],
+                diagnostics.hud_primitive_registration_roots[index],
+                diagnostics.hud_primitive_registration_packets[index],
+                static_cast<unsigned long long>(
+                    diagnostics.hud_primitive_registration_counts[index]),
+                static_cast<unsigned int>(
+                    diagnostics.hud_primitive_registration_buffer_masks[index]));
+          }
+          std::fputc('\n', stderr);
+        }
+        if (diagnostics.hud_primitive_writes != 0U) {
+          std::fprintf(stderr, "  HUD primitive writers: %llu",
+                       static_cast<unsigned long long>(
+                           diagnostics.hud_primitive_writes));
+          for (auto index = std::size_t{};
+               index < diagnostics.hud_primitive_writer_pcs.size(); ++index) {
+            if (diagnostics.hud_primitive_writer_pcs[index] == 0U) {
+              continue;
+            }
+            std::fprintf(
+                stderr, " %08X>%08X:%08X/%llu/m%02X",
+                diagnostics.hud_primitive_writer_pcs[index],
+                diagnostics.hud_primitive_writer_addresses[index],
+                diagnostics.hud_primitive_writer_instructions[index],
+                static_cast<unsigned long long>(
+                    diagnostics.hud_primitive_writer_counts[index]),
+                static_cast<unsigned int>(
+                    diagnostics.hud_primitive_writer_buffer_masks[index]));
+          }
+          std::fputc('\n', stderr);
+        }
+        traced_gpu_submissions = diagnostics.observed_gpu_submissions;
+      }
       if (diagnostics.renderer_text_repairs != renderer_text_repairs) {
         PsyX_Log_Info(
             "SF2 resident renderer repaired: count=%llu address=0x%08X "
@@ -14551,6 +14930,77 @@ SceneViewerResult runSf2GuestScene(
         pending_texture_room_frames = 0U;
       }
       game::projectSf2GuestHud(guest_hud, diagnostics, raw.aim);
+      if (diagnostics.ui_text_event_count > ui_text_event_count) {
+        const auto oldest_retained =
+            diagnostics.ui_text_event_count > diagnostics.ui_text_events.size()
+                ? diagnostics.ui_text_event_count -
+                      diagnostics.ui_text_events.size()
+                : 0U;
+        const auto first = std::max(ui_text_event_count, oldest_retained);
+        const auto enqueue = [](std::string message,
+                                std::string &current,
+                                unsigned int &frames,
+                                std::vector<std::string> &queue,
+                                unsigned int duration) {
+          if (message.empty() || current == message ||
+              std::ranges::find(queue, message) != queue.end()) {
+            return;
+          }
+          if (current.empty() || frames == 0U) {
+            current = std::move(message);
+            frames = duration;
+          } else if (queue.size() < 16U) {
+            queue.push_back(std::move(message));
+          }
+        };
+        auto last_status_guest_frame = std::optional<std::uint64_t>{};
+        for (auto serial = first;
+             serial < diagnostics.ui_text_event_count; ++serial) {
+          const auto &event = diagnostics.ui_text_events[
+              serial % diagnostics.ui_text_events.size()];
+          if (event.kind != game::Sf2GuestUiTextEventKind::create ||
+              event.text[0U] == '\0') {
+            continue;
+          }
+          const auto end = std::ranges::find(event.text, '\0');
+          auto message = std::string{event.text.begin(), end};
+          PsyX_Log_Info(
+              "SF2 UI text: serial=%llu guest=%llu template=%u text=\"%s\"\n",
+              static_cast<unsigned long long>(serial),
+              static_cast<unsigned long long>(event.guest_frame),
+              event.arguments[0U], message.c_str());
+          last_ui_create_guest_frame =
+              std::max(last_ui_create_guest_frame, event.guest_frame);
+          ui_text_capture_pending =
+              ui_text_capture_pending || capture_on_ui_text;
+          // Retail uses template zero for both pickup notices and authored
+          // failure text, so the template alone is not a presentation class.
+          // Pickup notifications are the exact English retail strings ending
+          // in " taken"; every other create belongs to the centred status
+          // channel. Consecutive status creates on one guest frame are the
+          // retail multi-line form (for example Objective Failed + reason).
+          if (message.ends_with(" taken")) {
+            constexpr auto pickup_message_duration = 120U;
+            enqueue(std::move(message), pickup_message,
+                    pickup_message_frames, pickup_message_queue,
+                    pickup_message_duration);
+          } else {
+            constexpr auto status_message_duration = 180U;
+            if (last_status_guest_frame == event.guest_frame &&
+                !status_message.empty() && status_message_frames != 0U) {
+              status_message.push_back('\n');
+              status_message.append(message);
+              status_message_frames = status_message_duration;
+            } else {
+              enqueue(std::move(message), status_message,
+                      status_message_frames, status_message_queue,
+                      status_message_duration);
+            }
+            last_status_guest_frame = event.guest_frame;
+          }
+        }
+      }
+      ui_text_event_count = diagnostics.ui_text_event_count;
       if (diagnostics.objective_completion_events >
           objective_completion_events) {
         constexpr auto objective_complete_duration = 180U;
@@ -14595,6 +15045,12 @@ SceneViewerResult runSf2GuestScene(
       const auto hud_clock_fallback = diagnostics.system_clock >= 300U;
       if (!guest_hud_visible &&
           (hud_scene_handoff || hud_clock_fallback)) {
+        // The direct TITLE-to-mission bootstrap can leave the retail map/menu
+        // composition in both persistent display pages. A checkpoint restart
+        // naturally overdraws it, but the initial in-scene handoff does not.
+        // Retire those pre-gameplay pixels exactly once when retail hands the
+        // camera to gameplay; subsequent HUD/text persistence remains intact.
+        GR_ClearNativeFramebufferPages();
         PsyX_Log_Info(
             "SF2 guest HUD activated: frame=%llu clock=%u source=%s\n",
             static_cast<unsigned long long>(frame->guest_frame),
@@ -14610,16 +15066,182 @@ SceneViewerResult runSf2GuestScene(
       }
       const auto capture_screenshot =
           !screenshot_captured &&
-          (pickup_capture_pending ||
+          (pickup_capture_pending || ui_text_capture_pending ||
            (screenshot_frame &&
             presented_frames >=
                 *screenshot_frame + screenshot_captures));
-      beginSf2GuestFrame();
-      drawSf2GuestFrame(*frame, texture_bank);
+      const auto recent_guest_ui_text =
+          last_ui_create_guest_frame != 0U &&
+          frame->guest_frame >= last_ui_create_guest_frame &&
+          frame->guest_frame - last_ui_create_guest_frame <= 360U;
+      const auto guest_ui_overlay = false;
+      if (trace_presentation &&
+          frame->sequence != traced_presentation_sequence) {
+        auto display_start = std::uint32_t{0xffffffffU};
+        for (const auto command : frame->gp1_words) {
+          if ((command >> 24U) == 0x05U) {
+            display_start = command & 0x00ffffffU;
+          }
+        }
+        PsyX_Log_Info(
+            "SF2 presentation: presented=%llu sequence=%llu guest=%llu "
+            "clock=%u packets=%zu draws=%zu words=%zu ui-events=%llu "
+            "last-ui=%llu recent=%u composite=%u gp1=%zu flip=0x%06X "
+            "segments=%zu bank=%u retail-gp=0x%08X retail-buffers=%u/%u\n",
+            static_cast<unsigned long long>(presented_frames),
+            static_cast<unsigned long long>(frame->sequence),
+            static_cast<unsigned long long>(frame->guest_frame),
+            diagnostics.system_clock, frame->packets.size(),
+            frame->draw_command_count, frame->gp0_word_count,
+            static_cast<unsigned long long>(diagnostics.ui_text_event_count),
+            static_cast<unsigned long long>(last_ui_create_guest_frame),
+            recent_guest_ui_text ? 1U : 0U,
+            guest_ui_overlay ? 1U : 0U, frame->gp1_words.size(),
+            display_start, frame->submission_packet_ends.size(),
+            texture_bank, frame->retail_global_pointer,
+            frame->retail_draw_buffer_index,
+            frame->retail_display_buffer_index);
+        auto segment_begin = std::size_t{};
+        auto inherited_e1 = std::uint32_t{};
+        auto inherited_e3 = std::uint32_t{};
+        auto inherited_e4 = std::uint32_t{};
+        auto inherited_e5 = std::uint32_t{};
+        for (auto segment = std::size_t{};
+             segment < frame->submission_packet_ends.size(); ++segment) {
+          const auto segment_end = frame->submission_packet_ends[segment];
+          auto sprites = std::size_t{};
+          auto tiles = std::size_t{};
+          auto textured_polygons = std::size_t{};
+          auto fills = std::size_t{};
+          auto first_fill_x = std::uint16_t{};
+          auto first_fill_y = std::uint16_t{};
+          auto first_fill_width = std::uint16_t{};
+          auto first_fill_height = std::uint16_t{};
+          auto first_fill_valid = false;
+          auto largest_tile_x = std::int16_t{};
+          auto largest_tile_y = std::int16_t{};
+          auto largest_tile_width = std::uint16_t{};
+          auto largest_tile_height = std::uint16_t{};
+          auto largest_tile_area = std::uint32_t{};
+          auto first_clut = std::uint16_t{};
+          auto first_clut_valid = false;
+          for (auto packet_index = segment_begin;
+               packet_index < segment_end; ++packet_index) {
+            const auto &packet = frame->packets[packet_index];
+            if (packet.gp0_words.empty()) {
+              continue;
+            }
+            const auto opcode = static_cast<std::uint8_t>(
+                packet.gp0_words.front() >> 24U);
+            const auto base = static_cast<std::uint8_t>(opcode & 0xfcU);
+            if (opcode == 0xe1U) {
+              inherited_e1 = packet.gp0_words.front();
+            } else if (opcode == 0xe3U) {
+              inherited_e3 = packet.gp0_words.front();
+            } else if (opcode == 0xe4U) {
+              inherited_e4 = packet.gp0_words.front();
+            } else if (opcode == 0xe5U) {
+              inherited_e5 = packet.gp0_words.front();
+            } else if (opcode == 0x02U &&
+                       packet.gp0_words.size() >= 3U) {
+              ++fills;
+              if (!first_fill_valid) {
+                const auto origin = packet.gp0_words[1U];
+                const auto extent = packet.gp0_words[2U];
+                first_fill_x = static_cast<std::uint16_t>(origin & 0x3ffU);
+                first_fill_y = static_cast<std::uint16_t>(
+                    (origin >> 16U) & 0x1ffU);
+                first_fill_width = static_cast<std::uint16_t>(
+                    extent & 0x3ffU);
+                first_fill_height = static_cast<std::uint16_t>(
+                    (extent >> 16U) & 0x1ffU);
+                first_fill_valid = true;
+              }
+            } else if (base == 0x64U || base == 0x74U ||
+                       base == 0x7cU) {
+              ++sprites;
+              if (!first_clut_valid && packet.gp0_words.size() >= 3U) {
+                first_clut = static_cast<std::uint16_t>(
+                    packet.gp0_words[2U] >> 16U);
+                first_clut_valid = true;
+              }
+            } else if (base == 0x60U || base == 0x68U ||
+                       base == 0x70U || base == 0x78U) {
+              ++tiles;
+              if (base == 0x60U && packet.gp0_words.size() >= 3U) {
+                const auto origin = packet.gp0_words[1U];
+                const auto extent = packet.gp0_words[2U];
+                const auto width = static_cast<std::uint16_t>(
+                    extent & 0xffffU);
+                const auto height = static_cast<std::uint16_t>(
+                    extent >> 16U);
+                const auto area = static_cast<std::uint32_t>(width) *
+                                  static_cast<std::uint32_t>(height);
+                if (area > largest_tile_area) {
+                  largest_tile_area = area;
+                  largest_tile_x = static_cast<std::int16_t>(origin);
+                  largest_tile_y = static_cast<std::int16_t>(origin >> 16U);
+                  largest_tile_width = width;
+                  largest_tile_height = height;
+                }
+              }
+            } else if (base == 0x24U || base == 0x2cU ||
+                       base == 0x34U || base == 0x3cU) {
+              ++textured_polygons;
+            }
+          }
+          const auto root =
+              segment < frame->submission_roots.size()
+                  ? frame->submission_roots[segment]
+                  : 0U;
+          const auto draws =
+              segment < frame->submission_draw_counts.size()
+                  ? frame->submission_draw_counts[segment]
+                  : 0U;
+          const auto draw_x0 = inherited_e3 & 0x3ffU;
+          const auto draw_y0 = (inherited_e3 >> 10U) & 0x1ffU;
+          const auto draw_x1 = inherited_e4 & 0x3ffU;
+          const auto draw_y1 = (inherited_e4 >> 10U) & 0x1ffU;
+          const auto signed_11 = [](std::uint32_t value) {
+            value &= 0x7ffU;
+            return static_cast<std::int32_t>(
+                (value & 0x400U) != 0U ? value | 0xfffff800U : value);
+          };
+          const auto draw_offset_x = signed_11(inherited_e5);
+          const auto draw_offset_y = signed_11(inherited_e5 >> 11U);
+          PsyX_Log_Info(
+              "SF2 presentation segment: index=%zu root=0x%08X "
+              "draws=%zu sprites=%zu tiles=%zu textured=%zu "
+              "e1=0x%08X e3=0x%08X e4=0x%08X e5=0x%08X "
+              "area=%u,%u-%u,%u offset=%d,%d clut=0x%04X "
+              "fills=%zu fill=%u,%u+%ux%u tile=%d,%d+%ux%u\n",
+              segment, root, draws, sprites, tiles,
+              textured_polygons, inherited_e1, inherited_e3,
+              inherited_e4, inherited_e5, draw_x0, draw_y0,
+              draw_x1, draw_y1, draw_offset_x, draw_offset_y,
+              first_clut_valid ? first_clut : 0U, fills,
+              first_fill_valid ? first_fill_x : 0U,
+              first_fill_valid ? first_fill_y : 0U,
+              first_fill_valid ? first_fill_width : 0U,
+              first_fill_valid ? first_fill_height : 0U,
+              largest_tile_x, largest_tile_y, largest_tile_width,
+              largest_tile_height);
+          segment_begin = segment_end;
+        }
+        traced_presentation_sequence = frame->sequence;
+      }
+      const auto fresh_presentation =
+          frame->sequence != drawn_presentation_sequence;
+      retained_world_frame = frame;
+      beginSf2GuestFrame(sf2GuestFramebufferPage(*frame), fresh_presentation);
+      if (fresh_presentation) {
+        drawSf2GuestFrame(*frame, texture_bank);
+        drawn_presentation_sequence = frame->sequence;
+      }
       // The authored opening lasts roughly fifteen seconds. The retail HUD
       // callback is absent in this direct TITLE-to-mission path, so keep the
       // read-only native overlay hidden until the camera handoff.
-      if (guest_hud_visible) {
+      if (guest_hud_visible && fresh_presentation) {
         // The guest world publication replays its authored VRAM setup before
         // every draw. It can overwrite the native HUD residency without
         // changing the HUD's logical weapon/font state, so invalidate that
@@ -14629,17 +15251,42 @@ SceneViewerResult runSf2GuestScene(
             guest_hud, raw.aim,
             std::span<const game::LegacyDroppedItemBridgeState>{},
             std::span<const game::GameplayProjectile>{});
-        drawSf2GuestHud(hud_textures, guest_hud, diagnostics,
-                        objective_complete_frames != 0U,
-                        pickup_message_frames != 0U
-                            ? std::string_view{pickup_message}
-                            : std::string_view{});
+        // The runtime now composes every retail ordering table belonging to
+        // the same game tick before publication. Native HUD supplements can
+        // therefore draw once without guessing whether this was a sparse UI
+        // submission.
+        if (!disable_native_hud) {
+          drawSf2GuestHud(hud_textures, guest_hud, diagnostics, false,
+                          std::string_view{}, std::string_view{},
+                          guest_ui_overlay);
+        }
       }
       if (objective_complete_frames != 0U) {
         --objective_complete_frames;
       }
       if (pickup_message_frames != 0U) {
         --pickup_message_frames;
+        if (pickup_message_frames == 0U) {
+          pickup_message.clear();
+        }
+      }
+      if (pickup_message_frames == 0U && !pickup_message_queue.empty()) {
+        pickup_message = std::move(pickup_message_queue.front());
+        pickup_message_queue.erase(pickup_message_queue.begin());
+        constexpr auto pickup_message_duration = 120U;
+        pickup_message_frames = pickup_message_duration;
+      }
+      if (status_message_frames != 0U) {
+        --status_message_frames;
+        if (status_message_frames == 0U) {
+          status_message.clear();
+        }
+      }
+      if (status_message_frames == 0U && !status_message_queue.empty()) {
+        status_message = std::move(status_message_queue.front());
+        status_message_queue.erase(status_message_queue.begin());
+        constexpr auto status_message_duration = 180U;
+        status_message_frames = status_message_duration;
       }
       if (capture_screenshot) {
         std::array<std::size_t, 6U> command_kinds{};
@@ -14655,7 +15302,7 @@ SceneViewerResult runSf2GuestScene(
         PsyX_Log_Info(
             "SF2 capture frame: presented=%llu sequence=%llu guest=%llu "
             "clock=%u packets=%zu draws=%zu kinds=%zu/%zu/%zu/%zu/%zu/%zu "
-            "env=(%d,%d,%d,%d)/"
+            "composite=%u env=(%d,%d,%d,%d)/"
             "(%d,%d)/tpage=0x%04X dtd=%d\n",
             static_cast<unsigned long long>(presented_frames),
             static_cast<unsigned long long>(frame->sequence),
@@ -14663,13 +15310,19 @@ SceneViewerResult runSf2GuestScene(
             diagnostics.system_clock, frame->packets.size(),
             frame->draw_command_count, command_kinds[0U], command_kinds[1U],
             command_kinds[2U], command_kinds[3U], command_kinds[4U],
-            command_kinds[5U], captured_environment.clip.x,
+            command_kinds[5U], guest_ui_overlay ? 1U : 0U,
+            captured_environment.clip.x,
             captured_environment.clip.y, captured_environment.clip.w,
             captured_environment.clip.h, captured_environment.ofs[0],
             captured_environment.ofs[1], captured_environment.tpage,
             captured_environment.dtd);
+        if (dump_presentation_on_capture) {
+          dumpSf2PresentationFrame(*frame, presented_frames,
+                                   diagnostics.system_clock);
+        }
         PsyX_TakeScreenshot();
         pickup_capture_pending = false;
+        ui_text_capture_pending = false;
         if (screenshot_capture_count > 1U) {
           auto copy_error = std::error_code{};
           std::filesystem::copy_file(
@@ -14691,6 +15344,14 @@ SceneViewerResult runSf2GuestScene(
       if (automatic_exit_frame &&
           presented_frames >= *automatic_exit_frame) {
         PsyX_Log_Info("SF2 diagnostic exit: presented=%llu\n",
+                      static_cast<unsigned long long>(presented_frames));
+        return SceneViewerResult{
+            readButtons(pad), SceneExitReason::return_to_title};
+      }
+      if (automatic_exit_clock &&
+          diagnostics.system_clock >= *automatic_exit_clock) {
+        PsyX_Log_Info("SF2 diagnostic exit: clock=%u presented=%llu\n",
+                      diagnostics.system_clock,
                       static_cast<unsigned long long>(presented_frames));
         return SceneViewerResult{
             readButtons(pad), SceneExitReason::return_to_title};

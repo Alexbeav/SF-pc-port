@@ -64,6 +64,19 @@ struct Sf2PresentationFrame {
   std::uint32_t application_state{};
   std::uint32_t ordering_table_root{};
   std::vector<Sf2GpuPacket> packets;
+  // Exclusive packet ends for each retail ordering-table submission merged
+  // into this host publication. Native rendering must synchronize at these
+  // boundaries before later VRAM uploads can mutate texture residency.
+  std::vector<std::size_t> submission_packet_ends;
+  std::vector<std::uint32_t> submission_roots;
+  std::vector<std::size_t> submission_draw_counts;
+  std::uint32_t retail_global_pointer{};
+  std::uint16_t retail_draw_buffer_index{};
+  std::uint16_t retail_display_buffer_index{};
+  // Direct GP1 writes observed since the previous GPU boundary. Command 0x05
+  // changes the PS1 display-area start and is the authoritative page-flip
+  // signal; ordering-table submission alone is not a presentation boundary.
+  std::vector<std::uint32_t> gp1_words;
   std::size_t gp0_word_count{};
   std::size_t gpu_command_count{};
   std::size_t draw_command_count{};
@@ -104,6 +117,22 @@ struct Sf2GuestTimelineEvent {
   std::uint64_t guest_frame{};
   std::uint32_t system_clock{};
   std::array<std::uint32_t, 4U> arguments{};
+};
+
+enum class Sf2GuestUiTextEventKind : std::uint8_t {
+  create = 1U,
+  update,
+  remove,
+};
+
+struct Sf2GuestUiTextEvent {
+  Sf2GuestUiTextEventKind kind{};
+  std::uint64_t guest_frame{};
+  std::uint32_t system_clock{};
+  // Create records carry template/text/width/style. Update and remove retain
+  // the retail generation-tagged handle in argument zero.
+  std::array<std::uint32_t, 4U> arguments{};
+  std::array<char, 128U> text{};
 };
 
 struct Sf2GuestRadarActor {
@@ -209,6 +238,36 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_renderer_text_writer_pc{};
   std::uint32_t last_renderer_text_writer_instruction{};
   std::uint64_t rejected_renderer_ordering_tables{};
+  std::uint64_t observed_gpu_submissions{};
+  std::uint32_t last_gpu_submission_root{};
+  std::size_t last_gpu_submission_draw_count{};
+  std::size_t last_gpu_submission_packet_count{};
+  std::size_t last_gpu_submission_copy_count{};
+  std::size_t last_gpu_submission_upload_count{};
+  Sf2GpuTransfer last_gpu_submission_copy{};
+  std::uint16_t last_gpu_submission_copy_source_x{};
+  std::uint16_t last_gpu_submission_copy_source_y{};
+  std::uint32_t last_gpu_submission_clock{};
+  std::uint16_t last_gpu_submission_draw_buffer{};
+  std::uint16_t last_gpu_submission_build_buffer{};
+  std::uint32_t last_gpu_submission_first_draw_packet{};
+  std::uint32_t last_gpu_submission_last_draw_packet{};
+  std::array<std::uint64_t, 2U> text_renderer_calls{};
+  std::uint32_t text_renderer{};
+  std::uint16_t text_renderer_flags{};
+  std::array<std::uint32_t, 3U> text_renderer_list_heads{};
+  std::uint64_t hud_primitive_registrations{};
+  std::array<std::uint32_t, 8U> hud_primitive_registration_callers{};
+  std::array<std::uint32_t, 8U> hud_primitive_registration_packets{};
+  std::array<std::uint32_t, 8U> hud_primitive_registration_roots{};
+  std::array<std::uint64_t, 8U> hud_primitive_registration_counts{};
+  std::array<std::uint8_t, 8U> hud_primitive_registration_buffer_masks{};
+  std::uint64_t hud_primitive_writes{};
+  std::array<std::uint32_t, 12U> hud_primitive_writer_pcs{};
+  std::array<std::uint32_t, 12U> hud_primitive_writer_addresses{};
+  std::array<std::uint32_t, 12U> hud_primitive_writer_instructions{};
+  std::array<std::uint64_t, 12U> hud_primitive_writer_counts{};
+  std::array<std::uint8_t, 12U> hud_primitive_writer_buffer_masks{};
   std::uint32_t last_rejected_renderer_packet{};
   std::uint32_t last_rejected_renderer_root{};
   std::uint64_t last_rejected_renderer_frame{};
@@ -281,6 +340,9 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint8_t active_script_timer_count{};
   std::int16_t mission_timer_ticks{};
   bool mission_timer_visible{};
+  std::uint16_t mission_timer_handle{0xffffU};
+  std::array<char, 9U> mission_timer_text{};
+  std::uint64_t mission_timer_text_updates{};
   std::uint64_t scene_xa_archive_opens{};
   std::uint64_t scene_speech_starts{};
   std::uint64_t scene_speech_callbacks{};
@@ -312,6 +374,8 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t xa_stream_stops{};
   std::uint64_t timeline_event_count{};
   std::array<Sf2GuestTimelineEvent, 64U> timeline_events{};
+  std::uint64_t ui_text_event_count{};
+  std::array<Sf2GuestUiTextEvent, 64U> ui_text_events{};
   std::uint64_t async_file_services{};
   std::uint64_t async_file_completions{};
   std::uint32_t last_async_completion_caller{};
@@ -421,6 +485,8 @@ public:
   [[nodiscard]] bool faulted() const noexcept;
   [[nodiscard]] std::string_view faultDetail() const noexcept;
   void setHostPadState(const LegacyHostPadState &state) noexcept;
+  // Diagnostic presentation A/B switch; gameplay state remains untouched.
+  void setRetailAuxiliaryUiEnabled(bool enabled) noexcept;
   // Diagnostic-only authored event injection used by sf_tool to exercise
   // mission transitions without an interactive traversal.
   [[nodiscard]] bool

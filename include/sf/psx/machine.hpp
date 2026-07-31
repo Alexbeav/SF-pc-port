@@ -52,6 +52,7 @@ struct PsxMachineState {
   // between a guest DMA/write and the SF2 boundary collector draining them.
   // Preserve that in-flight tail so restore cannot splice GPU generations.
   std::vector<std::uint32_t> gpu_gp0_words;
+  std::vector<std::uint32_t> gpu_gp1_words;
   std::uint64_t pending_cpu_ticks{};
   std::uint32_t device_tick_remainder{};
 
@@ -65,6 +66,7 @@ struct PsxMachineState {
         spu(other.spu ? std::make_unique<SpuState>(*other.spu) : nullptr),
         xa_decoder(other.xa_decoder), timers(other.timers),
         gpu_gp0_words(other.gpu_gp0_words),
+        gpu_gp1_words(other.gpu_gp1_words),
         pending_cpu_ticks(other.pending_cpu_ticks),
         device_tick_remainder(other.device_tick_remainder) {}
 
@@ -88,6 +90,7 @@ struct PsxMachineState {
     xa_decoder = other.xa_decoder;
     timers = other.timers;
     gpu_gp0_words = other.gpu_gp0_words;
+    gpu_gp1_words = other.gpu_gp1_words;
     pending_cpu_ticks = other.pending_cpu_ticks;
     device_tick_remainder = other.device_tick_remainder;
     return *this;
@@ -153,6 +156,7 @@ public:
   // carry persistent VRAM uploads which an ordering-table snapshot cannot
   // reconstruct. Drain their byte-exact word stream at a product boundary.
   [[nodiscard]] std::vector<std::uint32_t> takeGpuGp0Words() noexcept;
+  [[nodiscard]] std::vector<std::uint32_t> takeGpuGp1Words() noexcept;
   [[nodiscard]] PsxMachineState captureState() const;
   [[nodiscard]] bool validateState(const PsxMachineState &state) const noexcept;
   [[nodiscard]] bool restoreState(const PsxMachineState &state) noexcept;
@@ -204,6 +208,7 @@ private:
   std::uint64_t pending_cpu_ticks_{};
   std::uint32_t device_tick_remainder_{};
   std::vector<std::uint32_t> gpu_gp0_words_;
+  std::vector<std::uint32_t> gpu_gp1_words_;
 
   class SpuDmaPort final : public DmaPort {
   public:

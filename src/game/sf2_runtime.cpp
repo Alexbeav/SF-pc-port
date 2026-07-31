@@ -11,6 +11,9 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <string>
@@ -139,11 +142,23 @@ sf2GpuTransfer(const Sf2GpuPacket &packet) noexcept {
       packet.gp0_words[kind == Sf2GpuCommandKind::copy_vram ? 2U : 1U];
   const auto size_word =
       packet.gp0_words[kind == Sf2GpuCommandKind::copy_vram ? 3U : 2U];
-  auto width = static_cast<std::uint16_t>(size_word & 0xffffU);
-  auto height = static_cast<std::uint16_t>(size_word >> 16U);
-  // GP0 encodes zero as the maximum transfer dimension.
-  width = width == 0U ? 1024U : width;
-  height = height == 0U ? 512U : height;
+  constexpr auto transfer_field_mask = 0x01ff03ffU;
+  // Retail-generated transfers keep the reserved coordinate/size bits clear.
+  // Rejecting them on captured MoveImage commands prevents a damaged DMA tag
+  // from reinterpreting polygon payload as a full-VRAM copy on the host.
+  if (kind == Sf2GpuCommandKind::copy_vram &&
+      ((packet.gp0_words[1U] & ~transfer_field_mask) != 0U ||
+       (coordinate_word & ~transfer_field_mask) != 0U ||
+       (size_word & ~transfer_field_mask) != 0U)) {
+    return std::nullopt;
+  }
+  // The GPU ignores the unused upper bits in each packed field. Transfer
+  // dimensions use the PS1's (value - 1) masks, so zero and other exact
+  // multiples encode the maximum dimension rather than an empty transfer.
+  const auto width = static_cast<std::uint16_t>(
+      ((size_word & 0xffffU) - 1U & 0x03ffU) + 1U);
+  const auto height = static_cast<std::uint16_t>(
+      (((size_word >> 16U) - 1U) & 0x01ffU) + 1U);
   const auto payload_offset =
       kind == Sf2GpuCommandKind::upload_vram ? 3U : packet.gp0_words.size();
   if (kind == Sf2GpuCommandKind::upload_vram) {
@@ -155,8 +170,8 @@ sf2GpuTransfer(const Sf2GpuPacket &packet) noexcept {
     }
   }
   return Sf2GpuTransfer{
-      .x = static_cast<std::uint16_t>(coordinate_word & 0xffffU),
-      .y = static_cast<std::uint16_t>(coordinate_word >> 16U),
+      .x = static_cast<std::uint16_t>(coordinate_word & 0x03ffU),
+      .y = static_cast<std::uint16_t>((coordinate_word >> 16U) & 0x01ffU),
       .width = width,
       .height = height,
       .payload = std::span<const std::uint32_t>{packet.gp0_words}.subspan(
@@ -174,9 +189,41 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
   constexpr std::uint32_t dma_end = 0x00ffffffU;
   constexpr std::size_t maximum_packets = 65'536U;
   constexpr std::size_t maximum_gp0_words = 1U << 20U;
+  // Retail SF2's linked primitives top out at the 12-word gouraud textured
+  // quad. Larger captured nodes are CPU-side descriptor/list records that can
+  // become linked while the hybrid runtime relocates the auxiliary workspace;
+  // replaying their arbitrary words as GP0 commands creates phantom UI and
+  // full-VRAM copies. Preserve the link, but do not submit that payload.
+  constexpr std::size_t maximum_retail_dma_payload_words = 32U;
+  auto previous_address = std::uint32_t{};
+  auto previous_tag = std::uint32_t{};
+  const auto trace_failure = [] {
+#if defined(_WIN32)
+    char *value{};
+    std::size_t size{};
+    const auto found =
+        _dupenv_s(&value, &size, "SF2_TRACE_OT_CAPTURE_FAILURE") == 0 &&
+        value != nullptr;
+    std::free(value);
+    return found;
+#else
+    return std::getenv("SF2_TRACE_OT_CAPTURE_FAILURE") != nullptr;
+#endif
+  }();
+  const auto reject = [&](const char *reason, std::uint32_t address,
+                          std::uint32_t tag = 0U) {
+    if (trace_failure) {
+      std::fprintf(stderr,
+                   "SF2 OT capture rejected: root=0x%08X address=0x%08X "
+                   "tag=0x%08X previous=0x%08X/0x%08X reason=%s\n",
+                   ordering_table_root, address, tag, previous_address,
+                   previous_tag, reason);
+    }
+    return std::optional<Sf2PresentationFrame>{};
+  };
   if (guest_ram.size() != psx_ram_size || sequence == 0U ||
       (ordering_table_root & 3U) != 0U) {
-    return std::nullopt;
+    return reject("invalid arguments", ordering_table_root);
   }
 
   const auto read_word = [&](std::uint32_t address,
@@ -212,37 +259,69 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
        ++packet_index) {
     const auto physical_address = address & 0x001fffffU;
     if (std::ranges::find(visited, physical_address) != visited.end()) {
-      return std::nullopt;
+      return reject("DMA chain cycle", address);
     }
     visited.push_back(physical_address);
 
     std::uint32_t tag{};
     if (!read_word(address, tag)) {
-      return std::nullopt;
+      return reject("unreadable DMA tag", address);
     }
-    const auto word_count = static_cast<std::size_t>(tag >> 24U);
+    const auto authored_word_count = static_cast<std::size_t>(tag >> 24U);
+    const auto word_count = authored_word_count <= maximum_retail_dma_payload_words
+                                ? authored_word_count
+                                : std::size_t{};
     if (frame.gp0_word_count > maximum_gp0_words - word_count) {
-      return std::nullopt;
+      return reject("GP0 word limit", address, tag);
     }
     if (word_count != 0U) {
-      Sf2GpuPacket packet;
-      packet.guest_address = 0x80000000U | physical_address;
-      packet.gp0_words.reserve(word_count);
+      std::vector<std::uint32_t> payload;
+      payload.reserve(word_count);
       for (auto word_index = std::size_t{}; word_index < word_count;
            ++word_index) {
         std::uint32_t word{};
         if (!read_word(address + static_cast<std::uint32_t>(
                                      (word_index + 1U) * 4U),
                        word)) {
-          return std::nullopt;
+          return reject("unreadable DMA payload", address, tag);
         }
-        packet.gp0_words.push_back(word);
+        payload.push_back(word);
       }
-      const auto opcode = packet.gp0_words.front() >> 24U;
-      frame.draw_command_count += opcode >= 0x20U && opcode <= 0x7fU ? 1U : 0U;
       frame.gp0_word_count += word_count;
-      ++frame.gpu_command_count;
-      frame.packets.push_back(std::move(packet));
+      for (auto payload_offset = std::size_t{};
+           payload_offset < payload.size();) {
+        const auto remaining =
+            std::span<const std::uint32_t>{payload}.subspan(payload_offset);
+        const auto command_words = sf2Gp0CommandWordCount(remaining);
+        if (!command_words) {
+          return reject("malformed GP0 payload", address, tag);
+        }
+        Sf2GpuPacket packet;
+        packet.guest_address =
+            0x80000000U |
+            ((physical_address + 4U +
+              static_cast<std::uint32_t>(payload_offset * 4U)) &
+             0x001fffffU);
+        packet.gp0_words.assign(
+            remaining.begin(),
+            remaining.begin() +
+                static_cast<std::ptrdiff_t>(*command_words));
+        const auto opcode = packet.gp0_words.front() >> 24U;
+        if (trace_failure && opcode == 0x80U &&
+            packet.gp0_words.size() == 4U) {
+          std::fprintf(stderr,
+                       "SF2 captured GP0(80): root=0x%08X dma=0x%08X "
+                       "tag=0x%08X offset=%zu words=%08X/%08X/%08X/%08X\n",
+                       ordering_table_root, address, tag, payload_offset,
+                       packet.gp0_words[0U], packet.gp0_words[1U],
+                       packet.gp0_words[2U], packet.gp0_words[3U]);
+        }
+        frame.draw_command_count +=
+            opcode >= 0x20U && opcode <= 0x7fU ? 1U : 0U;
+        ++frame.gpu_command_count;
+        frame.packets.push_back(std::move(packet));
+        payload_offset += *command_words;
+      }
     }
 
     const auto next = tag & dma_end;
@@ -251,9 +330,11 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
                  ? std::optional<Sf2PresentationFrame>{std::move(frame)}
                  : std::nullopt;
     }
+    previous_address = address;
+    previous_tag = tag;
     address = 0x80000000U | next;
   }
-  return std::nullopt;
+  return reject("DMA packet limit", address);
 }
 
 void projectSf2GuestHud(
@@ -450,6 +531,7 @@ public:
       loadAssets();
       setStage("platform binding");
       bindPlatform();
+      configureUiInstructionTrace();
       // Arm before TITLE-to-mission transition work: bootstrap itself builds
       // and
       // submits ordering tables, and a bad tag written here can remain
@@ -459,12 +541,15 @@ public:
       // one proven mutable word.
       vm_.runtime().setWriteWatch(0x8001d000U, 0x8001da9cU);
       vm_.runtime().addWriteWatch(0x8001daa0U, 0x8001f000U);
+      vm_.runtime().setWriteTrace(0x8014f000U, 0x80169000U);
+      vm_.runtime().setWriteTracePc(0x800133b4U, 0x800133dcU);
       if (!bootstrap()) {
         if (!faulted_) {
           markFault("retail TITLE-to-mission bootstrap failed at " + stage_);
         }
         return;
       }
+      normalizeInitialAuxiliaryRendererState();
       std::array<std::byte, protected_renderer_size_> protected_renderer{};
       if (!vm_.runtime().copyBytes(protected_renderer_begin_,
                                    protected_renderer)) {
@@ -568,6 +653,12 @@ public:
     }
   }
 
+  ~Impl() {
+    vm_.setHostCallObserver({});
+    vm_.runtime().setExecutionObserver({});
+    flushUiInstructionTrace();
+  }
+
   [[nodiscard]] bool ready() const noexcept { return ready_; }
   [[nodiscard]] bool faulted() const noexcept { return faulted_; }
   [[nodiscard]] std::string_view faultDetail() const noexcept {
@@ -576,6 +667,9 @@ public:
   }
   void setHostPadState(const LegacyHostPadState &state) noexcept {
     host_pad_ = state;
+  }
+  void setRetailAuxiliaryUiEnabled(bool enabled) noexcept {
+    disable_retail_auxiliary_ui_ = !enabled;
   }
   [[nodiscard]] bool
   dispatchScriptEventForProbe(std::uint32_t event,
@@ -725,8 +819,14 @@ public:
       state.open_files = open_files_;
       state.gpu_gp0_stream = gpu_gp0_stream_;
       state.gpu_gp0_scan = gpu_gp0_scan_;
+      state.gpu_draw_environment_words = gpu_draw_environment_words_;
+      state.gpu_draw_environment_valid = gpu_draw_environment_valid_;
       state.vram_setup_packets = vram_setup_packets_;
+      state.pending_immediate_gpu_packets = pending_immediate_gpu_packets_;
       state.presentation_frame = presentation_frame_;
+      state.pending_presentation = pending_presentation_;
+      state.pending_presentation_clock = pending_presentation_clock_;
+      state.published_sequence = published_sequence_;
       state.active_script_programs = active_script_programs_;
       state.callback_ticks = callback_ticks_;
       state.audio_callback_ticks = audio_callback_ticks_;
@@ -742,6 +842,11 @@ public:
       state.checkpoint_captured = checkpoint_captured_;
       state.retail_restore_active = retail_restore_active_;
       state.retail_restore_start_frame = retail_restore_start_frame_;
+      state.ui_text_event_count = ui_text_event_count_;
+      state.ui_text_events = ui_text_events_;
+      state.mission_timer_handle = mission_timer_handle_;
+      state.mission_timer_text = mission_timer_text_;
+      state.mission_timer_text_updates = mission_timer_text_updates_;
       quick_state_ = std::move(state);
       return true;
     } catch (...) {
@@ -759,6 +864,8 @@ public:
       auto open_files = quick_state_->open_files;
       auto gpu_gp0_stream = quick_state_->gpu_gp0_stream;
       auto vram_setup_packets = quick_state_->vram_setup_packets;
+      auto pending_immediate_gpu_packets =
+          quick_state_->pending_immediate_gpu_packets;
       auto active_script_programs = quick_state_->active_script_programs;
       if (!vm_.restoreSnapshot(quick_state_->vm)) {
         return false;
@@ -769,10 +876,19 @@ public:
       // prevents advanceHostUpdate() from consuming extra guest GPU
       // boundaries while it searches for a replacement authored OT.
       presentation_frame_ = quick_state_->presentation_frame;
+      pending_presentation_ = quick_state_->pending_presentation;
+      pending_presentation_clock_ =
+          quick_state_->pending_presentation_clock;
+      published_sequence_ = quick_state_->published_sequence;
       gpu_gp0_stream_.swap(gpu_gp0_stream);
       vram_setup_packets_.swap(vram_setup_packets);
+      pending_immediate_gpu_packets_.swap(pending_immediate_gpu_packets);
       active_script_programs_.swap(active_script_programs);
       gpu_gp0_scan_ = quick_state_->gpu_gp0_scan;
+      gpu_draw_environment_words_ =
+          quick_state_->gpu_draw_environment_words;
+      gpu_draw_environment_valid_ =
+          quick_state_->gpu_draw_environment_valid;
       callback_ticks_ = quick_state_->callback_ticks;
       audio_callback_ticks_ = quick_state_->audio_callback_ticks;
       retrace_ticks_ = quick_state_->retrace_ticks;
@@ -789,6 +905,11 @@ public:
       retail_restore_active_ = quick_state_->retail_restore_active;
       retail_restore_start_frame_ =
           quick_state_->retail_restore_start_frame;
+      ui_text_event_count_ = quick_state_->ui_text_event_count;
+      ui_text_events_ = quick_state_->ui_text_events;
+      mission_timer_handle_ = quick_state_->mission_timer_handle;
+      mission_timer_text_ = quick_state_->mission_timer_text;
+      mission_timer_text_updates_ = quick_state_->mission_timer_text_updates;
       scheduler_fault_detail_.clear();
       vm_.runtime().clearWriteWatchHit();
       last_valid_collision_room_ = 0xffffU;
@@ -927,6 +1048,53 @@ public:
         last_renderer_text_writer_instruction_;
     result.rejected_renderer_ordering_tables =
         rejected_renderer_ordering_tables_;
+    result.observed_gpu_submissions = observed_gpu_submissions_;
+    result.last_gpu_submission_root = last_gpu_submission_root_;
+    result.last_gpu_submission_draw_count =
+        last_gpu_submission_draw_count_;
+    result.last_gpu_submission_packet_count =
+        last_gpu_submission_packet_count_;
+    result.last_gpu_submission_copy_count =
+        last_gpu_submission_copy_count_;
+    result.last_gpu_submission_upload_count =
+        last_gpu_submission_upload_count_;
+    result.last_gpu_submission_copy = last_gpu_submission_copy_;
+    result.last_gpu_submission_copy_source_x =
+        last_gpu_submission_copy_source_x_;
+    result.last_gpu_submission_copy_source_y =
+        last_gpu_submission_copy_source_y_;
+    result.last_gpu_submission_clock = last_gpu_submission_clock_;
+    result.last_gpu_submission_draw_buffer =
+        last_gpu_submission_draw_buffer_;
+    result.last_gpu_submission_build_buffer =
+        last_gpu_submission_build_buffer_;
+    result.last_gpu_submission_first_draw_packet =
+        last_gpu_submission_first_draw_packet_;
+    result.last_gpu_submission_last_draw_packet =
+        last_gpu_submission_last_draw_packet_;
+    result.text_renderer_calls = text_renderer_calls_;
+    result.text_renderer = text_renderer_;
+    result.text_renderer_flags = text_renderer_flags_;
+    result.text_renderer_list_heads = text_renderer_list_heads_;
+    result.hud_primitive_registrations = hud_primitive_registrations_;
+    result.hud_primitive_registration_callers =
+        hud_primitive_registration_callers_;
+    result.hud_primitive_registration_packets =
+        hud_primitive_registration_packets_;
+    result.hud_primitive_registration_roots =
+        hud_primitive_registration_roots_;
+    result.hud_primitive_registration_counts =
+        hud_primitive_registration_counts_;
+    result.hud_primitive_registration_buffer_masks =
+        hud_primitive_registration_buffer_masks_;
+    result.hud_primitive_writes = hud_primitive_writes_;
+    result.hud_primitive_writer_pcs = hud_primitive_writer_pcs_;
+    result.hud_primitive_writer_addresses = hud_primitive_writer_addresses_;
+    result.hud_primitive_writer_instructions =
+        hud_primitive_writer_instructions_;
+    result.hud_primitive_writer_counts = hud_primitive_writer_counts_;
+    result.hud_primitive_writer_buffer_masks =
+        hud_primitive_writer_buffer_masks_;
     result.last_rejected_renderer_packet =
         last_rejected_renderer_packet_;
     result.last_rejected_renderer_root = last_rejected_renderer_root_;
@@ -1154,17 +1322,13 @@ public:
             .remaining_ticks = remaining,
             .program_name_words = name_words,
         };
-        // AIRBASE's visible countdown is LEVEL timer 0. Other active sequel
-        // timers drive internal choreography (for example HWAY's CHANCE
-        // program) and must not be projected as HUD clocks.
-        if (mission_index_ == 1U && index == 0U &&
-            name_words[0U] == 0x4556454cU &&
-            (name_words[1U] & 0xffffU) == 0x004cU) {
-          result.mission_timer_ticks = remaining;
-          result.mission_timer_visible = true;
-        }
       }
     }
+    result.mission_timer_handle = mission_timer_handle_;
+    result.mission_timer_text = mission_timer_text_;
+    result.mission_timer_text_updates = mission_timer_text_updates_;
+    result.mission_timer_visible = mission_timer_handle_ != 0xffffU &&
+                                   mission_timer_text_[0U] != '\0';
     result.scene_xa_archive_opens = scene_xa_archive_opens_;
     result.scene_speech_starts = scene_speech_starts_;
     result.scene_speech_callbacks = scene_speech_callbacks_;
@@ -1227,6 +1391,8 @@ public:
     result.xa_stream_stops = xa_stream_stops_;
     result.timeline_event_count = timeline_event_count_;
     result.timeline_events = timeline_events_;
+    result.ui_text_event_count = ui_text_event_count_;
+    result.ui_text_events = ui_text_events_;
     result.async_file_services = async_file_services_;
     result.async_file_completions = async_file_completions_;
     result.last_async_completion_caller = last_async_completion_caller_;
@@ -1246,10 +1412,11 @@ public:
     if (!ready_ || faulted_) {
       return false;
     }
-    // DrawOTag is also used for utility lists between display submissions.
-    // Advance through those boundaries atomically so one public update always
-    // means one retail 60 Hz presentation frame. SF2 derives its 20 Hz logic
-    // and PAD cadence from every third presentation frame.
+    // Preserve the 60 Hz guest/input contract: one public update retires one
+    // retail display-list submission. Presentation publication is separate;
+    // gameplay can queue world and UI lists during one 20 Hz logic tick, and
+    // advanceGuestBoundary() publishes their completed composition while
+    // intermediate updates continue to display the previous completed frame.
     constexpr auto maximum_boundaries_per_frame = 128U;
     for (auto boundary = 0U; boundary < maximum_boundaries_per_frame;
          ++boundary) {
@@ -1257,14 +1424,8 @@ public:
       if (!advanceGuestBoundary(display_submitted)) {
         return false;
       }
-      if (display_submitted) {
-        // A quick-state restore deliberately retires the old host
-        // presentation. The first restored display submission can be a
-        // utility/flip list rather than a complete authored world OT; keep
-        // advancing until restored RAM publishes a usable scene.
-        if (presentation_frame_) {
-          return true;
-        }
+      if (display_submitted && presentation_frame_) {
+        return true;
       }
     }
     markFault("SF2 did not submit a display frame within the boundary limit");
@@ -1272,6 +1433,231 @@ public:
   }
 
 private:
+  void normalizeInitialAuxiliaryRendererState() {
+    // The direct TITLE-to-mission handoff leaves TITLE's full-screen map-grid
+    // list attached to the resident auxiliary renderer. Retail's checkpoint
+    // restart clears this list head while retaining the renderer and its HUD,
+    // text and radar lists. Mirror that initialization state once, before the
+    // first gameplay frame, but only after verifying the complete observed
+    // 113-node stale list. A real map opened later installs a fresh list and
+    // is unaffected.
+    constexpr std::uint32_t auxiliary_general_list = 0x80120b78U;
+    constexpr std::uint32_t expected_root = 0x80125310U;
+    constexpr std::uint32_t node_begin = 0x80124dd0U;
+    constexpr std::uint32_t node_end = 0x8012531cU;
+    constexpr std::uint32_t primitive_begin = 0x80168ae8U;
+    constexpr std::uint32_t primitive_end = 0x80169790U;
+    constexpr std::size_t expected_nodes = 113U;
+
+    std::uint32_t cursor{};
+    if (!vm_.runtime().read32(auxiliary_general_list, cursor) ||
+        cursor != expected_root) {
+      return;
+    }
+    for (auto node = std::size_t{}; node < expected_nodes; ++node) {
+      std::uint32_t primitive{};
+      std::uint32_t next{};
+      if (cursor < node_begin || cursor >= node_end ||
+          ((cursor - node_begin) % 12U) != 0U ||
+          !vm_.runtime().read32(cursor, primitive) ||
+          !vm_.runtime().read32(cursor + 8U, next) ||
+          primitive < primitive_begin || primitive >= primitive_end ||
+          (node + 1U == expected_nodes ? next != 0U : next == 0U)) {
+        return;
+      }
+      cursor = next;
+    }
+    static_cast<void>(vm_.runtime().write32(auxiliary_general_list, 0U));
+  }
+
+  struct UiInstructionTraceRecord {
+    std::uint64_t ordinal{};
+    std::uint64_t guest_frame{};
+    std::uint32_t system_clock{};
+    std::uint32_t pc{};
+    std::uint32_t instruction{};
+    std::uint16_t draw_buffer{};
+    std::uint16_t display_buffer{};
+    std::uint16_t build_buffer{};
+    std::uint16_t reserved{};
+    std::uint32_t packet_cursor{};
+    std::array<std::uint32_t, 32U> gpr{};
+    std::array<std::uint32_t, 8U> a0_words{};
+    std::array<std::uint32_t, 8U> a1_words{};
+    std::array<std::uint32_t, 8U> s3_words{};
+  };
+
+  void configureUiInstructionTrace() {
+    std::string path;
+#if defined(_WIN32)
+    char *environment_value{};
+    std::size_t environment_size{};
+    if (_dupenv_s(&environment_value, &environment_size,
+                  "SF2_UI_INSTRUCTION_TRACE") == 0 &&
+        environment_value != nullptr) {
+      path.assign(environment_value);
+      std::free(environment_value);
+    }
+#else
+    if (const auto *environment_value =
+            std::getenv("SF2_UI_INSTRUCTION_TRACE")) {
+      path.assign(environment_value);
+    }
+#endif
+    if (path.empty()) {
+      return;
+    }
+    const auto environment_unsigned = [](const char *name,
+                                         std::uint64_t fallback) {
+      std::string value;
+#if defined(_WIN32)
+      char *environment_value{};
+      std::size_t environment_size{};
+      if (_dupenv_s(&environment_value, &environment_size, name) == 0 &&
+          environment_value != nullptr) {
+        value.assign(environment_value);
+        std::free(environment_value);
+      }
+#else
+      if (const auto *environment_value = std::getenv(name)) {
+        value.assign(environment_value);
+      }
+#endif
+      if (value.empty()) {
+        return fallback;
+      }
+      char *end{};
+      const auto parsed = std::strtoull(value.c_str(), &end, 10);
+      return end != value.c_str() && *end == '\0' ? parsed : fallback;
+    };
+    ui_instruction_trace_begin_clock_ = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(environment_unsigned(
+                                    "SF2_UI_TRACE_BEGIN_CLOCK", 0U),
+                                std::numeric_limits<std::uint32_t>::max()));
+    ui_instruction_trace_end_clock_ = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(environment_unsigned(
+                                    "SF2_UI_TRACE_END_CLOCK",
+                                    std::numeric_limits<std::uint32_t>::max()),
+                                std::numeric_limits<std::uint32_t>::max()));
+    constexpr auto default_maximum_trace_bytes =
+        std::uint64_t{8U} * 1024U * 1024U * 1024U;
+    constexpr auto absolute_maximum_trace_bytes =
+        std::uint64_t{32U} * 1024U * 1024U * 1024U;
+    ui_instruction_trace_max_bytes_ = std::clamp<std::uint64_t>(
+        environment_unsigned("SF2_UI_TRACE_MAX_BYTES",
+                             default_maximum_trace_bytes),
+        sizeof(UiInstructionTraceRecord) + 12U,
+        absolute_maximum_trace_bytes);
+    ui_instruction_trace_.open(path,
+                               std::ios::binary | std::ios::trunc);
+    if (!ui_instruction_trace_) {
+      markFault("could not open SF2 UI instruction trace");
+      return;
+    }
+    constexpr std::array<char, 8U> magic{'S', 'F', '2', 'U', 'I', 'T', 'R', '1'};
+    const auto record_size =
+        static_cast<std::uint32_t>(sizeof(UiInstructionTraceRecord));
+    ui_instruction_trace_.write(magic.data(),
+                                static_cast<std::streamsize>(magic.size()));
+    ui_instruction_trace_.write(
+        reinterpret_cast<const char *>(&record_size), sizeof(record_size));
+    ui_instruction_trace_buffer_.reserve(4096U);
+    vm_.runtime().setExecutionObserver(
+        [this](const psx::R3000State &state, std::uint32_t pc,
+               std::uint32_t instruction) {
+          recordUiInstructionTrace(state, pc, instruction);
+        });
+    vm_.setHostCallObserver(
+        [this](std::uint32_t address, const psx::R3000State &state) {
+          if (address == 0x800e54ecU || address == 0x800e6e74U ||
+              address == profile_.gpu_submission_entry) {
+            recordUiInstructionTrace(state, address, 0xffffffffU);
+          }
+        });
+  }
+
+  void recordUiInstructionTrace(const psx::R3000State &state,
+                                std::uint32_t pc,
+                                std::uint32_t instruction) {
+    const auto writes_traced_ordering_table = [&] {
+      const auto opcode = instruction >> 26U;
+      if (opcode != 0x28U && opcode != 0x29U && opcode != 0x2aU &&
+          opcode != 0x2bU && opcode != 0x2eU) {
+        return false;
+      }
+      const auto base_register = (instruction >> 21U) & 0x1fU;
+      const auto displacement = static_cast<std::int32_t>(
+          static_cast<std::int16_t>(instruction & 0xffffU));
+      const auto address = state.gpr[base_register] + displacement;
+      return address >= 0x801f8c60U && address < 0x801f8cb0U;
+    }();
+    const auto relevant = instruction == 0xffffffffU ||
+        writes_traced_ordering_table ||
+        (pc >= 0x80012000U && pc < 0x8001f000U) ||
+        (pc >= 0x800a5000U && pc < 0x800a9000U) ||
+        (pc >= 0x80150000U && pc < 0x80170000U);
+    if (!relevant || !ui_instruction_trace_) {
+      return;
+    }
+    std::uint32_t system_clock{};
+    static_cast<void>(
+        vm_.runtime().read32(profile_.system_clock, system_clock));
+    if (system_clock < ui_instruction_trace_begin_clock_ ||
+        system_clock > ui_instruction_trace_end_clock_ ||
+        ui_instruction_trace_capped_) {
+      return;
+    }
+    const auto next_size = 12U +
+        (ui_instruction_trace_events_ + 1U) *
+            sizeof(UiInstructionTraceRecord);
+    if (next_size > ui_instruction_trace_max_bytes_) {
+      ui_instruction_trace_capped_ = true;
+      flushUiInstructionTrace();
+      return;
+    }
+    UiInstructionTraceRecord record{};
+    record.ordinal = ++ui_instruction_trace_events_;
+    record.guest_frame = guest_frame_;
+    record.pc = pc;
+    record.instruction = instruction;
+    record.gpr = state.gpr;
+    record.system_clock = system_clock;
+    static_cast<void>(
+        vm_.runtime().read16(state.gpr[28U] + 0x26U, record.draw_buffer));
+    static_cast<void>(vm_.runtime().read16(state.gpr[28U] + 0x28U,
+                                           record.display_buffer));
+    static_cast<void>(
+        vm_.runtime().read16(state.gpr[28U] + 0x2aU, record.build_buffer));
+    static_cast<void>(vm_.runtime().read32(0x8013e6dcU,
+                                           record.packet_cursor));
+    const auto snapshot = [this](std::uint32_t address, auto &words) {
+      for (auto index = std::size_t{}; index < words.size(); ++index) {
+        static_cast<void>(vm_.runtime().read32(
+            address + static_cast<std::uint32_t>(index * 4U),
+            words[index]));
+      }
+    };
+    snapshot(state.gpr[4U], record.a0_words);
+    snapshot(state.gpr[5U], record.a1_words);
+    snapshot(state.gpr[19U], record.s3_words);
+    ui_instruction_trace_buffer_.push_back(record);
+    if (ui_instruction_trace_buffer_.size() >= 4096U) {
+      flushUiInstructionTrace();
+    }
+  }
+
+  void flushUiInstructionTrace() {
+    if (!ui_instruction_trace_ || ui_instruction_trace_buffer_.empty()) {
+      return;
+    }
+    ui_instruction_trace_.write(
+        reinterpret_cast<const char *>(ui_instruction_trace_buffer_.data()),
+        static_cast<std::streamsize>(ui_instruction_trace_buffer_.size() *
+                                     sizeof(UiInstructionTraceRecord)));
+    ui_instruction_trace_buffer_.clear();
+    ui_instruction_trace_.flush();
+  }
+
   void readPlayerState(std::uint32_t &instance, std::int32_t &x,
                        std::int32_t &y, std::int32_t &z,
                        std::uint16_t &health,
@@ -1599,14 +1985,14 @@ private:
   }
 
 
-  [[nodiscard]] static bool
-  isAuthoredWorldFrame(const Sf2PresentationFrame &frame) noexcept {
+  [[nodiscard]] static std::size_t
+  authoredWorldPolygonCount(const Sf2PresentationFrame &frame) noexcept {
     // The retail mission loader submits a sizeable card-and-line list before
     // the first authored scene.  It has hundreds of draw commands, so a raw
     // draw-count threshold mistakes it for gameplay.  Mission geometry uses
     // the textured gouraud polygon families (0x34/0x36/0x3c/0x3e); require a
     // meaningful population of those before handing a frame to the product.
-    const auto world_polygons = std::ranges::count_if(
+    return static_cast<std::size_t>(std::ranges::count_if(
         frame.packets, [](const Sf2GpuPacket &packet) {
           if (packet.gp0_words.empty()) {
             return false;
@@ -1614,12 +2000,17 @@ private:
           const auto opcode = packet.gp0_words.front() >> 24U;
           return (opcode & 0xfcU) == 0x34U ||
                  (opcode & 0xfcU) == 0x3cU;
-        });
-    return world_polygons >= 100;
+        }));
   }
 
-  void captureGpuSideEffects() {
+  [[nodiscard]] static bool
+  isAuthoredWorldFrame(const Sf2PresentationFrame &frame) noexcept {
+    return authoredWorldPolygonCount(frame) >= 100U;
+  }
+
+  [[nodiscard]] std::vector<std::uint32_t> captureGpuSideEffects() {
     auto words = vm_.machine().takeGpuGp0Words();
+    auto gp1_words = vm_.machine().takeGpuGp1Words();
     gpu_gp0_stream_.insert(gpu_gp0_stream_.end(), words.begin(), words.end());
     const auto compact_consumed_words = [this]() {
       if (gpu_gp0_scan_ == 0U) {
@@ -1645,11 +2036,20 @@ private:
       const auto command_words = sf2Gp0CommandWordCount(remaining);
       if (!command_words) {
         compact_consumed_words();
-        return;
+        return gp1_words;
       }
       const auto opcode =
           static_cast<std::uint8_t>(remaining.front() >> 24U);
-      if (opcode == 0x80U || opcode == 0xa0U) {
+      if (opcode == 0x02U) {
+        Sf2GpuPacket immediate;
+        immediate.gp0_words.assign(
+            remaining.begin(),
+            remaining.begin() +
+                static_cast<std::ptrdiff_t>(*command_words));
+        if (sf2GpuTransfer(immediate)) {
+          pending_immediate_gpu_packets_.push_back(std::move(immediate));
+        }
+      } else if (opcode == 0x80U || opcode == 0xa0U) {
         Sf2GpuPacket setup;
         setup.gp0_words.assign(
             remaining.begin(),
@@ -1660,6 +2060,7 @@ private:
       gpu_gp0_scan_ += *command_words;
     }
     compact_consumed_words();
+    return gp1_words;
   }
 
   void attachVramSetup(Sf2PresentationFrame &frame) const {
@@ -1677,6 +2078,96 @@ private:
                    std::make_move_iterator(frame.packets.begin()),
                    std::make_move_iterator(frame.packets.end()));
     frame.packets = std::move(packets);
+  }
+
+  void makeDrawEnvironmentSelfContained(Sf2PresentationFrame &frame) {
+    std::vector<Sf2GpuPacket> packets;
+    packets.reserve(gpu_draw_environment_words_.size() +
+                    frame.packets.size());
+    for (auto index = std::size_t{};
+         index < gpu_draw_environment_words_.size(); ++index) {
+      if (!gpu_draw_environment_valid_[index]) {
+        continue;
+      }
+      packets.push_back(Sf2GpuPacket{
+          .guest_address = 0U,
+          .gp0_words = {gpu_draw_environment_words_[index]},
+      });
+      ++frame.gp0_word_count;
+      ++frame.gpu_command_count;
+    }
+    packets.insert(packets.end(),
+                   std::make_move_iterator(frame.packets.begin()),
+                   std::make_move_iterator(frame.packets.end()));
+    frame.packets = std::move(packets);
+
+    // Advance the retained GPU state through the authored environment
+    // commands so the next OT receives the state this submission leaves.
+    for (const auto &packet : frame.packets) {
+      if (packet.gp0_words.size() != 1U) {
+        continue;
+      }
+      const auto opcode = packet.gp0_words.front() >> 24U;
+      if (opcode >= 0xe1U && opcode <= 0xe6U) {
+        const auto index = static_cast<std::size_t>(opcode - 0xe1U);
+        gpu_draw_environment_words_[index] = packet.gp0_words.front();
+        gpu_draw_environment_valid_[index] = true;
+      }
+    }
+  }
+
+  void appendPresentationSubmission(Sf2PresentationFrame &composition,
+                                    Sf2PresentationFrame submission) {
+    if (submission.guest_frame >= composition.guest_frame) {
+      composition.guest_frame = submission.guest_frame;
+      composition.application_state = submission.application_state;
+      composition.retail_global_pointer =
+          submission.retail_global_pointer;
+      composition.retail_draw_buffer_index =
+          submission.retail_draw_buffer_index;
+      composition.retail_display_buffer_index =
+          submission.retail_display_buffer_index;
+    }
+    composition.gp0_word_count += submission.gp0_word_count;
+    composition.gpu_command_count += submission.gpu_command_count;
+    composition.draw_command_count += submission.draw_command_count;
+    composition.gp1_words.insert(
+        composition.gp1_words.end(),
+        std::make_move_iterator(submission.gp1_words.begin()),
+        std::make_move_iterator(submission.gp1_words.end()));
+    const auto packet_offset = composition.packets.size();
+    composition.packets.insert(
+        composition.packets.end(),
+        std::make_move_iterator(submission.packets.begin()),
+        std::make_move_iterator(submission.packets.end()));
+    if (submission.submission_packet_ends.empty()) {
+      composition.submission_packet_ends.push_back(
+          composition.packets.size());
+    } else {
+      for (const auto end : submission.submission_packet_ends) {
+        composition.submission_packet_ends.push_back(packet_offset + end);
+      }
+    }
+    composition.submission_roots.insert(
+        composition.submission_roots.end(),
+        submission.submission_roots.begin(),
+        submission.submission_roots.end());
+    composition.submission_draw_counts.insert(
+        composition.submission_draw_counts.end(),
+        submission.submission_draw_counts.begin(),
+        submission.submission_draw_counts.end());
+  }
+
+  void publishPendingPresentation() {
+    if (!pending_presentation_ ||
+        !isAuthoredWorldFrame(*pending_presentation_)) {
+      pending_presentation_.reset();
+      return;
+    }
+    pending_presentation_->sequence = ++published_sequence_;
+    presentation_frame_ = std::make_shared<const Sf2PresentationFrame>(
+        std::move(*pending_presentation_));
+    pending_presentation_.reset();
   }
 
   void rememberVramSetupPacket(Sf2GpuPacket packet) {
@@ -1726,6 +2217,25 @@ private:
         rememberVramSetupPacket(packet);
       }
     }
+  }
+
+  void attachImmediateGpuPackets(Sf2PresentationFrame &frame) {
+    if (pending_immediate_gpu_packets_.empty()) {
+      return;
+    }
+    std::vector<Sf2GpuPacket> packets;
+    packets.reserve(pending_immediate_gpu_packets_.size() +
+                    frame.packets.size());
+    for (auto &packet : pending_immediate_gpu_packets_) {
+      frame.gp0_word_count += packet.gp0_words.size();
+      ++frame.gpu_command_count;
+      packets.push_back(std::move(packet));
+    }
+    pending_immediate_gpu_packets_.clear();
+    packets.insert(packets.end(),
+                   std::make_move_iterator(frame.packets.begin()),
+                   std::make_move_iterator(frame.packets.end()));
+    frame.packets = std::move(packets);
   }
 
   [[nodiscard]] bool startMissionScriptsIfReady() noexcept {
@@ -1782,6 +2292,33 @@ private:
       return text;
     };
     const auto boundary = runUntilBoundary(profile_.gpu_submission_entry);
+    if (const auto &trace = vm_.runtime().writeTraceHit();
+        trace.width != 0U) {
+      ++hud_primitive_writes_;
+      auto slot = hud_primitive_writer_pcs_.size();
+      for (auto index = std::size_t{};
+           index < hud_primitive_writer_pcs_.size(); ++index) {
+        if (hud_primitive_writer_pcs_[index] == trace.pc ||
+            hud_primitive_writer_pcs_[index] == 0U) {
+          slot = index;
+          break;
+        }
+      }
+      if (slot < hud_primitive_writer_pcs_.size()) {
+        hud_primitive_writer_pcs_[slot] = trace.pc;
+        hud_primitive_writer_addresses_[slot] = trace.address;
+        hud_primitive_writer_instructions_[slot] = trace.instruction;
+        ++hud_primitive_writer_counts_[slot];
+        std::uint16_t build_buffer{};
+        static_cast<void>(vm_.runtime().read16(
+            vm_.runtime().state().gpr[28U] + 0x2aU, build_buffer));
+        if (build_buffer < 8U) {
+          hud_primitive_writer_buffer_masks_[slot] |=
+              static_cast<std::uint8_t>(1U << build_buffer);
+        }
+      }
+      vm_.runtime().clearWriteTraceHit();
+    }
     auto write_watch = vm_.runtime().writeWatchHit();
     // Retail's exception/callback trampoline intentionally self-patches the
     // instruction eight bytes before its continuation on first use. It is a
@@ -1894,7 +2431,7 @@ private:
             : std::min(diagnostics_.minimum_stack_pointer, boundary_sp);
     diagnostics_.maximum_stack_pointer =
         std::max(diagnostics_.maximum_stack_pointer, boundary_sp);
-    captureGpuSideEffects();
+    auto boundary_gp1_words = captureGpuSideEffects();
     stabilizeCollisionRoom();
     std::uint32_t application_state{};
     if (!vm_.runtime().read32(profile_.application_state, application_state)) {
@@ -1918,8 +2455,71 @@ private:
     if (display_submitted) {
       ++presentation_sequence_;
       ++guest_frame_;
+      std::uint32_t system_clock{};
+      if (!vm_.runtime().read32(profile_.system_clock, system_clock)) {
+        markFault("could not read the SF2 presentation clock");
+        return false;
+      }
+      ++observed_gpu_submissions_;
+      last_gpu_submission_root_ = submission_root;
+      last_gpu_submission_draw_count_ =
+          captured_submission ? captured_submission->draw_command_count : 0U;
+      last_gpu_submission_packet_count_ =
+          captured_submission ? captured_submission->packets.size() : 0U;
+      last_gpu_submission_copy_count_ = 0U;
+      last_gpu_submission_upload_count_ = 0U;
+      last_gpu_submission_first_draw_packet_ = 0U;
+      last_gpu_submission_last_draw_packet_ = 0U;
+      last_gpu_submission_copy_ = {};
+      last_gpu_submission_copy_source_x_ = 0U;
+      last_gpu_submission_copy_source_y_ = 0U;
+      if (captured_submission) {
+        for (const auto &packet : captured_submission->packets) {
+          if (packet.gp0_words.empty()) {
+            continue;
+          }
+          const auto opcode = packet.gp0_words.front() >> 24U;
+          if (sf2GpuCommandKind(packet) == Sf2GpuCommandKind::draw) {
+            if (last_gpu_submission_first_draw_packet_ == 0U) {
+              last_gpu_submission_first_draw_packet_ = packet.guest_address;
+            }
+            last_gpu_submission_last_draw_packet_ = packet.guest_address;
+          }
+          last_gpu_submission_copy_count_ += opcode == 0x80U ? 1U : 0U;
+          last_gpu_submission_upload_count_ += opcode == 0xa0U ? 1U : 0U;
+          if (opcode == 0x80U) {
+            if (const auto transfer = sf2GpuTransfer(packet)) {
+              last_gpu_submission_copy_ = *transfer;
+              if (packet.gp0_words.size() >= 2U) {
+                last_gpu_submission_copy_source_x_ =
+                    static_cast<std::uint16_t>(packet.gp0_words[1U] &
+                                               0x3ffU);
+                last_gpu_submission_copy_source_y_ =
+                    static_cast<std::uint16_t>(
+                        (packet.gp0_words[1U] >> 16U) & 0x1ffU);
+              }
+            }
+          }
+        }
+      }
+      last_gpu_submission_clock_ = system_clock;
+      static_cast<void>(vm_.runtime().read16(
+          vm_.runtime().state().gpr[28U] + 0x26U,
+          last_gpu_submission_draw_buffer_));
+      static_cast<void>(vm_.runtime().read16(
+          vm_.runtime().state().gpr[28U] + 0x2aU,
+          last_gpu_submission_build_buffer_));
+      // A clock transition closes the previous composition even when the
+      // boundary which revealed it is a utility list that cannot itself be
+      // captured as an authored OT. Waiting for the next capturable list
+      // accidentally accumulated several retail ticks and overran audio.
+      if (pending_presentation_ &&
+          system_clock != pending_presentation_clock_) {
+        publishPendingPresentation();
+      }
       auto frame = std::move(captured_submission);
       if (frame) {
+        frame->gp1_words = std::move(boundary_gp1_words);
         const auto invalid_packet = std::ranges::find_if(
             frame->packets, [](const Sf2GpuPacket &packet) {
               return packet.guest_address >= protected_renderer_begin_ &&
@@ -1936,15 +2536,58 @@ private:
         }
       }
       if (frame) {
+        frame->retail_global_pointer = vm_.runtime().state().gpr[28U];
+        const auto retail_draw_buffer_index =
+            frame->retail_global_pointer + 0x26U;
+        const auto retail_display_buffer_index =
+            frame->retail_global_pointer + 0x28U;
+        static_cast<void>(vm_.runtime().read16(
+            retail_draw_buffer_index, frame->retail_draw_buffer_index));
+        static_cast<void>(vm_.runtime().read16(
+            retail_display_buffer_index,
+            frame->retail_display_buffer_index));
+        if (isAuthoredWorldFrame(*frame)) {
+          // ClearImage/GP0(02) is emitted immediately before DrawOTag rather
+          // than linked into the OT. It belongs at the front of this world
+          // composition; dropping it leaves both persistent native pages to
+          // accumulate snow, transparency and old map pixels indefinitely.
+          attachImmediateGpuPackets(*frame);
+        }
+        makeDrawEnvironmentSelfContained(*frame);
         captureOrderingTableUploads(*frame);
       }
-      // SF2 submits several utility lists between complete display lists,
-      // including a large loading-card list. Keep the last authored world/HUD
-      // frame until another complete scene is ready.
-      if (frame && isAuthoredWorldFrame(*frame)) {
+      // Only authored world/UI lists belong in the visible composition.
+      // Retail also queues maintenance OTs whose commands are not display
+      // content; drawing them into the native target darkens the scene.
+      const auto auxiliary =
+          frame && pending_presentation_ &&
+          system_clock == pending_presentation_clock_ &&
+          frame->draw_command_count != 0U;
+      const auto auxiliary_targets_world_page =
+          auxiliary && frame->retail_draw_buffer_index ==
+                           pending_presentation_->retail_draw_buffer_index;
+      if (frame && (isAuthoredWorldFrame(*frame) || auxiliary)) {
+        frame->submission_roots.push_back(frame->ordering_table_root);
+        frame->submission_draw_counts.push_back(
+            frame->draw_command_count);
         attachVramSetup(*frame);
-        presentation_frame_ =
-            std::make_shared<const Sf2PresentationFrame>(std::move(*frame));
+        frame->submission_packet_ends.push_back(frame->packets.size());
+        if (auxiliary) {
+          // SF2 submits matching UI OTs for both PS1 framebuffer pages. The
+          // native compositor has one target, so appending the opposite page
+          // superimposes stale map/UI state and duplicates notifications.
+          if (!disable_retail_auxiliary_ui_ && pending_presentation_ &&
+              auxiliary_targets_world_page) {
+            appendPresentationSubmission(*pending_presentation_,
+                                         std::move(*frame));
+          }
+        } else if (!pending_presentation_) {
+          pending_presentation_clock_ = system_clock;
+          pending_presentation_ = std::move(*frame);
+        } else {
+          appendPresentationSubmission(*pending_presentation_,
+                                       std::move(*frame));
+        }
       }
     }
     const auto retired = vm_.resumeCurrentPcClockNeutral(1U);
@@ -2090,8 +2733,14 @@ private:
     std::map<std::uint32_t, OpenFile> open_files;
     std::vector<std::uint32_t> gpu_gp0_stream;
     std::size_t gpu_gp0_scan{};
+    std::array<std::uint32_t, 6U> gpu_draw_environment_words{};
+    std::array<bool, 6U> gpu_draw_environment_valid{};
     std::vector<Sf2GpuPacket> vram_setup_packets;
+    std::vector<Sf2GpuPacket> pending_immediate_gpu_packets;
     std::shared_ptr<const Sf2PresentationFrame> presentation_frame;
+    std::optional<Sf2PresentationFrame> pending_presentation;
+    std::uint32_t pending_presentation_clock{};
+    std::uint64_t published_sequence{};
     std::vector<std::uint32_t> active_script_programs;
     std::uint64_t callback_ticks{};
     std::uint64_t audio_callback_ticks{};
@@ -2107,6 +2756,11 @@ private:
     bool checkpoint_captured{};
     bool retail_restore_active{};
     std::uint64_t retail_restore_start_frame{};
+    std::uint64_t ui_text_event_count{};
+    std::array<Sf2GuestUiTextEvent, 64U> ui_text_events{};
+    std::uint16_t mission_timer_handle{0xffffU};
+    std::array<char, 9U> mission_timer_text{};
+    std::uint64_t mission_timer_text_updates{};
   };
 
   static constexpr auto profile_ = sf2UsaGuestRuntimeProfile();
@@ -2254,6 +2908,118 @@ private:
               break;
             }
             last_pickup_text_bytes_[index] = static_cast<char>(value);
+          }
+          context.continueGuestInstruction();
+        });
+    // SF2's text system is not layout-compatible with SF1: handles resolve
+    // through the 64-entry pool at 0x80137B04 and each glyph is 0x10 bytes.
+    // Observe the shared create/update/remove boundaries so native
+    // presentation receives the exact retail-authored string regardless of
+    // whether it originated in mission bytecode, an objective, or a pickup.
+    vm_.bindHostCall(
+        0x800a6b7cU, [this](LegacyHostCallContext &context) {
+          recordUiTextEvent(Sf2GuestUiTextEventKind::create, context);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800a8068U, [this](LegacyHostCallContext &context) {
+          recordUiTextEvent(Sf2GuestUiTextEventKind::update, context);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800a716cU, [this](LegacyHostCallContext &context) {
+          recordUiTextEvent(Sf2GuestUiTextEventKind::remove, context);
+          context.continueGuestInstruction();
+        });
+    // Observe invocations of renderer objects which own a manual 0x66 glyph
+    // list at +0x94. This catches the HEALTH producer at the routine entry
+    // while remaining callable through the VM's normal host-call boundary.
+    vm_.bindHostCall(
+        0x80013040U, [this](LegacyHostCallContext &context) {
+          const auto renderer = context.argument(0U);
+          const auto global_pointer = context.registerValue(28U);
+          if (renderer != 0U) {
+            std::array<std::uint32_t, 3U> lists{};
+            static_cast<void>(context.read32(renderer + 0x90U, lists[0U]));
+            static_cast<void>(context.read32(renderer + 0x94U, lists[1U]));
+            static_cast<void>(context.read32(renderer + 0x98U, lists[2U]));
+            if (lists[1U] == 0U) {
+              context.continueGuestInstruction();
+              return;
+            }
+            std::uint16_t build_buffer{};
+            static_cast<void>(
+                context.read16(global_pointer + 0x2aU, build_buffer));
+            if (build_buffer < text_renderer_calls_.size()) {
+              ++text_renderer_calls_[build_buffer];
+            }
+            text_renderer_ = renderer;
+            static_cast<void>(context.read16(renderer + 0x06U,
+                                             text_renderer_flags_));
+            text_renderer_list_heads_ = lists;
+          }
+          context.continueGuestInstruction();
+        });
+    // Track the retail callers which register primitives from the small
+    // mission-HUD allocation immediately preceding the radar packets.  This
+    // is observation-only: it identifies the real producer of the six
+    // HEALTH glyph sprites that currently populate only one display page.
+    vm_.bindHostCall(
+        0x80013000U, [this](LegacyHostCallContext &context) {
+          const auto packet = context.argument(1U);
+          if (packet >= 0x8014f000U && packet < 0x80169020U) {
+            const auto caller = context.returnAddress();
+            ++hud_primitive_registrations_;
+            auto slot = hud_primitive_registration_callers_.size();
+            for (auto index = std::size_t{};
+                 index < hud_primitive_registration_callers_.size();
+                 ++index) {
+              if (hud_primitive_registration_callers_[index] == caller ||
+                  hud_primitive_registration_callers_[index] == 0U) {
+                slot = index;
+                break;
+              }
+            }
+            if (slot < hud_primitive_registration_callers_.size()) {
+              hud_primitive_registration_callers_[slot] = caller;
+              hud_primitive_registration_packets_[slot] = packet;
+              hud_primitive_registration_roots_[slot] = context.argument(0U);
+              ++hud_primitive_registration_counts_[slot];
+              std::uint16_t build_buffer{};
+              static_cast<void>(context.read16(
+                  context.registerValue(28U) + 0x2aU, build_buffer));
+              if (build_buffer < 8U) {
+                hud_primitive_registration_buffer_masks_[slot] |=
+                    static_cast<std::uint8_t>(1U << build_buffer);
+              }
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80013354U, [](LegacyHostCallContext &context) {
+          // The retained auxiliary source primitives live at
+          // 0x80168AE8..0x80169778. Retail's odd-page packet cursor begins at
+          // 0x801689FC, immediately below that pool. Once combat HUD and text
+          // increase the copied packet volume, the output overtakes unread
+          // source records and turns their DMA lengths into GP0 E1 words.
+          //
+          // Native presentation snapshots every completed OT before the next
+          // retail tick, so both auxiliary pages can safely use the retired
+          // even-page packet workspace. Keep the odd-page glyph packets at
+          // their authored addresses, but relocate the general-list copy
+          // cursor before the renderer loads it at this instruction.
+          constexpr std::uint16_t odd_auxiliary_table = 3U;
+          constexpr std::uint32_t auxiliary_renderer = 0x80120ae0U;
+          constexpr std::uint32_t packet_cursor = 0x8013e6dcU;
+          constexpr std::uint32_t safe_packet_workspace = 0x8014fc5cU;
+          std::uint16_t table_index{};
+          if (context.registerValue(19U) == auxiliary_renderer &&
+              context.read16(context.registerValue(28U) + 0x2aU,
+                             table_index) &&
+              table_index == odd_auxiliary_table) {
+            static_cast<void>(
+                context.write32(packet_cursor, safe_packet_workspace));
           }
           context.continueGuestInstruction();
         });
@@ -3527,6 +4293,66 @@ private:
     ++timeline_event_count_;
   }
 
+  void recordUiTextEvent(
+      Sf2GuestUiTextEventKind kind,
+      const LegacyHostCallContext &context) noexcept {
+    Sf2GuestUiTextEvent event;
+    event.kind = kind;
+    event.guest_frame = guest_frame_;
+    static_cast<void>(vm_.runtime().read32(
+        profile_.system_clock, event.system_clock));
+    for (auto index = std::size_t{}; index < event.arguments.size(); ++index) {
+      event.arguments[index] =
+          context.argument(static_cast<std::uint32_t>(index));
+    }
+    if (kind != Sf2GuestUiTextEventKind::remove &&
+        event.arguments[1U] != 0U) {
+      for (auto index = std::size_t{}; index + 1U < event.text.size();
+           ++index) {
+        std::uint8_t value{};
+        if (!context.read8(event.arguments[1U] +
+                               static_cast<std::uint32_t>(index),
+                           value) ||
+            value == 0U) {
+          break;
+        }
+        event.text[index] = static_cast<char>(value);
+      }
+    }
+    const auto timer_text =
+        event.text[0U] >= '0' && event.text[0U] <= '9' &&
+        event.text[1U] >= '0' && event.text[1U] <= '9' &&
+        event.text[2U] == ':' &&
+        event.text[3U] >= '0' && event.text[3U] <= '9' &&
+        event.text[4U] >= '0' && event.text[4U] <= '9' &&
+        event.text[5U] == ':' &&
+        event.text[6U] >= '0' && event.text[6U] <= '9' &&
+        event.text[7U] >= '0' && event.text[7U] <= '9' &&
+        event.text[8U] == '\0';
+    if (timer_text) {
+      // Text_Update supplies the generation-tagged handle. The preceding
+      // create call only carries a template index and must not be mistaken
+      // for an object handle.
+      if (kind == Sf2GuestUiTextEventKind::update) {
+        mission_timer_handle_ =
+            static_cast<std::uint16_t>(event.arguments[0U]);
+        std::ranges::copy_n(event.text.begin(), mission_timer_text_.size(),
+                            mission_timer_text_.begin());
+        ++mission_timer_text_updates_;
+      }
+      return;
+    }
+    if (kind == Sf2GuestUiTextEventKind::remove &&
+        static_cast<std::uint16_t>(event.arguments[0U]) ==
+            mission_timer_handle_) {
+      mission_timer_handle_ = 0xffffU;
+      mission_timer_text_.fill('\0');
+      return;
+    }
+    ui_text_events_[ui_text_event_count_ % ui_text_events_.size()] = event;
+    ++ui_text_event_count_;
+  }
+
   [[nodiscard]] bool
   writeMissionPadRecord(const LegacyHostPadState &state) noexcept {
     if (mission_pad_record_ == 0U) {
@@ -3597,6 +4423,14 @@ private:
 
   GameDisc disc_;
   LegacyGameplayVm vm_;
+  std::ofstream ui_instruction_trace_;
+  std::vector<UiInstructionTraceRecord> ui_instruction_trace_buffer_;
+  std::uint64_t ui_instruction_trace_events_{};
+  std::uint64_t ui_instruction_trace_max_bytes_{};
+  std::uint32_t ui_instruction_trace_begin_clock_{};
+  std::uint32_t ui_instruction_trace_end_clock_{
+      std::numeric_limits<std::uint32_t>::max()};
+  bool ui_instruction_trace_capped_{};
   DiscCdRomMedia cdrom_media_;
   std::uint32_t mission_index_{};
   std::string fog_path_;
@@ -3611,9 +4445,16 @@ private:
   std::array<std::byte, 0x240U> catalog_copy_{};
   LegacyHostPadState host_pad_{};
   std::shared_ptr<const Sf2PresentationFrame> presentation_frame_;
+  std::optional<Sf2PresentationFrame> pending_presentation_;
+  std::uint32_t pending_presentation_clock_{};
+  bool disable_retail_auxiliary_ui_{};
+  std::uint64_t published_sequence_{};
   std::vector<std::uint32_t> gpu_gp0_stream_;
   std::size_t gpu_gp0_scan_{};
+  std::array<std::uint32_t, 6U> gpu_draw_environment_words_{};
+  std::array<bool, 6U> gpu_draw_environment_valid_{};
   std::vector<Sf2GpuPacket> vram_setup_packets_;
+  std::vector<Sf2GpuPacket> pending_immediate_gpu_packets_;
   std::uint64_t callback_ticks_{};
   std::uint64_t audio_callback_ticks_{};
   std::uint64_t retrace_ticks_{};
@@ -3660,6 +4501,36 @@ private:
   std::uint32_t last_renderer_text_writer_pc_{};
   std::uint32_t last_renderer_text_writer_instruction_{};
   std::uint64_t rejected_renderer_ordering_tables_{};
+  std::uint64_t observed_gpu_submissions_{};
+  std::uint32_t last_gpu_submission_root_{};
+  std::size_t last_gpu_submission_draw_count_{};
+  std::size_t last_gpu_submission_packet_count_{};
+  std::size_t last_gpu_submission_copy_count_{};
+  std::size_t last_gpu_submission_upload_count_{};
+  Sf2GpuTransfer last_gpu_submission_copy_{};
+  std::uint16_t last_gpu_submission_copy_source_x_{};
+  std::uint16_t last_gpu_submission_copy_source_y_{};
+  std::uint32_t last_gpu_submission_clock_{};
+  std::uint16_t last_gpu_submission_draw_buffer_{};
+  std::uint16_t last_gpu_submission_build_buffer_{};
+  std::uint32_t last_gpu_submission_first_draw_packet_{};
+  std::uint32_t last_gpu_submission_last_draw_packet_{};
+  std::array<std::uint64_t, 2U> text_renderer_calls_{};
+  std::uint32_t text_renderer_{};
+  std::uint16_t text_renderer_flags_{};
+  std::array<std::uint32_t, 3U> text_renderer_list_heads_{};
+  std::uint64_t hud_primitive_registrations_{};
+  std::array<std::uint32_t, 8U> hud_primitive_registration_callers_{};
+  std::array<std::uint32_t, 8U> hud_primitive_registration_packets_{};
+  std::array<std::uint32_t, 8U> hud_primitive_registration_roots_{};
+  std::array<std::uint64_t, 8U> hud_primitive_registration_counts_{};
+  std::array<std::uint8_t, 8U> hud_primitive_registration_buffer_masks_{};
+  std::uint64_t hud_primitive_writes_{};
+  std::array<std::uint32_t, 12U> hud_primitive_writer_pcs_{};
+  std::array<std::uint32_t, 12U> hud_primitive_writer_addresses_{};
+  std::array<std::uint32_t, 12U> hud_primitive_writer_instructions_{};
+  std::array<std::uint64_t, 12U> hud_primitive_writer_counts_{};
+  std::array<std::uint8_t, 12U> hud_primitive_writer_buffer_masks_{};
   std::uint32_t last_rejected_renderer_packet_{};
   std::uint32_t last_rejected_renderer_root_{};
   std::uint64_t last_rejected_renderer_frame_{};
@@ -3733,6 +4604,11 @@ private:
   std::uint64_t xa_stream_stops_{};
   std::uint64_t timeline_event_count_{};
   std::array<Sf2GuestTimelineEvent, 64U> timeline_events_{};
+  std::uint64_t ui_text_event_count_{};
+  std::array<Sf2GuestUiTextEvent, 64U> ui_text_events_{};
+  std::uint16_t mission_timer_handle_{0xffffU};
+  std::array<char, 9U> mission_timer_text_{};
+  std::uint64_t mission_timer_text_updates_{};
   std::uint64_t async_file_services_{};
   std::uint64_t async_file_completions_{};
   std::uint32_t last_async_completion_caller_{};
@@ -3777,6 +4653,11 @@ std::string_view Sf2GuestMissionRuntime::faultDetail() const noexcept {
 void Sf2GuestMissionRuntime::setHostPadState(
     const LegacyHostPadState &state) noexcept {
   impl_->setHostPadState(state);
+}
+
+void Sf2GuestMissionRuntime::setRetailAuxiliaryUiEnabled(
+    bool enabled) noexcept {
+  impl_->setRetailAuxiliaryUiEnabled(enabled);
 }
 
 bool Sf2GuestMissionRuntime::dispatchScriptEventForProbe(

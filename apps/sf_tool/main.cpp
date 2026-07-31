@@ -101,7 +101,7 @@ void printUsage() {
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
          "[neutral|forward|combat|crouch|quickstate|quickobjective|"
-         "crouchback|objective|objective-dialogue|weapons] "
+         "crouchback|objective|objective-dialogue|weapons|ui|uiobjective] "
          "[resource-index-0-based]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
@@ -6466,6 +6466,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool crouch_back,
                            bool quick_state, bool objective_event,
                            bool weapon_cycle, bool skip_objective_scene,
+                           bool scan_ui_objects,
                            std::uint32_t mission_index) {
   sf::game::Sf2GuestMissionRuntime runtime{
       std::filesystem::path{cue_path}, mission_index};
@@ -6989,6 +6990,122 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     inspect_pcm(count);
   }
   const auto diagnostics = runtime.diagnostics();
+  if (scan_ui_objects) {
+    std::vector<std::byte> ram(sf::psx::R3000Runtime::ram_size);
+    if (!runtime.copyGuestRamForProbe(ram)) {
+      std::cerr << "SF2 UI-object probe could not copy guest RAM\n";
+      return 10;
+    }
+    const auto read16 = [&ram](std::size_t offset) {
+      return static_cast<std::uint16_t>(
+          std::to_integer<std::uint8_t>(ram[offset]) |
+          (static_cast<std::uint16_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 1U]))
+           << 8U));
+    };
+    const auto read32 = [&ram](std::size_t offset) {
+      return static_cast<std::uint32_t>(
+          std::to_integer<std::uint8_t>(ram[offset]) |
+          (static_cast<std::uint32_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 1U]))
+           << 8U) |
+          (static_cast<std::uint32_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 2U]))
+           << 16U) |
+          (static_cast<std::uint32_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 3U]))
+           << 24U));
+    };
+    std::cout << "SF2 UI sprite packets:";
+    for (const auto &packet : presentation->packets) {
+      if (packet.gp0_words.empty()) {
+        continue;
+      }
+      const auto opcode = packet.gp0_words.front() >> 24U;
+      if (opcode < 0x60U || opcode > 0x7fU) {
+        continue;
+      }
+      std::cout << " 0x" << std::hex << std::uppercase
+                << packet.guest_address << ":";
+      for (const auto word : packet.gp0_words) {
+        std::cout << word << "/";
+      }
+      std::cout << std::dec;
+    }
+    std::cout << '\n';
+    constexpr auto timer_format_string = 0x801bb182U;
+    std::cout << "SF2 timer-format references:";
+    auto format_references = std::size_t{};
+    for (auto offset = std::size_t{}; offset + 4U <= ram.size();
+         offset += 4U) {
+      if (read32(offset) != timer_format_string) {
+        continue;
+      }
+      std::cout << " 0x" << std::hex << std::uppercase
+                << (0x80000000U + static_cast<std::uint32_t>(offset));
+      ++format_references;
+    }
+    std::cout << std::dec << " count=" << format_references << '\n';
+    // TextHandle_Resolve at 0x800A5718 proves a 64-entry, 0x1c-byte object
+    // pool at 0x80137B04. TextGlyph_Allocate at 0x800A6290 proves the sequel
+    // glyph pool at 0x80137014 uses a 0x10-byte stride and 0xaf entries. Dump
+    // only live, pool-backed records; this is deterministic structural
+    // evidence rather than a whole-RAM pattern guess.
+    constexpr auto text_object_pool = 0x00137b04U;
+    constexpr auto text_object_stride = 0x1cU;
+    constexpr auto text_object_capacity = 64U;
+    constexpr auto glyph_pool_begin = 0x80137014U;
+    constexpr auto glyph_pool_end = glyph_pool_begin + 0xafU * 0x10U;
+    auto live_objects = 0U;
+    std::cout << "SF2 live text objects:";
+    for (auto index = 0U; index < text_object_capacity; ++index) {
+      const auto object = text_object_pool + index * text_object_stride;
+      const auto glyph_pointer = read32(object);
+      const auto glyph_count = read16(object + 0x0cU);
+      if (glyph_pointer < glyph_pool_begin || glyph_pointer >= glyph_pool_end ||
+          glyph_count == 0U || glyph_count > 0xafU) {
+        continue;
+      }
+      std::cout << " " << index << "=0x" << std::hex << std::uppercase
+                << glyph_pointer << std::dec << "/n" << glyph_count << "/g"
+                << static_cast<unsigned int>(
+                       std::to_integer<std::uint8_t>(ram[object + 0x15U]))
+                << "/f0x" << std::hex
+                << static_cast<unsigned int>(
+                       std::to_integer<std::uint8_t>(ram[object + 0x14U]))
+                << "/xy" << std::dec
+                << std::bit_cast<std::int16_t>(read16(object + 0x0eU)) << ","
+                << std::bit_cast<std::int16_t>(read16(object + 0x10U));
+      ++live_objects;
+    }
+    std::cout << " count=" << live_objects << '\n';
+    std::cout << "SF2 UI text events:";
+    const auto first_ui_event =
+        diagnostics.ui_text_event_count > diagnostics.ui_text_events.size()
+            ? diagnostics.ui_text_event_count -
+                  diagnostics.ui_text_events.size()
+            : 0U;
+    for (auto serial = first_ui_event;
+         serial < diagnostics.ui_text_event_count; ++serial) {
+      const auto &event = diagnostics.ui_text_events[
+          serial % diagnostics.ui_text_events.size()];
+      std::cout << " [" << serial << "/"
+                << static_cast<unsigned int>(event.kind) << "@"
+                << event.guest_frame << "/" << event.system_clock << ":0x"
+                << std::hex << std::uppercase << event.arguments[0U] << "/"
+                << event.arguments[1U] << "/" << event.arguments[2U] << "/"
+                << event.arguments[3U] << std::dec << ":";
+      for (const auto character : event.text) {
+        if (character == '\0') {
+          break;
+        }
+        std::cout << (static_cast<unsigned char>(character) < 0x20U ? ' '
+                                                                      : character);
+      }
+      std::cout << "]";
+    }
+    std::cout << '\n';
+  }
   std::vector<std::uint32_t> presentation_words;
   presentation_words.reserve(presentation->gp0_word_count);
   for (const auto &packet : presentation->packets) {
@@ -7006,6 +7123,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       : forward      ? "forward"
       : crouch       ? "crouch"
       : quick_state  ? "quickstate"
+      : scan_ui_objects ? "ui"
                       : "neutral";
   std::cout << "SF2 product runtime completed: frames=" << frames
             << " input=" << input_mode
@@ -7298,7 +7416,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
               << timer.timer_index << "=" << timer.remaining_ticks << ",";
   }
   std::cout << "/hud=" << diagnostics.mission_timer_visible << "/"
-            << diagnostics.mission_timer_ticks
+            << diagnostics.mission_timer_ticks << "/"
+            << diagnostics.mission_timer_handle << "/"
+            << diagnostics.mission_timer_text.data() << "/updates="
+            << diagnostics.mission_timer_text_updates
             << " level=0x" << std::hex << std::uppercase
             << diagnostics.script_level_program << "/"
             << diagnostics.script_level_name_pointer << ":"
@@ -11765,7 +11886,7 @@ int main(int argc, char **argv) {
           mode != "combat" && mode != "crouch" &&
           mode != "crouchback" &&
           mode != "objective" && mode != "objective-dialogue" &&
-          mode != "weapons" &&
+          mode != "weapons" && mode != "ui" && mode != "uiobjective" &&
           mode != "quickstate" && mode != "quickobjective") {
         printUsage();
         return 1;
@@ -11776,8 +11897,10 @@ int main(int argc, char **argv) {
           mode == "crouchback",
           mode == "quickstate" || mode == "quickobjective",
           mode == "objective" || mode == "weapons" ||
+              mode == "uiobjective" ||
               mode == "quickobjective" || mode == "objective-dialogue",
           mode == "weapons", mode != "objective-dialogue",
+          mode == "ui" || mode == "uiobjective",
           argc == 6 ? parseSf2MissionIndex(argv[5]) : 2U);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {

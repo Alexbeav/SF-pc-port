@@ -11,6 +11,7 @@
 #include <array>
 #include <assert.h>
 #include <string.h>
+#include <vector>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -432,22 +433,85 @@ GLuint		g_glVRAMFramebuffer;
 GLuint		g_glOffscreenFramebuffer;
 GrPBO		g_glOffscreenPBO;
 
-GLuint		g_glNativeFramebuffer;
-GLuint		g_glNativeColorTexture;
+GLuint		g_glNativeFramebuffer[2];
+GLuint		g_glNativeColorTexture[2];
 GLuint		g_glNativeDepthRenderbuffer;
 GLuint		g_glNativeStencilRenderbuffer;
-GLuint		g_glNativeMultisampleFramebuffer;
-GLuint		g_glNativeMultisampleColorRenderbuffer;
+GLuint		g_glNativeMultisampleFramebuffer[2];
+GLuint		g_glNativeMultisampleColorRenderbuffer[2];
 GLuint		g_glNativeMultisampleDepthRenderbuffer;
 int			g_nativeFramebufferWidth;
 int			g_nativeFramebufferHeight;
 int			g_nativeFramebufferSamples;
+int			g_nativeFramebufferPage;
+
+static GLuint PsyX_GetNativeResolveFramebuffer()
+{
+	return g_glNativeFramebuffer[g_nativeFramebufferPage];
+}
 
 static GLuint PsyX_GetNativeDrawFramebuffer()
 {
 	return g_nativeFramebufferSamples > 1
-		? g_glNativeMultisampleFramebuffer
-		: g_glNativeFramebuffer;
+		? g_glNativeMultisampleFramebuffer[g_nativeFramebufferPage]
+		: PsyX_GetNativeResolveFramebuffer();
+}
+
+void GR_SetNativeFramebufferPage(int page)
+{
+	g_nativeFramebufferPage = page != 0 ? 1 : 0;
+}
+
+void GR_ClearNativeFramebufferPage()
+{
+	if (g_nativeFramebufferWidth <= 0 || g_nativeFramebufferHeight <= 0)
+		return;
+
+	const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+	GLfloat clearColor[4];
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glBindFramebuffer(GL_FRAMEBUFFER,
+		g_glNativeFramebuffer[g_nativeFramebufferPage]);
+	glClear(GL_COLOR_BUFFER_BIT);
+	if (g_nativeFramebufferSamples > 1)
+	{
+		glBindFramebuffer(GL_FRAMEBUFFER,
+			g_glNativeMultisampleFramebuffer[g_nativeFramebufferPage]);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+	glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+	if (scissorEnabled)
+		glEnable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
+}
+
+void GR_ClearNativeFramebufferPages()
+{
+	if (g_nativeFramebufferWidth <= 0 || g_nativeFramebufferHeight <= 0)
+		return;
+
+	const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+	GLfloat clearColor[4];
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	for (int page = 0; page < 2; ++page)
+	{
+		glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer[page]);
+		glClear(GL_COLOR_BUFFER_BIT);
+		if (g_nativeFramebufferSamples > 1)
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER,
+				g_glNativeMultisampleFramebuffer[page]);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+	}
+	glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+	if (scissorEnabled)
+		glEnable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeDrawFramebuffer());
 }
 
 static int PsyX_EnsureNativeFramebuffer()
@@ -466,14 +530,26 @@ static int PsyX_EnsureNativeFramebuffer()
 #else
 	const GLenum nativeColorFormat = GL_RGBA8;
 #endif
-	glBindTexture(GL_TEXTURE_2D, g_glNativeColorTexture);
-	glTexImage2D(GL_TEXTURE_2D, 0, nativeColorFormat, nativeViewport.w, nativeViewport.h,
-		0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-	glBindTexture(GL_TEXTURE_2D, 0);
+	for (int page = 0; page < 2; ++page)
+	{
+		glBindTexture(GL_TEXTURE_2D, g_glNativeColorTexture[page]);
+		glTexImage2D(GL_TEXTURE_2D, 0, nativeColorFormat, nativeViewport.w, nativeViewport.h,
+			0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer[page]);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+			g_glNativeColorTexture[page], 0);
 
-	glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-		g_glNativeColorTexture, 0);
+#if defined(RENDERER_OGLES) && OGLES_VERSION == 2
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER,
+			g_glNativeDepthRenderbuffer);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
+			g_glNativeStencilRenderbuffer);
+#else
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+			GL_RENDERBUFFER, g_glNativeDepthRenderbuffer);
+#endif
+	}
+	glBindTexture(GL_TEXTURE_2D, 0);
 
 #if defined(RENDERER_OGLES) && OGLES_VERSION == 2
 	glBindRenderbuffer(GL_RENDERBUFFER, g_glNativeDepthRenderbuffer);
@@ -517,19 +593,21 @@ static int PsyX_EnsureNativeFramebuffer()
 #if USE_FRAMEBUFFER_BLIT
 	if (g_cfg_msaaSamples > 1)
 	{
-		glBindRenderbuffer(GL_RENDERBUFFER, g_glNativeMultisampleColorRenderbuffer);
-		glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_cfg_msaaSamples, GL_RGBA8,
-			nativeViewport.w, nativeViewport.h);
-
 		glBindRenderbuffer(GL_RENDERBUFFER, g_glNativeMultisampleDepthRenderbuffer);
 		glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_cfg_msaaSamples,
 			GL_DEPTH32F_STENCIL8, nativeViewport.w, nativeViewport.h);
 
-		glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeMultisampleFramebuffer);
-		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
-			g_glNativeMultisampleColorRenderbuffer);
-		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-			GL_RENDERBUFFER, g_glNativeMultisampleDepthRenderbuffer);
+		for (int page = 0; page < 2; ++page)
+		{
+			glBindRenderbuffer(GL_RENDERBUFFER, g_glNativeMultisampleColorRenderbuffer[page]);
+			glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_cfg_msaaSamples, GL_RGBA8,
+				nativeViewport.w, nativeViewport.h);
+			glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeMultisampleFramebuffer[page]);
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+				g_glNativeMultisampleColorRenderbuffer[page]);
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+				GL_RENDERBUFFER, g_glNativeMultisampleDepthRenderbuffer);
+		}
 
 		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
 		{
@@ -538,14 +616,17 @@ static int PsyX_EnsureNativeFramebuffer()
 				GL_DEPTH24_STENCIL8, nativeViewport.w, nativeViewport.h);
 			eprintwarn("32F MSAA depth unavailable; using reversed D24S8\n");
 		}
-		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+		g_nativeFramebufferSamples = g_cfg_msaaSamples;
+		for (int page = 0; page < 2; ++page)
 		{
-			g_nativeFramebufferSamples = g_cfg_msaaSamples;
-		}
-		else
-		{
-			eprintwarn("MSAA framebuffer is unavailable; falling back to disabled\n");
-			g_cfg_msaaSamples = 0;
+			glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeMultisampleFramebuffer[page]);
+			if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+			{
+				eprintwarn("MSAA framebuffer is unavailable; falling back to disabled\n");
+				g_cfg_msaaSamples = 0;
+				g_nativeFramebufferSamples = 0;
+				break;
+			}
 		}
 	}
 #else
@@ -554,6 +635,18 @@ static int PsyX_EnsureNativeFramebuffer()
 
 	g_nativeFramebufferWidth = nativeViewport.w;
 	g_nativeFramebufferHeight = nativeViewport.h;
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	for (int page = 0; page < 2; ++page)
+	{
+		glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer[page]);
+		glClear(GL_COLOR_BUFFER_BIT);
+		if (g_nativeFramebufferSamples > 1)
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeMultisampleFramebuffer[page]);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+	}
 	eprintf("*Internal render target: %dx%d, MSAA: %dx\n",
 		g_nativeFramebufferWidth, g_nativeFramebufferHeight,
 		g_nativeFramebufferSamples);
@@ -570,8 +663,9 @@ static void PsyX_ResolveNativeFramebuffer()
 
 	const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
 	glDisable(GL_SCISSOR_TEST);
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glNativeMultisampleFramebuffer);
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glNativeFramebuffer);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER,
+		g_glNativeMultisampleFramebuffer[g_nativeFramebufferPage]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, PsyX_GetNativeResolveFramebuffer());
 	glBlitFramebuffer(0, 0, g_nativeFramebufferWidth, g_nativeFramebufferHeight,
 		0, 0, g_nativeFramebufferWidth, g_nativeFramebufferHeight,
 		GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -590,7 +684,7 @@ static void PsyX_PresentNativeFramebuffer()
 	glDisable(GL_SCISSOR_TEST);
 	PsyX_ResolveNativeFramebuffer();
 
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glNativeFramebuffer);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, PsyX_GetNativeResolveFramebuffer());
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
@@ -781,13 +875,13 @@ void GR_Shutdown()
 	glDeleteFramebuffers(1, &g_glBlitFramebuffer);
 	glDeleteFramebuffers(1, &g_glOffscreenFramebuffer);
 	glDeleteFramebuffers(1, &g_glVRAMFramebuffer);
-	glDeleteFramebuffers(1, &g_glNativeFramebuffer);
-	glDeleteFramebuffers(1, &g_glNativeMultisampleFramebuffer);
+	glDeleteFramebuffers(2, g_glNativeFramebuffer);
+	glDeleteFramebuffers(2, g_glNativeMultisampleFramebuffer);
 	glDeleteRenderbuffers(1, &g_glNativeDepthRenderbuffer);
 	glDeleteRenderbuffers(1, &g_glNativeStencilRenderbuffer);
-	glDeleteRenderbuffers(1, &g_glNativeMultisampleColorRenderbuffer);
+	glDeleteRenderbuffers(2, g_glNativeMultisampleColorRenderbuffer);
 	glDeleteRenderbuffers(1, &g_glNativeMultisampleDepthRenderbuffer);
-	glDeleteTextures(1, &g_glNativeColorTexture);
+	glDeleteTextures(2, g_glNativeColorTexture);
 
 	GR_DestroyTexture(g_vramTexturesDouble[0]);
 	GR_DestroyTexture(g_vramTexturesDouble[1]);
@@ -1567,18 +1661,21 @@ int GR_InitialisePSX()
 
 	// All display primitives are rasterized at the active PSX DISPENV size.
 	// The default framebuffer is used only for the final 4:3 presentation blit.
-	glGenTextures(1, &g_glNativeColorTexture);
-	glBindTexture(GL_TEXTURE_2D, g_glNativeColorTexture);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glGenTextures(2, g_glNativeColorTexture);
+	for (int page = 0; page < 2; ++page)
+	{
+		glBindTexture(GL_TEXTURE_2D, g_glNativeColorTexture[page]);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
 	glBindTexture(GL_TEXTURE_2D, 0);
-	glGenFramebuffers(1, &g_glNativeFramebuffer);
+	glGenFramebuffers(2, g_glNativeFramebuffer);
 	glGenRenderbuffers(1, &g_glNativeDepthRenderbuffer);
 	glGenRenderbuffers(1, &g_glNativeStencilRenderbuffer);
-	glGenFramebuffers(1, &g_glNativeMultisampleFramebuffer);
-	glGenRenderbuffers(1, &g_glNativeMultisampleColorRenderbuffer);
+	glGenFramebuffers(2, g_glNativeMultisampleFramebuffer);
+	glGenRenderbuffers(2, g_glNativeMultisampleColorRenderbuffer);
 	glGenRenderbuffers(1, &g_glNativeMultisampleDepthRenderbuffer);
 
 	// gen framebuffer
@@ -2325,7 +2422,8 @@ void GR_StoreFrameBuffer(int x, int y, int w, int h)
 	// before drawing set source and target
 	{
 		// setup draw and read framebuffers
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glNativeFramebuffer);	// source is native PSX framebuffer
+		glBindFramebuffer(GL_READ_FRAMEBUFFER,
+			PsyX_GetNativeResolveFramebuffer());	// source is native PSX framebuffer
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glBlitFramebuffer);
 
 		const PsyXPresentationViewport viewport = PsyX_GetRenderViewport();
@@ -2367,8 +2465,12 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 {
 	if (w <= 0 || h <= 0)
 		return;
-	assert(x >= 0 && y >= 0 && dst_x >= 0 && dst_y >= 0);
-	assert(dst_x + w <= VRAM_WIDTH && dst_y + h <= VRAM_HEIGHT);
+	x &= VRAM_WIDTH - 1;
+	y &= VRAM_HEIGHT - 1;
+	dst_x &= VRAM_WIDTH - 1;
+	dst_y &= VRAM_HEIGHT - 1;
+	w = std::min(w, VRAM_WIDTH);
+	h = std::min(h, VRAM_HEIGHT);
 
 	GR_MarkVRAMDirty(dst_x, dst_y, w, h);
 
@@ -2380,10 +2482,42 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 
 	if (internalCopy)
 	{
-		assert(x + w <= VRAM_WIDTH && y + h <= VRAM_HEIGHT);
 		framebuffer_need_update = 1;
 		src = vram;
 		stride = VRAM_WIDTH;
+	}
+
+	// GP0 VRAM copies wrap at the 1024x512 VRAM edges. The common in-bounds
+	// path below stays allocation-free; use a snapshot for wrapped copies so
+	// overlap retains MoveImage semantics and can never walk beyond `vram`.
+	if (internalCopy &&
+		(x + w > VRAM_WIDTH || y + h > VRAM_HEIGHT ||
+		 dst_x + w > VRAM_WIDTH || dst_y + h > VRAM_HEIGHT))
+	{
+		std::vector<unsigned short> snapshot(static_cast<size_t>(w) * h);
+		for (int row = 0; row < h; ++row)
+		{
+			for (int column = 0; column < w; ++column)
+			{
+				snapshot[static_cast<size_t>(row) * w + column] =
+					vram[((y + row) & (VRAM_HEIGHT - 1)) * VRAM_WIDTH +
+						 ((x + column) & (VRAM_WIDTH - 1))];
+			}
+		}
+		for (int row = 0; row < h; ++row)
+		{
+			for (int column = 0; column < w; ++column)
+			{
+				vram[((dst_y + row) & (VRAM_HEIGHT - 1)) * VRAM_WIDTH +
+					 ((dst_x + column) & (VRAM_WIDTH - 1))] =
+					snapshot[static_cast<size_t>(row) * w + column];
+			}
+		}
+		// A wrapped rectangle is not representable by the single dirty region
+		// recorded above. This path is rare, so conservatively refresh both
+		// complete VRAM textures after applying it.
+		GR_ResetVRAMDirtyRects();
+		return;
 	}
 
 	if (internalCopy && dst_y > sourceY && dst_y < sourceY + h)
@@ -2515,7 +2649,7 @@ void GR_ReadScreenPixels(int width, int height, unsigned char* pixels)
 	GLint previousFramebuffer = 0;
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
 	PsyX_ResolveNativeFramebuffer();
-	glBindFramebuffer(GL_FRAMEBUFFER, g_glNativeFramebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, PsyX_GetNativeResolveFramebuffer());
 #if defined(RENDERER_OGL)
 	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
 #else
