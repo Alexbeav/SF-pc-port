@@ -25,8 +25,9 @@ pre-release tags rather than a stable semantic-versioning promise.
   bridge to use `MOVIE2.HOG`.
 - Recovered Disc 2's campaign-to-archive permutation and kept mission loading
   on the retail TITLE handoff. All thirteen Disc 2 packages now reach live
-  gameplay in the headless product runtime; DISCO and LABS2 also pass
-  extended combat, restart, and F5/F9 gates.
+  gameplay and pass 3,000-update combat/input stress routes in the headless
+  product runtime; nine cross one or more retail restart cycles. DISCO and
+  LABS2 also pass focused F5/F9 gates.
 - Contained stale sound variants at the 24-voice SPU hardware boundary.
   LABS2 no longer faults when a released variant's reused voice byte exceeds
   the physical voice bank, while valid retail voice updates remain untouched.
