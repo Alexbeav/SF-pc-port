@@ -102,7 +102,7 @@ void printUsage() {
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
          "[neutral|forward|combat|crouch|quickstate|quickobjective|"
          "objective|weapons] "
-         "[mission-index]\n"
+         "[resource-index-0-based]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
