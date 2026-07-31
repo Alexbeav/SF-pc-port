@@ -2591,7 +2591,10 @@ public:
           upload(layer);
         }
       }
-      if (state.scoped) {
+      // SF2's guest ordering tables own their weapon optics.  The sequel's
+      // interface archives do not contain SF1's SCOPED/SCP* TIM set, so a
+      // scoped SF2 weapon must not enter the native SF1 residency path.
+      if (state.scoped && hud_atlas_ == game::HudAtlasKind::sf1) {
         if (weapon == game::WeaponId::nightvision_rifle) {
           for (std::size_t index = 0;
                index < nightvision_scope_layers.size(); ++index) {
@@ -8205,6 +8208,18 @@ static_assert(packedScreenY(0x04000400U) == -1024);
 static_assert(isDisabledGpuVertex(0x04000400U));
 static_assert(!isDisabledGpuVertex(0x003eff56U));
 
+[[nodiscard]] constexpr bool gpuPolygonSpanRejected(
+    std::int16_t minimum_x, std::int16_t maximum_x,
+    std::int16_t minimum_y, std::int16_t maximum_y) noexcept {
+  return static_cast<std::int32_t>(maximum_x) - minimum_x >= 1024 ||
+         static_cast<std::int32_t>(maximum_y) - minimum_y >= 512;
+}
+
+static_assert(!gpuPolygonSpanRejected(-512, 511, -256, 255));
+static_assert(gpuPolygonSpanRejected(-512, 512, -256, 255));
+static_assert(gpuPolygonSpanRejected(-512, 511, -256, 256));
+static_assert(gpuPolygonSpanRejected(-1024, -122, -1024, 62));
+
 [[nodiscard]] constexpr double
 reprojectGuestCoordinate(double guest_coordinate, double draw_offset,
                          double presented_minus_guest) noexcept {
@@ -13291,10 +13306,11 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
     const auto y = [&words](std::size_t index) {
       return static_cast<float>(packedScreenY(words[index]));
     };
-    // SF2 disables preallocated polygons and lines by placing a vertex at
-    // (-1024,-1024). The PS1 rejects the resulting oversized primitive;
-    // PsyCross clips and rasterizes it instead, producing a screen-wide radar
-    // wedge. Preserve the retail rejection before handing it to PsyCross.
+    // SF2 disables preallocated primitives by placing vertices at
+    // (-1024,-1024). Polygon projection near the camera can produce the same
+    // large raw-coordinate spans. The PS1 rejects polygons spanning 1024
+    // horizontal or 512 vertical coordinate units; PsyCross otherwise clips
+    // and rasterizes them as screen-filling vertex explosions.
     const auto has_disabled_vertex = [&words](
                                          std::initializer_list<std::size_t>
                                              coordinate_indices) {
@@ -13302,8 +13318,24 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
         return isDisabledGpuVertex(words[index]);
       });
     };
+    const auto polygon_span_rejected = [&words](
+                                           std::initializer_list<std::size_t>
+                                               coordinate_indices) {
+      auto minimum_x = std::numeric_limits<std::int16_t>::max();
+      auto maximum_x = std::numeric_limits<std::int16_t>::min();
+      auto minimum_y = std::numeric_limits<std::int16_t>::max();
+      auto maximum_y = std::numeric_limits<std::int16_t>::min();
+      for (const auto index : coordinate_indices) {
+        minimum_x = std::min(minimum_x, packedScreenX(words[index]));
+        maximum_x = std::max(maximum_x, packedScreenX(words[index]));
+        minimum_y = std::min(minimum_y, packedScreenY(words[index]));
+        maximum_y = std::max(maximum_y, packedScreenY(words[index]));
+      }
+      return gpuPolygonSpanRejected(minimum_x, maximum_x, minimum_y,
+                                    maximum_y);
+    };
     if (base_opcode == 0x3cU && words.size() == 12U) {
-      if (has_disabled_vertex({1U, 4U, 7U, 10U})) {
+      if (polygon_span_rejected({1U, 4U, 7U, 10U})) {
         return;
       }
       POLY_GT4 primitive{};
@@ -13334,7 +13366,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x38U && words.size() == 8U) {
-      if (has_disabled_vertex({1U, 3U, 5U, 7U})) {
+      if (polygon_span_rejected({1U, 3U, 5U, 7U})) {
         return;
       }
       POLY_G4 primitive{};
@@ -13350,7 +13382,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x34U && words.size() == 9U) {
-      if (has_disabled_vertex({1U, 4U, 7U})) {
+      if (polygon_span_rejected({1U, 4U, 7U})) {
         return;
       }
       POLY_GT3 primitive{};
@@ -13377,7 +13409,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x30U && words.size() == 6U) {
-      if (has_disabled_vertex({1U, 3U, 5U})) {
+      if (polygon_span_rejected({1U, 3U, 5U})) {
         return;
       }
       POLY_G3 primitive{};
@@ -13391,7 +13423,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x2cU && words.size() == 9U) {
-      if (has_disabled_vertex({1U, 3U, 5U, 7U})) {
+      if (polygon_span_rejected({1U, 3U, 5U, 7U})) {
         return;
       }
       POLY_FT4 primitive{};
@@ -13419,7 +13451,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x28U && words.size() == 5U) {
-      if (has_disabled_vertex({1U, 2U, 3U, 4U})) {
+      if (polygon_span_rejected({1U, 2U, 3U, 4U})) {
         return;
       }
       const auto minimum_x = std::min({packedScreenX(words[1U]),
@@ -13462,7 +13494,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x24U && words.size() == 7U) {
-      if (has_disabled_vertex({1U, 3U, 5U})) {
+      if (polygon_span_rejected({1U, 3U, 5U})) {
         return;
       }
       POLY_FT3 primitive{};
@@ -13487,7 +13519,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x20U && words.size() == 4U) {
-      if (has_disabled_vertex({1U, 2U, 3U})) {
+      if (polygon_span_rejected({1U, 2U, 3U})) {
         return;
       }
       POLY_F3 primitive{};

@@ -1439,32 +1439,44 @@ private:
     // restart clears this list head while retaining the renderer and its HUD,
     // text and radar lists. Mirror that initialization state once, before the
     // first gameplay frame, but only after verifying the complete observed
-    // 113-node stale list. A real map opened later installs a fresh list and
-    // is unaffected.
+    // 113-node stale list. Mission allocation moves the dense node window,
+    // while its primitive pool and structure are invariant across all 21
+    // packages. A real map opened later installs a fresh list and is
+    // unaffected.
     constexpr std::uint32_t auxiliary_general_list = 0x80120b78U;
-    constexpr std::uint32_t expected_root = 0x80125310U;
-    constexpr std::uint32_t node_begin = 0x80124dd0U;
-    constexpr std::uint32_t node_end = 0x8012531cU;
     constexpr std::uint32_t primitive_begin = 0x80168ae8U;
     constexpr std::uint32_t primitive_end = 0x80169790U;
     constexpr std::size_t expected_nodes = 113U;
+    constexpr std::uint32_t node_size = 12U;
+    constexpr auto node_window_bytes =
+        static_cast<std::uint32_t>((expected_nodes - 1U) * node_size);
 
     std::uint32_t cursor{};
     if (!vm_.runtime().read32(auxiliary_general_list, cursor) ||
-        cursor != expected_root) {
+        cursor < node_window_bytes) {
       return;
     }
+    const auto node_begin = cursor - node_window_bytes;
+    const auto node_end = cursor + node_size;
+    std::array<bool, expected_nodes> visited_nodes{};
     for (auto node = std::size_t{}; node < expected_nodes; ++node) {
       std::uint32_t primitive{};
       std::uint32_t next{};
       if (cursor < node_begin || cursor >= node_end ||
-          ((cursor - node_begin) % 12U) != 0U ||
+          ((cursor - node_begin) % node_size) != 0U ||
           !vm_.runtime().read32(cursor, primitive) ||
           !vm_.runtime().read32(cursor + 8U, next) ||
           primitive < primitive_begin || primitive >= primitive_end ||
+          (primitive & 3U) != 0U ||
           (node + 1U == expected_nodes ? next != 0U : next == 0U)) {
         return;
       }
+      const auto node_index =
+          static_cast<std::size_t>((cursor - node_begin) / node_size);
+      if (visited_nodes[node_index]) {
+        return;
+      }
+      visited_nodes[node_index] = true;
       cursor = next;
     }
     static_cast<void>(vm_.runtime().write32(auxiliary_general_list, 0U));
