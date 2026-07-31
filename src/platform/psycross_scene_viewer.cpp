@@ -13681,6 +13681,13 @@ SceneViewerResult runSf2GuestScene(
   auto pending_texture_room_frames = 0U;
   auto presented_frames = std::uint64_t{};
   auto screenshot_captured = false;
+  // The native HUD supplements retail's direct GP0 world publication. Hide
+  // it during the initial authored camera sequence, but do not derive that
+  // presentation state from the retail clock forever: checkpoint restart
+  // rewinds the clock and used to hide the HUD for several seconds every
+  // time the player died.
+  auto guest_hud_visible = false;
+  auto quick_state_guest_hud_visible = false;
   const auto diagnostic_frame = [](const char *name) {
     const auto *value = SDL_getenv(name);
     if (value == nullptr) {
@@ -13739,6 +13746,7 @@ SceneViewerResult runSf2GuestScene(
         key_down(SDL_SCANCODE_F9) || automatic_quick_load_down;
     if (quick_save_down && !quick_save_was_down) {
       if (runtime.captureQuickState()) {
+        quick_state_guest_hud_visible = guest_hud_visible;
         const auto saved = runtime.diagnostics();
         PsyX_Log_Info(
             "SF2 quick state saved: frame=%llu clock=%u "
@@ -13757,6 +13765,7 @@ SceneViewerResult runSf2GuestScene(
     }
     if (quick_load_down && !quick_load_was_down) {
       if (runtime.restoreQuickState()) {
+        guest_hud_visible = quick_state_guest_hud_visible;
         audio.reset("sf2-quick-load");
         simulation_accumulator = 0.0;
         weapon_select =
@@ -14243,6 +14252,8 @@ SceneViewerResult runSf2GuestScene(
         pending_texture_room_frames = 0U;
       }
       game::projectSf2GuestHud(guest_hud, diagnostics);
+      guest_hud_visible =
+          guest_hud_visible || diagnostics.system_clock >= 300U;
       const auto current_hud_sample = runtime.inputSampleCount();
       if (current_hud_sample != hud_input_sample) {
         guest_hud.update(game::HudInput{.aiming = raw.aim});
@@ -14256,7 +14267,7 @@ SceneViewerResult runSf2GuestScene(
       // The authored opening lasts roughly fifteen seconds. The retail HUD
       // callback is absent in this direct TITLE-to-mission path, so keep the
       // read-only native overlay hidden until the camera handoff.
-      if (diagnostics.system_clock >= 300U) {
+      if (guest_hud_visible) {
         // The guest world publication replays its authored VRAM setup before
         // every draw. It can overwrite the native HUD residency without
         // changing the HUD's logical weapon/font state, so invalidate that
