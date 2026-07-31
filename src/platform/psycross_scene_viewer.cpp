@@ -22,6 +22,7 @@
 #include "sf/game/pause_menu_data.hpp"
 #include "sf/game/retail_cheats.hpp"
 #include "sf/game/sf2_runtime.hpp"
+#include "sf/game/supported_games.hpp"
 #include "sf/platform/player_input.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
 #include "sf/platform/stable_frame_vector.hpp"
@@ -10904,9 +10905,18 @@ void drawOriginalStatusScale(int offset_x, int offset_y) {
   }
 }
 
-void drawOriginalRadar(const game::GameplaySession &gameplay,
-                       const game::OriginalRadarGeometry &geometry,
-                       int offset_x, int offset_y) {
+struct RadarRenderActor {
+  double x{};
+  double z{};
+  std::uint16_t threat_q12{};
+  bool allied{};
+  bool selected{};
+};
+
+void drawOriginalRadarAtPose(
+    double player_x, double player_z, std::int32_t player_heading,
+    std::span<const RadarRenderActor> actors,
+    const game::OriginalRadarGeometry &geometry, int offset_x, int offset_y) {
   constexpr int center_x = 39;
   constexpr int center_y = 200;
 
@@ -11009,7 +11019,7 @@ void drawOriginalRadar(const game::GameplaySession &gameplay,
   const auto compass_index =
       static_cast<std::size_t>(
           (game::normalizeHeading(
-               static_cast<std::int64_t>(gameplay.player().yaw) + 1024) +
+               static_cast<std::int64_t>(player_heading) + 1024) +
            256) /
           512) %
       compass.size();
@@ -11028,24 +11038,11 @@ void drawOriginalRadar(const game::GameplaySession &gameplay,
   constexpr double radar_range = 1920.0;
   const auto horizontal_radius = static_cast<double>(geometry.outer_half_width);
   const auto vertical_radius = static_cast<double>(geometry.outer_half_height);
-  const auto basis = game::headingBasis(gameplay.player().yaw);
-  const auto target = gameplay.aimTarget();
-  const auto &objects = gameplay.objects();
-  const auto &models = gameplay.objectModels();
+  const auto basis = game::headingBasis(player_heading);
   auto marker_count = std::size_t{};
-  for (const auto object_index : gameplay.activeObjects()) {
-    if (!gameplay.objectAlive(object_index)) {
-      continue;
-    }
-    const auto &object = objects[object_index];
-    if (!std::holds_alternative<assets::HmdModel>(
-            models[object.model].geometry)) {
-      continue;
-    }
-    const auto delta_x =
-        static_cast<double>(object.transform.x) - gameplay.player().x;
-    const auto delta_z =
-        static_cast<double>(object.transform.z) - gameplay.player().z;
+  for (const auto &actor : actors) {
+    const auto delta_x = actor.x - player_x;
+    const auto delta_z = actor.z - player_z;
     const auto distance = std::hypot(delta_x, delta_z);
     if (distance <= 1.0) {
       continue;
@@ -11060,29 +11057,34 @@ void drawOriginalRadar(const game::GameplaySession &gameplay,
         center_y -
         static_cast<int>(std::lround(
             std::clamp(local_z / radar_range, -1.0, 1.0) * vertical_radius));
-    const auto selected = target && *target == object_index;
-    // FUN_8003be84: green -> yellow below 0x553, yellow -> red below
-    // 0xaa7, then solid red. Distant actors remain clamped to the rim.
+    // FUN_8003be84: the actor's Q12 threat scalar transitions green ->
+    // yellow below 0x553, yellow -> red below 0xAA7, then solid red.
+    // Position remains independently clamped to the radar rim.
     constexpr auto green_to_yellow = 0x553U;
     constexpr auto yellow_to_red = 0xaa7U;
-    const auto distance_units = static_cast<unsigned int>(std::min<double>(
-        distance,
-        static_cast<double>(std::numeric_limits<unsigned int>::max())));
+    const auto threat_q12 = static_cast<unsigned int>(actor.threat_q12);
     auto red = std::uint8_t{255U};
     auto green = std::uint8_t{};
-    if (distance_units < green_to_yellow) {
+    auto blue = std::uint8_t{};
+    if (actor.allied) {
+      // Retail distinguishes friendly actors such as Chance with a blue
+      // marker instead of applying the hostile distance gradient.
+      red = 64U;
+      green = 96U;
+      blue = 255U;
+    } else if (threat_q12 < green_to_yellow) {
       red = static_cast<std::uint8_t>(
-          std::min(255U, distance_units * 0x300U / 0x1000U));
+          std::min(255U, threat_q12 * 0x300U / 0x1000U));
       green = 255U;
-    } else if (distance_units < yellow_to_red) {
+    } else if (threat_q12 < yellow_to_red) {
       const auto falloff =
-          (distance_units - green_to_yellow) * 0x300U / 0x1000U;
+          (threat_q12 - green_to_yellow) * 0x300U / 0x1000U;
       green = static_cast<std::uint8_t>(255U - std::min(255U, falloff));
     }
-    const auto marker_size = selected ? 4 : 2;
+    const auto marker_size = actor.selected ? 4 : 2;
     drawSolidRect(marker_x - marker_size / 2 + offset_x,
                   marker_y - marker_size / 2 + offset_y, marker_size,
-                  marker_size, red, green, 0U);
+                  marker_size, red, green, blue);
     if (++marker_count == 6U) {
       break;
     }
@@ -11101,6 +11103,59 @@ void drawOriginalRadar(const game::GameplaySession &gameplay,
          static_cast<float>(center_x + 4 + offset_x),
          static_cast<float>(center_y + 2 + offset_y));
   DrawPrim(&pointer);
+}
+
+void drawOriginalRadar(const game::GameplaySession &gameplay,
+                       const game::OriginalRadarGeometry &geometry,
+                       int offset_x, int offset_y) {
+  auto actors = std::vector<RadarRenderActor>{};
+  actors.reserve(gameplay.activeObjects().size());
+  const auto target = gameplay.aimTarget();
+  const auto &objects = gameplay.objects();
+  const auto &models = gameplay.objectModels();
+  for (const auto object_index : gameplay.activeObjects()) {
+    if (!gameplay.objectAlive(object_index)) {
+      continue;
+    }
+    const auto &object = objects[object_index];
+    if (!std::holds_alternative<assets::HmdModel>(
+            models[object.model].geometry)) {
+      continue;
+    }
+    actors.push_back(RadarRenderActor{
+        .x = static_cast<double>(object.transform.x),
+        .z = static_cast<double>(object.transform.z),
+        .selected = target && *target == object_index,
+    });
+  }
+  drawOriginalRadarAtPose(
+      gameplay.player().x, gameplay.player().z, gameplay.player().yaw,
+      actors, geometry, offset_x, offset_y);
+}
+
+void drawSf2GuestRadar(
+    const game::Sf2GuestRuntimeDiagnostics &diagnostics,
+    const game::OriginalRadarGeometry &geometry) {
+  auto actors = std::array<RadarRenderActor, 16U>{};
+  const auto count = std::min<std::size_t>(
+      diagnostics.radar_actor_count, actors.size());
+  for (auto index = std::size_t{}; index < count; ++index) {
+    const auto &source = diagnostics.radar_actors[index];
+    actors[index] = RadarRenderActor{
+        .x = static_cast<double>(source.x),
+        .z = static_cast<double>(source.z),
+        .threat_q12 = source.threat_q12,
+        .allied = source.allied,
+        .selected = source.selected,
+    };
+  }
+  const auto heading = game::headingFromDirection(
+      static_cast<double>(diagnostics.player_forward_x),
+      static_cast<double>(diagnostics.player_forward_z));
+  drawOriginalRadarAtPose(
+      static_cast<double>(diagnostics.player_x),
+      static_cast<double>(diagnostics.player_z), heading,
+      std::span<const RadarRenderActor>{actors.data(), count}, geometry, 0, 0);
 }
 
 void drawOriginalAimReticle(int center_x, int center_y, bool head_target) {
@@ -13490,13 +13545,11 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
     drawSf2GuestPacket(packet, texture_bank);
   }
   DrawSync(0);
-  // Native HUD sprites select host-only alias TPAGEs. Retail SPRT packets do
-  // not carry a TPAGE of their own and can be encountered before the next
-  // guest E1 packet, so never leak the HUD page into the following frame.
-  DR_TPAGE guest_page{};
-  SetDrawTPage(&guest_page, 1, 0, GetTPage(0, 0, 0, 0));
-  DrawPrim(&guest_page);
-  DrawSync(0);
+  // Preserve the complete retail draw environment. SPRT packets do not carry
+  // a TPAGE, and many retail OTs intentionally inherit E1 state from an
+  // earlier submission. The native HUD pass snapshots and restores this
+  // environment itself; forcing page zero here made later text/UI submissions
+  // intermittently sample world or framebuffer data.
 }
 
 void beginSf2GuestFrame() {
@@ -13525,7 +13578,10 @@ void beginSf2GuestFrame() {
 }
 
 void drawSf2GuestHud(const HudTextureAtlas &textures,
-                     const game::GameplayHud &hud) {
+                     const game::GameplayHud &hud,
+                     const game::Sf2GuestRuntimeDiagnostics &diagnostics,
+                     bool objective_complete_visible,
+                     std::string_view pickup_message) {
   DrawSync(0);
   DRAWENV guest_environment{};
   GetDrawEnv(&guest_environment);
@@ -13548,7 +13604,55 @@ void drawSf2GuestHud(const HudTextureAtlas &textures,
                         0, 0);
   drawOriginalStatusBar(26, hud.displayedPrimaryBar(), hud.primaryReveal(),
                         150U, 150U, 255U, 0, 0);
+
+  if (hud.dangerReveal() != 0U) {
+    const auto danger = game::localizeTextCopy("DANGER");
+    drawOriginalHudTextSolid(textures, danger, 20, 33);
+    auto red = std::uint8_t{255U};
+    auto green = std::uint8_t{100U};
+    auto blue = std::uint8_t{100U};
+    if (hud.dangerCritical()) {
+      const auto phase = static_cast<double>(hud.tick() & 15U) *
+                         (2.0 * std::numbers::pi / 16.0);
+      red = static_cast<std::uint8_t>(
+          std::lround((std::cos(phase) + 1.0) * 127.5));
+      green = 0U;
+      blue = 0U;
+    }
+    drawOriginalStatusBar(41, hud.displayedDangerBar(), hud.dangerReveal(),
+                          red, green, blue, 0, 0);
+  }
+
+  if (hud.targetReveal() != 0U) {
+    const auto target = game::localizeTextCopy("TARGET");
+    drawOriginalHudTextSolid(textures, target, 20, 48);
+    drawOriginalStatusBar(56, hud.displayedTargetBar(), hud.targetReveal(),
+                          100U, 255U, 100U, 0, 0);
+  }
   drawOriginalStatusScale(0, 0);
+  DrawSync(0);
+  drawSf2GuestRadar(
+      diagnostics, game::originalRadarGeometry(hud.revealFrame()));
+  if (diagnostics.mission_timer_visible &&
+      diagnostics.mission_timer_ticks > 0) {
+    constexpr auto retail_timer_ticks_per_second = 20U;
+    const auto seconds =
+        (static_cast<unsigned int>(diagnostics.mission_timer_ticks) +
+         retail_timer_ticks_per_second - 1U) /
+        retail_timer_ticks_per_second;
+    const auto minutes = seconds / 60U;
+    const auto remainder = seconds % 60U;
+    auto timer = std::to_string(minutes);
+    timer.push_back(':');
+    if (remainder < 10U) {
+      timer.push_back('0');
+    }
+    timer += std::to_string(remainder);
+    constexpr auto radar_center_x = 39;
+    drawOriginalHudTextSolid(
+        textures, timer,
+        radar_center_x - game::originalHudTextWidth(timer) / 2, 164, 255U);
+  }
   drawOriginalWeaponMenu(textures, hud, 0, 0, true);
 
   const auto &definition = hud.inventory().currentDefinition();
@@ -13588,6 +13692,20 @@ void drawSf2GuestHud(const HudTextureAtlas &textures,
     constexpr int ammo_x = screen_width / 2 + 118;
     constexpr int ammo_y = screen_height / 2 + 94;
     drawOriginalHudText(textures, ammo, ammo_x + horizontal_slide, ammo_y);
+  }
+  if (objective_complete_visible) {
+    const auto complete =
+        game::localizeTextCopy("PRIMARY MISSION OBJECTIVE COMPLETE");
+    drawOriginalHudTextSolid(
+        textures, complete,
+        (screen_width - game::originalHudTextWidth(complete)) / 2, 92, 255U);
+  }
+  if (!pickup_message.empty()) {
+    const auto localized = game::localizeTextCopy(pickup_message);
+    drawOriginalHudTextSolid(
+        textures, localized,
+        (screen_width - game::originalHudTextWidth(localized)) / 2, 108,
+        255U);
   }
   DrawSync(0);
   PutDrawEnv(&guest_environment);
@@ -13688,6 +13806,26 @@ SceneViewerResult runSf2GuestScene(
   // time the player died.
   auto guest_hud_visible = false;
   auto quick_state_guest_hud_visible = false;
+  // Startup cleanup emits two dialogue-stop calls before the authored scene.
+  // A later stop is the retail cutscene/dialogue handoff and is a better HUD
+  // activation boundary than an arbitrary clock delay. Keep the old clock
+  // threshold as a fallback for silent openings which emit no later stop.
+  auto hud_scene_speech_stops =
+      runtime.diagnostics().scene_speech_stops;
+  auto quick_state_hud_scene_speech_stops = hud_scene_speech_stops;
+  auto objective_completion_events =
+      runtime.diagnostics().objective_completion_events;
+  auto objective_complete_frames = 0U;
+  auto quick_state_objective_complete_frames = 0U;
+  auto pickup_presentation_events =
+      runtime.diagnostics().pickup_presentation_events;
+  auto pickup_message_frames = 0U;
+  auto quick_state_pickup_message_frames = 0U;
+  auto pickup_message = std::string{};
+  auto quick_state_pickup_message = std::string{};
+  auto pickup_capture_pending = false;
+  auto previous_guest_armor = runtime.diagnostics().player_armor;
+  auto quick_state_previous_guest_armor = previous_guest_armor;
   struct ObjectiveAutoplayState {
     std::int32_t previous_x{};
     std::int32_t previous_z{};
@@ -13724,17 +13862,35 @@ SceneViewerResult runSf2GuestScene(
   auto screenshot_captures = 0U;
   const auto automatic_objective =
       diagnostic_frame("SF2_AUTOPLAY_OBJECTIVE").value_or(0U) != 0U;
+  const auto automatic_objective_skip =
+      diagnostic_frame("SF2_AUTOPLAY_SKIP_OBJECTIVE").value_or(1U) != 0U;
   const auto automatic_quick_save_frame =
       diagnostic_frame("SF2_QUICK_SAVE_FRAME");
   const auto automatic_quick_load_frame =
       diagnostic_frame("SF2_QUICK_LOAD_FRAME");
+  const auto automatic_exit_frame =
+      diagnostic_frame("SF2_EXIT_FRAME");
+  const auto automatic_objective_overlay_frame =
+      diagnostic_frame("SF2_FORCE_OBJECTIVE_FRAME");
+  const auto capture_on_pickup =
+      diagnostic_frame("SF2_CAPTURE_ON_PICKUP").value_or(0U) != 0U;
+  const auto exit_on_capture =
+      diagnostic_frame("SF2_EXIT_ON_CAPTURE").value_or(0U) != 0U;
   auto automatic_quick_save_completed = false;
   auto automatic_quick_load_completed = false;
   std::array<psx::SpuPcmFrame, 4096U> pcm{};
 
+  const auto disc_number =
+      static_cast<std::uint8_t>(mission.definition().index < 8U ? 1U : 2U);
+  const auto archive_selection = game::missionArchiveSelection(
+      mission.gameId(), disc_number,
+      static_cast<std::uint16_t>(mission.definition().index));
   PsyX_Log_Info(
-      "SF2 guest alpha: retail TITLE->mission runtime, direct GP0/SPU "
-      "handoff\n");
+      "SF2 guest alpha: campaign=%u title=\"%s\" resource=%s disc=%u "
+      "archive=%u retail TITLE->mission direct GP0/SPU handoff\n",
+      mission.definition().index + 1U, mission.definition().title.data(),
+      mission.definition().resource_name.data(), disc_number,
+      archive_selection.value_or(0xffffU));
   for (;;) {
     const auto counter = SDL_GetPerformanceCounter();
     const auto elapsed = std::clamp(
@@ -13771,6 +13927,11 @@ SceneViewerResult runSf2GuestScene(
     if (quick_save_down && !quick_save_was_down) {
       if (runtime.captureQuickState()) {
         quick_state_guest_hud_visible = guest_hud_visible;
+        quick_state_hud_scene_speech_stops = hud_scene_speech_stops;
+        quick_state_objective_complete_frames = objective_complete_frames;
+        quick_state_pickup_message_frames = pickup_message_frames;
+        quick_state_pickup_message = pickup_message;
+        quick_state_previous_guest_armor = previous_guest_armor;
         if (automatic_objective) {
           quick_state_objective_autoplay = objective_autoplay;
         }
@@ -13793,6 +13954,14 @@ SceneViewerResult runSf2GuestScene(
     if (quick_load_down && !quick_load_was_down) {
       if (runtime.restoreQuickState()) {
         guest_hud_visible = quick_state_guest_hud_visible;
+        hud_scene_speech_stops = guest_hud_visible
+                                     ? quick_state_hud_scene_speech_stops
+                                     : runtime.diagnostics()
+                                           .scene_speech_stops;
+        objective_complete_frames = quick_state_objective_complete_frames;
+        pickup_message_frames = quick_state_pickup_message_frames;
+        pickup_message = quick_state_pickup_message;
+        previous_guest_armor = quick_state_previous_guest_armor;
         if (automatic_objective && quick_state_objective_autoplay) {
           objective_autoplay = *quick_state_objective_autoplay;
         }
@@ -13804,6 +13973,11 @@ SceneViewerResult runSf2GuestScene(
             game::Sf2SampledMouseAccumulator{runtime.inputSampleCount()};
         hud_input_sample = runtime.inputSampleCount();
         const auto restored = runtime.diagnostics();
+        objective_completion_events =
+            restored.objective_completion_events;
+        pickup_presentation_events =
+            restored.pickup_presentation_events;
+        previous_guest_armor = restored.player_armor;
         checkpoint_restores = restored.checkpoint_restores;
         guest_room = restored.guest_current_room;
         collision_room_record = restored.guest_collision_room_record;
@@ -14039,8 +14213,7 @@ SceneViewerResult runSf2GuestScene(
           .run = true,
           .interact =
               !objective_autoplay.looted &&
-              objective_autoplay.waypoint == 2U && distance <= 340.0 &&
-              (presented_frames % 30U) < 6U,
+              objective_autoplay.waypoint == 2U && distance <= 340.0,
       };
       if (objective_autoplay.heading_known) {
         constexpr auto pi = 3.14159265358979323846;
@@ -14054,7 +14227,7 @@ SceneViewerResult runSf2GuestScene(
         }
         guest_input.turn = -std::clamp(error, -1.0, 1.0);
       }
-      if (objective_autoplay.looted &&
+      if (automatic_objective_skip && objective_autoplay.looted &&
           presented_frames - objective_autoplay.loot_frame < 12U) {
         guest_input.kneel = true;
         guest_input.move = 0.0;
@@ -14339,7 +14512,15 @@ SceneViewerResult runSf2GuestScene(
       // Coordinate-based ownership oscillated between overlapping sequel
       // rooms and thrashed that atlas. Follow the exact retail room instead,
       // after it remains stable for two 20 Hz logic ticks.
-      if (diagnostics.guest_current_room <
+      const auto dialogue_active =
+          diagnostics.dialogue_state_valid &&
+          std::ranges::any_of(
+              diagnostics.dialogue_state_words,
+              [](std::uint32_t state) {
+                return state != 0xffffffffU;
+              });
+      if (!dialogue_active &&
+          diagnostics.guest_current_room <
           diagnostics.guest_collision_room_count) {
         if (diagnostics.guest_current_room == pending_texture_room) {
           ++pending_texture_room_frames;
@@ -14369,18 +14550,70 @@ SceneViewerResult runSf2GuestScene(
         pending_texture_room = 0xffffU;
         pending_texture_room_frames = 0U;
       }
-      game::projectSf2GuestHud(guest_hud, diagnostics);
-      guest_hud_visible =
-          guest_hud_visible || diagnostics.system_clock >= 300U;
+      game::projectSf2GuestHud(guest_hud, diagnostics, raw.aim);
+      if (diagnostics.objective_completion_events >
+          objective_completion_events) {
+        constexpr auto objective_complete_duration = 180U;
+        objective_complete_frames = objective_complete_duration;
+      }
+      // HWAY's truck objective grants Gabe his first armor and several
+      // inventory items after its completion routine was already consumed
+      // during the direct TITLE-to-mission bootstrap. Preserve the retail
+      // event hook above for every later objective, and bridge this one
+      // observable mission-specific handoff from authoritative guest state.
+      if (mission.definition().index == 2U &&
+          previous_guest_armor == 0U &&
+          diagnostics.player_armor != 0U) {
+        constexpr auto objective_complete_duration = 180U;
+        objective_complete_frames = objective_complete_duration;
+      }
+      if (automatic_objective_overlay_frame &&
+          presented_frames == *automatic_objective_overlay_frame) {
+        constexpr auto objective_complete_duration = 180U;
+        objective_complete_frames = objective_complete_duration;
+      }
+      objective_completion_events =
+          diagnostics.objective_completion_events;
+      if (diagnostics.pickup_presentation_events >
+          pickup_presentation_events) {
+        const auto end = std::ranges::find(
+            diagnostics.last_pickup_text_bytes, '\0');
+        pickup_message.assign(
+            diagnostics.last_pickup_text_bytes.begin(), end);
+        constexpr auto pickup_message_duration = 180U;
+        pickup_message_frames = pickup_message.empty()
+                                    ? 0U
+                                    : pickup_message_duration;
+        pickup_capture_pending =
+            capture_on_pickup && !pickup_message.empty();
+      }
+      pickup_presentation_events =
+          diagnostics.pickup_presentation_events;
+      previous_guest_armor = diagnostics.player_armor;
+      const auto hud_scene_handoff =
+          diagnostics.scene_speech_stops > hud_scene_speech_stops;
+      const auto hud_clock_fallback = diagnostics.system_clock >= 300U;
+      if (!guest_hud_visible &&
+          (hud_scene_handoff || hud_clock_fallback)) {
+        PsyX_Log_Info(
+            "SF2 guest HUD activated: frame=%llu clock=%u source=%s\n",
+            static_cast<unsigned long long>(frame->guest_frame),
+            diagnostics.system_clock,
+            hud_scene_handoff ? "scene-handoff" : "clock-fallback");
+      }
+      guest_hud_visible = guest_hud_visible || hud_scene_handoff ||
+                          hud_clock_fallback;
       const auto current_hud_sample = runtime.inputSampleCount();
       if (current_hud_sample != hud_input_sample) {
         guest_hud.update(game::HudInput{.aiming = raw.aim});
         hud_input_sample = current_hud_sample;
       }
       const auto capture_screenshot =
-          !screenshot_captured && screenshot_frame &&
-          presented_frames >=
-              *screenshot_frame + screenshot_captures;
+          !screenshot_captured &&
+          (pickup_capture_pending ||
+           (screenshot_frame &&
+            presented_frames >=
+                *screenshot_frame + screenshot_captures));
       beginSf2GuestFrame();
       drawSf2GuestFrame(*frame, texture_bank);
       // The authored opening lasts roughly fifteen seconds. The retail HUD
@@ -14396,7 +14629,17 @@ SceneViewerResult runSf2GuestScene(
             guest_hud, raw.aim,
             std::span<const game::LegacyDroppedItemBridgeState>{},
             std::span<const game::GameplayProjectile>{});
-        drawSf2GuestHud(hud_textures, guest_hud);
+        drawSf2GuestHud(hud_textures, guest_hud, diagnostics,
+                        objective_complete_frames != 0U,
+                        pickup_message_frames != 0U
+                            ? std::string_view{pickup_message}
+                            : std::string_view{});
+      }
+      if (objective_complete_frames != 0U) {
+        --objective_complete_frames;
+      }
+      if (pickup_message_frames != 0U) {
+        --pickup_message_frames;
       }
       if (capture_screenshot) {
         std::array<std::size_t, 6U> command_kinds{};
@@ -14426,6 +14669,7 @@ SceneViewerResult runSf2GuestScene(
             captured_environment.ofs[1], captured_environment.tpage,
             captured_environment.dtd);
         PsyX_TakeScreenshot();
+        pickup_capture_pending = false;
         if (screenshot_capture_count > 1U) {
           auto copy_error = std::error_code{};
           std::filesystem::copy_file(
@@ -14444,10 +14688,23 @@ SceneViewerResult runSf2GuestScene(
       }
       PsyX_EndScene();
       ++presented_frames;
+      if (automatic_exit_frame &&
+          presented_frames >= *automatic_exit_frame) {
+        PsyX_Log_Info("SF2 diagnostic exit: presented=%llu\n",
+                      static_cast<unsigned long long>(presented_frames));
+        return SceneViewerResult{
+            readButtons(pad), SceneExitReason::return_to_title};
+      }
       if (capture_screenshot) {
         ++screenshot_captures;
         screenshot_captured =
             screenshot_captures >= screenshot_capture_count;
+        if (exit_on_capture) {
+          PsyX_Log_Info("SF2 diagnostic exit after capture: presented=%llu\n",
+                        static_cast<unsigned long long>(presented_frames));
+          return SceneViewerResult{
+              readButtons(pad), SceneExitReason::return_to_title};
+        }
       }
     }
   }

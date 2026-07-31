@@ -312,6 +312,11 @@ public:
   void notifyWeaponChanged() noexcept;
   [[nodiscard]] bool selectWeapon(WeaponId id) noexcept;
   void setVitals(PlayerVitals vitals) noexcept;
+  // Checkpoint/bootstrap presentation occasionally begins after the guest
+  // vitals have already changed. Align both animated bars to that
+  // authoritative sample instead of replaying a synthetic full-to-empty
+  // transition.
+  void synchronizeVitals(PlayerVitals vitals) noexcept;
   void setDanger(std::uint8_t danger, bool critical = false) noexcept;
   void setTargetHealth(std::optional<std::uint8_t> health) noexcept;
 

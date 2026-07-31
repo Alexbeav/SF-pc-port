@@ -101,7 +101,7 @@ void printUsage() {
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
          "[neutral|forward|combat|crouch|quickstate|quickobjective|"
-         "objective|weapons] "
+         "crouchback|objective|objective-dialogue|weapons] "
          "[resource-index-0-based]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
@@ -6463,8 +6463,9 @@ int probeSf2GuestBootstrap(const char *cue_path, std::uint64_t budget,
 
 int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool forward, bool combat, bool crouch,
+                           bool crouch_back,
                            bool quick_state, bool objective_event,
-                           bool weapon_cycle,
+                           bool weapon_cycle, bool skip_objective_scene,
                            std::uint32_t mission_index) {
   sf::game::Sf2GuestMissionRuntime runtime{
       std::filesystem::path{cue_path}, mission_index};
@@ -6474,10 +6475,11 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     return 7;
   }
   sf::game::LegacyHostPadState pad;
-  pad.buttons = forward ? 0x0010U : crouch ? 0x4000U : 0U;
+  pad.buttons = forward ? 0x0010U
+                        : (crouch || crouch_back) ? 0x4000U : 0U;
   pad.face_axis_buttons = 0U;
-  pad.use_explicit_face_axis_buttons = crouch;
-  pad.left_y = forward ? 0x00U : 0x80U;
+  pad.use_explicit_face_axis_buttons = crouch || crouch_back;
+  pad.left_y = forward ? 0x00U : crouch_back ? 0xffU : 0x80U;
   runtime.setHostPadState(pad);
   std::vector<std::array<std::uint32_t, 4U>> display_environments;
   auto observed_sequence = std::uint64_t{};
@@ -6502,6 +6504,30 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   };
   auto first_restore_frame = std::uint32_t{};
   auto first_sprite_frame = std::uint32_t{};
+  auto first_target_frame = std::uint32_t{};
+  auto target_active_frames = std::uint32_t{};
+  auto maximum_player_danger = std::uint8_t{};
+  auto maximum_player_threat_count = std::uint16_t{};
+  auto last_objective_bits =
+      runtime.diagnostics().objective_completion_bits;
+  auto last_objective_event_count =
+      runtime.diagnostics().objective_completion_events;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>>
+      objective_bit_transitions;
+  objective_bit_transitions.emplace_back(0U, last_objective_bits);
+  std::vector<std::pair<std::uint32_t, std::uint64_t>>
+      objective_event_transitions;
+  objective_event_transitions.emplace_back(0U,
+                                           last_objective_event_count);
+  auto last_dialogue_word = runtime.diagnostics().dialogue_state_word;
+  auto last_dialogue_words =
+      runtime.diagnostics().dialogue_state_words;
+  auto dialogue_queue_transitions = std::uint32_t{};
+  auto dialogue_active_frames = std::uint32_t{};
+  auto first_dialogue_active_frame = std::uint32_t{};
+  std::vector<std::pair<std::uint32_t, std::uint32_t>>
+      dialogue_state_transitions;
+  dialogue_state_transitions.emplace_back(0U, last_dialogue_word);
   auto maximum_sprite_commands = std::size_t{};
   auto maximum_active_spu_voices = std::size_t{};
   auto minimum_player_health = std::numeric_limits<std::uint16_t>::max();
@@ -6547,7 +6573,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       std::array<std::uint32_t, 2U>{};
   auto weapon_select =
       sf::game::Sf2WeaponSelectPulseQueue{runtime.inputSampleCount()};
-  auto weapon_pulses_queued = false;
+  auto weapon_pulses_queued = std::uint32_t{};
+  auto last_weapon_pulse_frame = std::uint32_t{};
+  auto shotgun_observed = false;
+  auto shotgun_stress_frames = std::uint32_t{};
   auto last_equipped_item = runtime.diagnostics().player_equipped_item;
   std::vector<std::pair<std::uint32_t, std::uint32_t>>
       equipped_item_transitions;
@@ -6683,7 +6712,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       navigation.interact =
           !objective_looted && objective_waypoint == 2U &&
           distance <= 340.0 && (frame % 30U) < 6U;
-      if (objective_looted && frame - objective_loot_frame < 12U) {
+      if (skip_objective_scene && objective_looted &&
+          frame - objective_loot_frame < 12U) {
         // Cross skips the short interaction scene in retail. Hold it across
         // enough 60 Hz submissions for one 20 Hz PAD sample, then begin the
         // return traversal that previously exposed the manual crash.
@@ -6694,14 +6724,29 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     }
     if (weapon_cycle && objective_looted &&
         frame >= objective_loot_frame + 120U) {
-      if (!weapon_pulses_queued) {
-        // Select is the retail Change Weapon action. Queue enough separated
-        // sampled edges to observe a complete wrap through the post-truck
-        // inventory without writing guest inventory or selection state.
-        weapon_select.enqueue(12U);
-        weapon_pulses_queued = true;
+      // Dwell for one second on each retail selection. The older probe queued
+      // all twelve Select edges at once and changed weapons every sampled
+      // input interval, which could not reproduce the reported shotgun plus
+      // crouch/back instability.
+      if (weapon_pulses_queued < 12U &&
+          (weapon_pulses_queued == 0U ||
+           frame - last_weapon_pulse_frame >= 60U)) {
+        weapon_select.enqueue(1U);
+        ++weapon_pulses_queued;
+        last_weapon_pulse_frame = frame;
       }
-      if (weapon_select.update(runtime.inputSampleCount())) {
+      const auto weapon_select_down =
+          weapon_select.update(runtime.inputSampleCount());
+      if (runtime.diagnostics().player_equipped_item == 8U) {
+        shotgun_observed = true;
+        auto stress = sf::game::PlayerInput{};
+        stress.move = -1.0;
+        stress.kneel = true;
+        stress.fire_held = (frame % 18U) < 9U;
+        pad = sf::game::legacyPadStateFromPlayerInput(stress);
+        ++shotgun_stress_frames;
+      }
+      if (weapon_select_down) {
         pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
       }
     }
@@ -6727,6 +6772,52 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       inspect_pcm(count);
     }
     const auto frame_diagnostics = runtime.diagnostics();
+    if (frame_diagnostics.player_target_active) {
+      ++target_active_frames;
+      if (first_target_frame == 0U) {
+        first_target_frame = frame + 1U;
+      }
+    }
+    maximum_player_danger =
+        std::max(maximum_player_danger, frame_diagnostics.player_danger);
+    maximum_player_threat_count =
+        std::max(maximum_player_threat_count,
+                 frame_diagnostics.player_threat_count);
+    if (frame_diagnostics.objective_completion_bits !=
+        last_objective_bits) {
+      last_objective_bits = frame_diagnostics.objective_completion_bits;
+      objective_bit_transitions.emplace_back(frame + 1U,
+                                             last_objective_bits);
+    }
+    if (frame_diagnostics.objective_completion_events !=
+        last_objective_event_count) {
+      last_objective_event_count =
+          frame_diagnostics.objective_completion_events;
+      objective_event_transitions.emplace_back(
+          frame + 1U, last_objective_event_count);
+    }
+    if (frame_diagnostics.dialogue_state_word !=
+        last_dialogue_word) {
+      last_dialogue_word = frame_diagnostics.dialogue_state_word;
+      dialogue_state_transitions.emplace_back(frame + 1U,
+                                              last_dialogue_word);
+    }
+    if (frame_diagnostics.dialogue_state_words !=
+        last_dialogue_words) {
+      last_dialogue_words =
+          frame_diagnostics.dialogue_state_words;
+      ++dialogue_queue_transitions;
+    }
+    if (std::ranges::any_of(
+            frame_diagnostics.dialogue_state_words,
+            [](std::uint32_t state) {
+              return state != 0xffffffffU;
+            })) {
+      if (first_dialogue_active_frame == 0U) {
+        first_dialogue_active_frame = frame + 1U;
+      }
+      ++dialogue_active_frames;
+    }
     if (first_rejected_sound_bank_frame == 0U &&
         frame_diagnostics.rejected_sound_bank_lookups != 0U) {
       first_rejected_sound_bank_frame = frame + 1U;
@@ -6946,12 +7037,68 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << " player=0x" << std::hex << std::uppercase
             << diagnostics.player_instance << std::dec << ":"
             << diagnostics.player_x << "/" << diagnostics.player_y << "/"
-            << diagnostics.player_z << ":room="
+            << diagnostics.player_z << ":forward="
+            << diagnostics.player_forward_x << "/"
+            << diagnostics.player_forward_z << ":radar="
+            << static_cast<unsigned int>(diagnostics.radar_actor_count)
+            << ":room="
             << diagnostics.guest_current_room << "/"
             << diagnostics.guest_collision_room_count << ":collision=0x"
             << std::hex << diagnostics.guest_collision_room_record << "/"
             << diagnostics.guest_collision_list << std::dec << ":"
             << diagnostics.player_health << "/" << diagnostics.player_armor
+            << ":target=" << diagnostics.player_target_active << "/"
+            << diagnostics.player_target_slot << "/"
+            << diagnostics.player_target_meter << "/health="
+            << static_cast<unsigned int>(
+                   diagnostics.player_target_health_percent)
+            << "/first@"
+            << first_target_frame << "/frames=" << target_active_frames
+            << ":objectives="
+            << diagnostics.objective_state_valid << "/0x" << std::hex
+            << diagnostics.objective_completion_bits << std::dec << "/"
+            << objective_bit_transitions.size() << "/events="
+            << diagnostics.objective_completion_events << "/last="
+            << diagnostics.last_objective_completion_index << "/"
+            << diagnostics.last_objective_completion_text << "/trace="
+            << objective_event_transitions.size() << ":"
+            ;
+  for (const auto &[frame, count] : objective_event_transitions) {
+    std::cout << frame << "@" << count << "/";
+  }
+  std::cout << ":bits=";
+  for (const auto &[frame, bits] : objective_bit_transitions) {
+    std::cout << frame << "@0x" << std::hex << bits << std::dec << "/";
+  }
+  std::cout
+            << ":pickups=" << diagnostics.pickup_presentation_events
+            << "/" << diagnostics.last_pickup_actor << "/0x" << std::hex
+            << diagnostics.last_pickup_text << std::dec << "/"
+            << diagnostics.last_pickup_item << "/words=";
+  for (const auto word : diagnostics.last_pickup_text_words) {
+    std::cout << std::hex << word << "/";
+  }
+  std::cout << std::dec
+            << ":threat=" << diagnostics.threat_state_valid << "/"
+            << diagnostics.player_object_slot << "/"
+            << diagnostics.player_threat_count << "/"
+            << static_cast<unsigned int>(diagnostics.player_danger)
+            << "/max=" << maximum_player_threat_count << "/"
+            << static_cast<unsigned int>(maximum_player_danger)
+            << ":dialogue=" << diagnostics.dialogue_state_valid << "/0x"
+            << std::hex << diagnostics.dialogue_state_word << std::dec
+            << "/queues=0x" << std::hex
+            << diagnostics.dialogue_state_words[0] << "/"
+            << diagnostics.dialogue_state_words[1] << "/"
+            << diagnostics.dialogue_state_words[2] << std::dec
+            << "/transitions=" << dialogue_queue_transitions
+            << "/active=" << dialogue_active_frames << "/first@"
+            << first_dialogue_active_frame << "/"
+            << dialogue_state_transitions.size() << ":";
+  for (const auto &[frame, word] : dialogue_state_transitions) {
+    std::cout << frame << "@0x" << std::hex << word << std::dec << "/";
+  }
+  std::cout
             << ":item=" << diagnostics.player_equipped_item << ":owned=0x"
             << std::hex << diagnostics.player_owned_items[0] << "/"
             << diagnostics.player_owned_items[1] << std::dec
@@ -6959,12 +7106,16 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   for (const auto &[frame, item] : equipped_item_transitions) {
     std::cout << frame << ":" << item << "/";
   }
-  std::cout << " room-fallbacks="
+  std::cout << " shotgun-stress=" << shotgun_observed << "/"
+            << shotgun_stress_frames << " room-fallbacks="
             << diagnostics.collision_room_fallbacks << ":"
             << diagnostics.last_collision_room_fallback
             << "/request:"
             << diagnostics.collision_request_fallbacks << ":"
             << diagnostics.last_collision_request_fallback
+            << "/player:"
+            << diagnostics.player_collision_requests << "/invalid:"
+            << diagnostics.invalid_player_collision_requests
             << " renderer-repairs=" << diagnostics.renderer_text_repairs
             << ":0x" << std::hex << std::uppercase
             << diagnostics.last_renderer_text_repair_address << "/"
@@ -7133,7 +7284,21 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.script_dispatches << "/"
             << diagnostics.script_event5_dispatches << "/"
             << diagnostics.script_program_dispatches << "/"
-            << diagnostics.script_activations
+            << diagnostics.script_activations << "/0x" << std::hex
+            << diagnostics.last_script_activation_program << std::dec
+            << "/timers="
+            << static_cast<unsigned int>(
+                   diagnostics.active_script_timer_count) << ":";
+  for (auto index = std::size_t{};
+       index < diagnostics.active_script_timer_count; ++index) {
+    const auto &timer = diagnostics.active_script_timers[index];
+    std::cout << "0x" << std::hex << timer.program << "/"
+              << timer.program_name_words[0U] << "/"
+              << timer.program_name_words[1U] << std::dec << "/"
+              << timer.timer_index << "=" << timer.remaining_ticks << ",";
+  }
+  std::cout << "/hud=" << diagnostics.mission_timer_visible << "/"
+            << diagnostics.mission_timer_ticks
             << " level=0x" << std::hex << std::uppercase
             << diagnostics.script_level_program << "/"
             << diagnostics.script_level_name_pointer << ":"
@@ -7287,10 +7452,23 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cerr << "SF2 objective-event probe did not loot the truck\n";
     return 10;
   }
+  const auto radar_forward_length_squared =
+      static_cast<std::int64_t>(diagnostics.player_forward_x) *
+          diagnostics.player_forward_x +
+      static_cast<std::int64_t>(diagnostics.player_forward_z) *
+          diagnostics.player_forward_z;
+  if ((combat || objective_event) && frames >= 1'200U &&
+      (diagnostics.radar_actor_count == 0U ||
+       radar_forward_length_squared < 2048LL * 2048LL)) {
+    std::cerr << "SF2 radar probe did not retain actor poses and a valid "
+                 "player heading\n";
+    return 10;
+  }
   if (weapon_cycle &&
-      (!weapon_pulses_queued || equipped_item_transitions.size() < 4U)) {
-    std::cerr << "SF2 weapon-cycle probe did not observe enough retail "
-                 "selection transitions\n";
+      (weapon_pulses_queued < 12U || equipped_item_transitions.size() < 4U ||
+       !shotgun_observed || shotgun_stress_frames < 40U)) {
+    std::cerr << "SF2 weapon-cycle probe did not complete the retail "
+                 "selection and shotgun crouch/back/fire stress interval\n";
     return 10;
   }
   return 0;
@@ -11585,7 +11763,9 @@ int main(int argc, char **argv) {
                                   : std::string_view{};
       if (!mode.empty() && mode != "neutral" && mode != "forward" &&
           mode != "combat" && mode != "crouch" &&
-          mode != "objective" && mode != "weapons" &&
+          mode != "crouchback" &&
+          mode != "objective" && mode != "objective-dialogue" &&
+          mode != "weapons" &&
           mode != "quickstate" && mode != "quickobjective") {
         printUsage();
         return 1;
@@ -11593,10 +11773,11 @@ int main(int argc, char **argv) {
       return probeSf2ProductRuntime(
           argv[2], argc >= 4 ? parseFrameCount(argv[3]) : 64U,
           mode == "forward", mode == "combat", mode == "crouch",
+          mode == "crouchback",
           mode == "quickstate" || mode == "quickobjective",
           mode == "objective" || mode == "weapons" ||
-              mode == "quickobjective",
-          mode == "weapons",
+              mode == "quickobjective" || mode == "objective-dialogue",
+          mode == "weapons", mode != "objective-dialogue",
           argc == 6 ? parseSf2MissionIndex(argv[5]) : 2U);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {

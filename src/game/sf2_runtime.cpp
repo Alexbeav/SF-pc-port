@@ -258,7 +258,8 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
 
 void projectSf2GuestHud(
     GameplayHud &hud,
-    const Sf2GuestRuntimeDiagnostics &guest) noexcept {
+    const Sf2GuestRuntimeDiagnostics &guest,
+    bool first_person_aim) noexcept {
   const auto previous_weapon = hud.inventory().current();
   auto &inventory = hud.inventory();
   inventory.resetUnarmed();
@@ -283,12 +284,34 @@ void projectSf2GuestHud(
   if (inventory.current() != previous_weapon) {
     hud.notifyWeaponChanged();
   }
-  hud.setVitals(PlayerVitals{
+  const auto vitals = PlayerVitals{
       .health = guest.player_health,
       .maximum_health = 150U,
       .armor = guest.player_armor,
       .maximum_armor = 600U,
-  });
+  };
+  if (guest.player_health == 0U) {
+    hud.synchronizeVitals(vitals);
+  } else {
+    hud.setVitals(vitals);
+  }
+  const auto equipped_item = static_cast<std::uint8_t>(
+      guest.player_equipped_item & 0x3fU);
+  // SF2's retail item ordering keeps its ranged lock-on weapons in slots
+  // 1..18 (through the Air Taser), followed by Hand Taser 19 and Knife 20;
+  // slot 21 is the M-79. Emulator comparison confirms melee lock-on retains
+  // a selected actor but does not raise TARGET.
+  const auto ranged_target_weapon =
+      (equipped_item >= 1U && equipped_item <= 18U) ||
+      equipped_item == 21U;
+  hud.setTargetHealth(
+      guest.player_target_active && ranged_target_weapon &&
+              !first_person_aim
+          ? std::optional<std::uint8_t>{
+                guest.player_target_health_percent}
+          : std::nullopt);
+  hud.setDanger(guest.threat_state_valid ? guest.player_danger : 0U,
+                guest.threat_state_valid && guest.player_danger == 100U);
 }
 
 Sf2SampledMouseAccumulator::Sf2SampledMouseAccumulator(
@@ -704,6 +727,7 @@ public:
       state.gpu_gp0_scan = gpu_gp0_scan_;
       state.vram_setup_packets = vram_setup_packets_;
       state.presentation_frame = presentation_frame_;
+      state.active_script_programs = active_script_programs_;
       state.callback_ticks = callback_ticks_;
       state.audio_callback_ticks = audio_callback_ticks_;
       state.retrace_ticks = retrace_ticks_;
@@ -735,6 +759,7 @@ public:
       auto open_files = quick_state_->open_files;
       auto gpu_gp0_stream = quick_state_->gpu_gp0_stream;
       auto vram_setup_packets = quick_state_->vram_setup_packets;
+      auto active_script_programs = quick_state_->active_script_programs;
       if (!vm_.restoreSnapshot(quick_state_->vm)) {
         return false;
       }
@@ -746,6 +771,7 @@ public:
       presentation_frame_ = quick_state_->presentation_frame;
       gpu_gp0_stream_.swap(gpu_gp0_stream);
       vram_setup_packets_.swap(vram_setup_packets);
+      active_script_programs_.swap(active_script_programs);
       gpu_gp0_scan_ = quick_state_->gpu_gp0_scan;
       callback_ticks_ = quick_state_->callback_ticks;
       audio_callback_ticks_ = quick_state_->audio_callback_ticks;
@@ -826,6 +852,39 @@ public:
       }
     }
     readPlayerHudState(result.player_instance, result);
+    result.threat_state_valid =
+        readPlayerThreatState(result.player_instance, result);
+    result.dialogue_state_valid = true;
+    for (auto index = std::size_t{};
+         index < result.dialogue_state_words.size(); ++index) {
+      result.dialogue_state_valid =
+          vm_.runtime().read32(
+              0x80134d1cU + static_cast<std::uint32_t>(index * 0x10U),
+              result.dialogue_state_words[index]) &&
+          result.dialogue_state_valid;
+    }
+    result.dialogue_state_word = result.dialogue_state_words.front();
+    // MissionObjective_Complete (0x8002E6E8) sets bits in word +0x0C of
+    // the state record rooted at GP+0x90C (0x8011F570). Read that exact
+    // retail state so the native overlay can reproduce completion notices
+    // without guessing from mission-specific triggers.
+    std::uint32_t objective_state{};
+    result.objective_state_valid =
+        vm_.runtime().read32(0x8011f570U, objective_state) &&
+        objective_state != 0U &&
+        vm_.runtime().read32(objective_state + 0x0cU,
+                             result.objective_completion_bits);
+    result.objective_completion_events = objective_completion_events_;
+    result.last_objective_completion_index =
+        last_objective_completion_index_;
+    result.last_objective_completion_text =
+        last_objective_completion_text_;
+    result.pickup_presentation_events = pickup_presentation_events_;
+    result.last_pickup_actor = last_pickup_actor_;
+    result.last_pickup_text = last_pickup_text_;
+    result.last_pickup_item = last_pickup_item_;
+    result.last_pickup_text_words = last_pickup_text_words_;
+    result.last_pickup_text_bytes = last_pickup_text_bytes_;
     result.last_restore_caller = last_restore_caller_;
     result.pre_restore_player_x = pre_restore_player_x_;
     result.pre_restore_player_y = pre_restore_player_y_;
@@ -854,6 +913,9 @@ public:
         collision_request_fallbacks_;
     result.last_collision_request_fallback =
         last_collision_request_fallback_;
+    result.player_collision_requests = player_collision_requests_;
+    result.invalid_player_collision_requests =
+        invalid_player_collision_requests_;
     result.renderer_text_repairs = renderer_text_repairs_;
     result.last_renderer_text_repair_address =
         last_renderer_text_repair_address_;
@@ -1054,6 +1116,55 @@ public:
         last_script_dispatch_arguments_;
     result.script_program_dispatches = script_program_dispatches_;
     result.script_activations = script_activations_;
+    result.last_script_activation_program =
+        last_script_activation_program_;
+    for (const auto program : active_script_programs_) {
+      std::uint32_t header{};
+      std::uint32_t timers{};
+      std::uint32_t name{};
+      std::array<std::uint32_t, 2U> name_words{};
+      if (!vm_.runtime().read32(program, header) ||
+          !vm_.runtime().read32(program + 0x10U, timers) ||
+          !vm_.runtime().read32(program + 0x14U, name) ||
+          timers == 0U || name == 0U ||
+          !vm_.runtime().read32(name, name_words[0U]) ||
+          !vm_.runtime().read32(name + 4U, name_words[1U])) {
+        continue;
+      }
+      const auto timer_count =
+          static_cast<std::uint8_t>(header >> 24U);
+      for (auto index = std::uint16_t{}; index < timer_count; ++index) {
+        std::uint16_t remaining_bits{};
+        if (!vm_.runtime().read16(
+                timers + static_cast<std::uint32_t>(index) * 2U,
+                remaining_bits)) {
+          break;
+        }
+        const auto remaining =
+            std::bit_cast<std::int16_t>(remaining_bits);
+        if (remaining <= 0 ||
+            result.active_script_timer_count >=
+                result.active_script_timers.size()) {
+          continue;
+        }
+        result.active_script_timers[
+            result.active_script_timer_count++] = Sf2GuestScriptTimer{
+            .program = program,
+            .timer_index = index,
+            .remaining_ticks = remaining,
+            .program_name_words = name_words,
+        };
+        // AIRBASE's visible countdown is LEVEL timer 0. Other active sequel
+        // timers drive internal choreography (for example HWAY's CHANCE
+        // program) and must not be projected as HUD clocks.
+        if (mission_index_ == 1U && index == 0U &&
+            name_words[0U] == 0x4556454cU &&
+            (name_words[1U] & 0xffffU) == 0x004cU) {
+          result.mission_timer_ticks = remaining;
+          result.mission_timer_visible = true;
+        }
+      }
+    }
     result.scene_xa_archive_opens = scene_xa_archive_opens_;
     result.scene_speech_starts = scene_speech_starts_;
     result.scene_speech_callbacks = scene_speech_callbacks_;
@@ -1178,6 +1289,8 @@ private:
     std::uint32_t raw_x{};
     std::uint32_t raw_y{};
     std::uint32_t raw_z{};
+    std::uint16_t health_bits{};
+    std::uint16_t armor_bits{};
     if (!vm_.runtime().read32(player_pointer, instance) || instance == 0U ||
         !vm_.runtime().read32(instance + instance_node_offset, node) ||
         node == 0U ||
@@ -1192,9 +1305,9 @@ private:
         !vm_.runtime().read32(matrix + matrix_translation_offset + 8U,
                               raw_z) ||
         !vm_.runtime().read16(health_controller + health_value_offset,
-                              health) ||
+                              health_bits) ||
         !vm_.runtime().read16(health_controller + health_armor_offset,
-                              armor)) {
+                              armor_bits)) {
       instance = 0U;
       x = 0;
       y = 0;
@@ -1206,17 +1319,42 @@ private:
     x = std::bit_cast<std::int32_t>(raw_x);
     y = std::bit_cast<std::int32_t>(raw_y);
     z = std::bit_cast<std::int32_t>(raw_z);
+    const auto signed_health = std::bit_cast<std::int16_t>(health_bits);
+    const auto signed_armor = std::bit_cast<std::int16_t>(armor_bits);
+    health = signed_health > 0 ? static_cast<std::uint16_t>(signed_health) : 0U;
+    armor = signed_armor > 0 ? static_cast<std::uint16_t>(signed_armor) : 0U;
   }
 
   void readPlayerHudState(
       std::uint32_t instance,
       Sf2GuestRuntimeDiagnostics &result) const noexcept {
+    constexpr std::uint32_t instance_target_offset = 0x14U;
     constexpr std::uint32_t instance_inventory_offset = 0x20U;
+    constexpr std::uint32_t target_slot_offset = 0U;
+    constexpr std::uint32_t target_flags_offset = 4U;
+    constexpr std::uint32_t target_meter_offset = 0x58U;
     constexpr std::uint32_t inventory_owned_offset = 0x3cU;
     constexpr std::uint32_t inventory_ammo_offset = 0x44U;
     constexpr std::uint32_t inventory_equipped_offset = 0xccU;
     if (instance == 0U) {
       return;
+    }
+    std::uint32_t target{};
+    if (vm_.runtime().read32(instance + instance_target_offset, target) &&
+        target != 0U) {
+      std::uint16_t target_slot_bits{};
+      std::uint16_t target_meter_bits{};
+      if (vm_.runtime().read16(target + target_slot_offset,
+                               target_slot_bits) &&
+          vm_.runtime().read32(target + target_flags_offset,
+                               result.player_target_flags) &&
+          vm_.runtime().read16(target + target_meter_offset,
+                               target_meter_bits)) {
+        result.player_target_slot =
+            std::bit_cast<std::int16_t>(target_slot_bits);
+        result.player_target_meter =
+            std::bit_cast<std::int16_t>(target_meter_bits);
+      }
     }
     std::uint32_t inventory{};
     if (!vm_.runtime().read32(instance + instance_inventory_offset,
@@ -1244,6 +1382,222 @@ private:
           vm_.runtime().read16(address + 2U, result.player_magazines[item]));
     }
   }
+
+  [[nodiscard]] bool readPlayerThreatState(
+      std::uint32_t player_instance,
+      Sf2GuestRuntimeDiagnostics &result) const noexcept {
+    constexpr std::uint32_t object_records_pointer = 0x8011eef8U;
+    constexpr std::uint32_t object_count_address = 0x8011f564U;
+    constexpr std::uint32_t object_record_stride = 0x4cU;
+    constexpr std::uint32_t object_instance_offset = 0x34U;
+    constexpr std::uint32_t object_class_offset = 0x2aU;
+    constexpr std::uint32_t object_maximum_health_offset = 0x3eU;
+    constexpr std::uint32_t object_health_offset = 0x40U;
+    constexpr std::uint32_t instance_node_offset = 0x08U;
+    constexpr std::uint32_t instance_target_offset = 0x14U;
+    constexpr std::uint32_t target_slot_offset = 0U;
+    // SF2 expands the target controller relative to SF1. Dynamic scans of
+    // living actors targeting Gabe place the retail Q12 danger scalar at
+    // +0xE8 (0x1000 at full threat); SF1's +0xD4 field remains zero here.
+    constexpr std::uint32_t target_danger_offset = 0xe8U;
+    constexpr std::uint32_t maximum_objects = 1024U;
+    constexpr std::uint32_t fixed_one = 0x1000U;
+    constexpr std::uint32_t retail_bar_maximum = 50U;
+
+    std::uint32_t records{};
+    std::uint32_t count_bits{};
+    if (player_instance == 0U ||
+        !vm_.runtime().read32(object_records_pointer, records) ||
+        !vm_.runtime().read32(object_count_address, count_bits) ||
+        records == 0U) {
+      return false;
+    }
+    const auto count = std::bit_cast<std::int32_t>(count_bits);
+    if (count <= 0 ||
+        static_cast<std::uint32_t>(count) > maximum_objects) {
+      return false;
+    }
+
+    result.player_object_slot = -1;
+    for (auto slot = 0; slot < count; ++slot) {
+      std::uint32_t instance{};
+      if (!vm_.runtime().read32(
+              records + static_cast<std::uint32_t>(slot) *
+                            object_record_stride +
+                  object_instance_offset,
+              instance)) {
+        return false;
+      }
+      if (instance == player_instance) {
+        result.player_object_slot = static_cast<std::int16_t>(slot);
+        break;
+      }
+    }
+    if (result.player_object_slot < 0) {
+      return false;
+    }
+
+    // PSYQ MATRIX stores its 3x3 Q12 rotation at +0 and translation at
+    // +0x14. Local +Z is the actor's forward axis in the sequel instance
+    // nodes, so m02/m22 provide a stable radar basis without deriving facing
+    // from movement (which fails while Gabe is standing still).
+    std::uint32_t player_node{};
+    std::uint32_t player_matrix{};
+    std::uint16_t forward_x_bits{};
+    std::uint16_t forward_z_bits{};
+    if (vm_.runtime().read32(
+            player_instance + instance_node_offset, player_node) &&
+        player_node != 0U &&
+        vm_.runtime().read32(player_node + 0x0cU, player_matrix) &&
+        player_matrix != 0U &&
+        vm_.runtime().read16(player_matrix + 0x04U, forward_x_bits) &&
+        vm_.runtime().read16(player_matrix + 0x10U, forward_z_bits)) {
+      result.player_forward_x =
+          std::bit_cast<std::int16_t>(forward_x_bits);
+      result.player_forward_z =
+          std::bit_cast<std::int16_t>(forward_z_bits);
+    }
+
+    result.radar_actor_count = 0U;
+    auto radar_distance_squared =
+        std::array<std::uint64_t, 16U>{};
+    radar_distance_squared.fill(
+        std::numeric_limits<std::uint64_t>::max());
+    auto safe_q12 = fixed_one;
+    result.player_threat_count = 0U;
+    for (auto slot = 0; slot < count; ++slot) {
+      const auto record =
+          records + static_cast<std::uint32_t>(slot) * object_record_stride;
+      std::uint32_t instance{};
+      std::uint16_t health_bits{};
+      std::uint8_t object_class{};
+      if (!vm_.runtime().read32(record + object_instance_offset, instance) ||
+          !vm_.runtime().read16(record + object_health_offset, health_bits) ||
+          !vm_.runtime().read8(record + object_class_offset, object_class)) {
+        return false;
+      }
+      if (instance == 0U ||
+          std::bit_cast<std::int16_t>(health_bits) <= 0) {
+        continue;
+      }
+      if (slot == result.player_target_slot) {
+        std::uint16_t maximum_health_bits{};
+        if (!vm_.runtime().read16(
+                record + object_maximum_health_offset,
+                maximum_health_bits)) {
+          return false;
+        }
+        const auto health =
+            static_cast<std::uint32_t>(
+                std::bit_cast<std::int16_t>(health_bits));
+        const auto signed_maximum =
+            std::bit_cast<std::int16_t>(maximum_health_bits);
+        const auto maximum = std::max<std::uint32_t>(
+            health, signed_maximum > 0
+                        ? static_cast<std::uint32_t>(signed_maximum)
+                        : 1U);
+        result.player_target_health_percent =
+            static_cast<std::uint8_t>(std::min<std::uint32_t>(
+                100U, (health * 100U + maximum - 1U) / maximum));
+        result.player_target_active = true;
+      }
+      std::uint32_t node{};
+      std::uint32_t target{};
+      if (!vm_.runtime().read32(instance + instance_node_offset, node) ||
+          !vm_.runtime().read32(instance + instance_target_offset, target)) {
+        return false;
+      }
+      if (node == 0U || target == 0U) {
+        continue;
+      }
+
+      std::uint16_t target_slot_bits{};
+      std::uint32_t danger_bits{};
+      if (!vm_.runtime().read16(target + target_slot_offset,
+                                target_slot_bits) ||
+          !vm_.runtime().read32(target + target_danger_offset,
+                                danger_bits)) {
+        return false;
+      }
+      const auto threat_q12 = static_cast<std::uint16_t>(
+          std::min(danger_bits & 0xffff3fffU, fixed_one));
+      if (std::bit_cast<std::int16_t>(target_slot_bits) ==
+          result.player_object_slot) {
+        ++result.player_threat_count;
+        safe_q12 = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(safe_q12) *
+             (fixed_one - threat_q12)) >>
+            12U);
+      }
+
+      // The retail object dispatcher reads the faction/class byte from
+      // record +0x2A. SF2 class 01 and AIRBASE's class 03 are opposition;
+      // class 02 is allied. Keep both factions (retail plots Chance in blue)
+      // while excluding unrelated target-capable object classes.
+      const auto radar_hostile = object_class == 0x01U ||
+                                 object_class == 0x03U;
+      const auto radar_allied = object_class == 0x02U;
+      std::uint32_t matrix{};
+      std::uint32_t actor_x_bits{};
+      std::uint32_t actor_z_bits{};
+      if ((radar_hostile || radar_allied) &&
+          vm_.runtime().read32(node + 0x0cU, matrix) &&
+          matrix != 0U &&
+          vm_.runtime().read32(matrix + 0x14U, actor_x_bits) &&
+          vm_.runtime().read32(matrix + 0x1cU, actor_z_bits)) {
+        const auto actor_x = std::bit_cast<std::int32_t>(actor_x_bits);
+        const auto actor_z = std::bit_cast<std::int32_t>(actor_z_bits);
+        const auto delta_x =
+            static_cast<std::int64_t>(actor_x) - result.player_x;
+        const auto delta_z =
+            static_cast<std::int64_t>(actor_z) - result.player_z;
+        const auto square = [](std::int64_t value) {
+          const auto magnitude = static_cast<std::uint64_t>(
+              value < 0 ? -value : value);
+          return magnitude * magnitude;
+        };
+        const auto distance_squared =
+            square(delta_x) + square(delta_z);
+        auto insertion = radar_distance_squared.size();
+        for (auto index = std::size_t{};
+             index < radar_distance_squared.size(); ++index) {
+          if (distance_squared < radar_distance_squared[index]) {
+            insertion = index;
+            break;
+          }
+        }
+        if (insertion < radar_distance_squared.size()) {
+          for (auto index = radar_distance_squared.size() - 1U;
+               index > insertion; --index) {
+            radar_distance_squared[index] =
+                radar_distance_squared[index - 1U];
+            result.radar_actors[index] =
+                result.radar_actors[index - 1U];
+          }
+          radar_distance_squared[insertion] = distance_squared;
+          result.radar_actors[insertion] = Sf2GuestRadarActor{
+              .x = actor_x,
+              .z = actor_z,
+              .object_slot = static_cast<std::int16_t>(slot),
+              .threat_q12 = threat_q12,
+              .allied = radar_allied,
+              .selected = result.player_target_slot == slot,
+          };
+          result.radar_actor_count = static_cast<std::uint8_t>(
+              std::min<std::size_t>(
+                  result.radar_actor_count + 1U,
+                  result.radar_actors.size()));
+        }
+      }
+
+    }
+    const auto endpoint =
+        retail_bar_maximum - ((safe_q12 * retail_bar_maximum) >> 12U);
+    result.player_danger =
+        static_cast<std::uint8_t>(endpoint * 2U);
+    return true;
+  }
+
 
   [[nodiscard]] static bool
   isAuthoredWorldFrame(const Sf2PresentationFrame &frame) noexcept {
@@ -1674,6 +2028,15 @@ private:
         !vm_.runtime().read16(owner + owner_room_offset, room)) {
       return;
     }
+    auto dialogue_active = false;
+    for (auto index = std::uint32_t{}; index < 3U; ++index) {
+      std::uint32_t dialogue_state{};
+      if (vm_.runtime().read32(0x80134d1cU + index * 0x10U,
+                               dialogue_state) &&
+          dialogue_state != 0xffffffffU) {
+        dialogue_active = true;
+      }
+    }
     if (room < room_count) {
       last_valid_collision_room_ = room;
       return;
@@ -1683,12 +2046,38 @@ private:
     // following floor scan then has no collision list and can drop Gabe
     // through valid geometry. Retain only the immediately preceding retail
     // room and let any subsequent valid resolver result replace it.
-    if (room == 0xffffU && last_valid_collision_room_ < room_count &&
+    if (!dialogue_active && room == 0xffffU &&
+        last_valid_collision_room_ < room_count &&
         vm_.runtime().write16(owner + owner_room_offset,
                               last_valid_collision_room_)) {
       ++collision_room_fallbacks_;
       last_collision_room_fallback_ = last_valid_collision_room_;
     }
+  }
+
+  void stabilizePlayerCollisionRequest(
+      LegacyHostCallContext &context, std::uint32_t request) noexcept {
+    constexpr std::uint32_t request_room_offset = 0x0cU;
+    constexpr std::uint32_t collision_room_count_address = 0x8011f660U;
+    std::uint32_t request_room{};
+    std::uint32_t room_count{};
+    ++player_collision_requests_;
+    if (!context.read32(request + request_room_offset, request_room)) {
+      return;
+    }
+    if (request_room != 0xffffU && request_room != 0xffffffffU) {
+      return;
+    }
+    ++invalid_player_collision_requests_;
+    if (last_valid_collision_room_ == 0xffffU ||
+        !context.read32(collision_room_count_address, room_count) ||
+        last_valid_collision_room_ >= room_count ||
+        !context.write32(request + request_room_offset,
+                         last_valid_collision_room_)) {
+      return;
+    }
+    ++collision_request_fallbacks_;
+    last_collision_request_fallback_ = last_valid_collision_room_;
   }
 
   struct OpenFile {
@@ -1703,6 +2092,7 @@ private:
     std::size_t gpu_gp0_scan{};
     std::vector<Sf2GpuPacket> vram_setup_packets;
     std::shared_ptr<const Sf2PresentationFrame> presentation_frame;
+    std::vector<std::uint32_t> active_script_programs;
     std::uint64_t callback_ticks{};
     std::uint64_t audio_callback_ticks{};
     std::uint64_t retrace_ticks{};
@@ -1834,6 +2224,40 @@ private:
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
+        0x8002e6e8U, [this](LegacyHostCallContext &context) {
+          ++objective_completion_events_;
+          last_objective_completion_index_ = context.argument(0U);
+          last_objective_completion_text_ =
+              static_cast<std::int32_t>(context.argument(1U));
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800abc48U, [this](LegacyHostCallContext &context) {
+          ++pickup_presentation_events_;
+          last_pickup_actor_ = context.argument(0U);
+          last_pickup_text_ = context.argument(1U);
+          last_pickup_item_ = context.argument(2U);
+          for (auto index = std::size_t{};
+               index < last_pickup_text_words_.size(); ++index) {
+            static_cast<void>(context.read32(
+                last_pickup_text_ + static_cast<std::uint32_t>(index * 4U),
+                last_pickup_text_words_[index]));
+          }
+          last_pickup_text_bytes_.fill('\0');
+          for (auto index = std::size_t{};
+               index + 1U < last_pickup_text_bytes_.size(); ++index) {
+            std::uint8_t value{};
+            if (!context.read8(last_pickup_text_ +
+                                   static_cast<std::uint32_t>(index),
+                               value) ||
+                value == 0U) {
+              break;
+            }
+            last_pickup_text_bytes_[index] = static_cast<char>(value);
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
         0x80078c24U, [this](LegacyHostCallContext &context) {
           const auto request = context.argument(0U);
           std::uint16_t event{};
@@ -1880,11 +2304,23 @@ private:
           // a public display boundary. Apply its captured owner-room repair
           // at the collision call edge as well as at that boundary. This
           // intentionally does not classify or rewrite individual requests:
-          // the previously suspected return site is shared actor logic.
+          // the observed return site is shared actor logic.
           stabilizeCollisionRoom();
           ++world_collision_scans_;
           last_world_collision_caller_ = context.returnAddress();
           const auto request = context.argument(0U);
+          // 0x80084E7C is shared actor logic, so the return address alone is
+          // not a player-floor identity. The caller iterates s1 over actors
+          // while retaining Gabe in s0; its own branch at 0x80084E18 treats
+          // s1 == s0 as the player case. Repair only that exact request.
+          const auto player_request =
+              context.returnAddress() == 0x80084e7cU &&
+              context.registerValue(16U) != 0U &&
+              context.registerValue(17U) ==
+                  context.registerValue(16U);
+          if (player_request) {
+            stabilizePlayerCollisionRequest(context, request);
+          }
           std::uint32_t object{};
           std::uint32_t room{};
           if (context.read32(request + 0x08U, object)) {
@@ -2132,6 +2568,23 @@ private:
     vm_.bindHostCall(
         0x800b39e4U, [this](LegacyHostCallContext &context) {
           ++script_activations_;
+          last_script_activation_program_ = context.argument(0U);
+          if (std::ranges::find(active_script_programs_,
+                                last_script_activation_program_) ==
+              active_script_programs_.end()) {
+            active_script_programs_.push_back(
+                last_script_activation_program_);
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800b3a30U, [this](LegacyHostCallContext &context) {
+          std::erase(active_script_programs_, context.argument(0U));
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800b3a84U, [this](LegacyHostCallContext &context) {
+          active_script_programs_.clear();
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -3198,6 +3651,8 @@ private:
   std::uint16_t last_collision_room_fallback_{};
   std::uint64_t collision_request_fallbacks_{};
   std::uint16_t last_collision_request_fallback_{};
+  std::uint64_t player_collision_requests_{};
+  std::uint64_t invalid_player_collision_requests_{};
   std::uint64_t renderer_text_repairs_{};
   std::uint32_t last_renderer_text_repair_address_{};
   std::uint32_t last_renderer_text_expected_{};
@@ -3244,12 +3699,23 @@ private:
   std::uint32_t last_retail_load_image_caller_{};
   Sf2GpuTransfer last_retail_load_image_transfer_{};
   std::uint64_t script_archive_loads_{};
+  std::uint64_t objective_completion_events_{};
+  std::uint32_t last_objective_completion_index_{};
+  std::int32_t last_objective_completion_text_{-1};
+  std::uint64_t pickup_presentation_events_{};
+  std::uint32_t last_pickup_actor_{};
+  std::uint32_t last_pickup_text_{};
+  std::uint32_t last_pickup_item_{};
+  std::array<std::uint32_t, 8U> last_pickup_text_words_{};
+  std::array<char, 64U> last_pickup_text_bytes_{};
   std::uint64_t script_level_starts_{};
   std::uint64_t script_dispatches_{};
   std::uint64_t script_event5_dispatches_{};
   std::array<std::uint32_t, 2U> last_script_dispatch_arguments_{};
   std::uint64_t script_program_dispatches_{};
   std::uint64_t script_activations_{};
+  std::uint32_t last_script_activation_program_{};
+  std::vector<std::uint32_t> active_script_programs_;
   std::uint64_t scene_xa_archive_opens_{};
   std::uint64_t scene_speech_starts_{};
   std::uint64_t scene_speech_callbacks_{};

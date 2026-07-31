@@ -803,6 +803,12 @@ void GameplayHud::setVitals(PlayerVitals vitals) noexcept {
   vitals_ = vitals;
 }
 
+void GameplayHud::synchronizeVitals(PlayerVitals vitals) noexcept {
+  setVitals(vitals);
+  displayed_primary_bar_ = primaryBar();
+  displayed_primary_trail_ = displayed_primary_bar_;
+}
+
 void GameplayHud::setDanger(std::uint8_t danger, bool critical) noexcept {
   danger_ = std::min(danger, static_cast<std::uint8_t>(100U));
   danger_critical_ = critical && danger_ == 100U;

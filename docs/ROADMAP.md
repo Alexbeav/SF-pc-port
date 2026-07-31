@@ -32,6 +32,40 @@
   campaign validation. Complete: 20/20 retail mission resources and all 13
   distinct overlays pass bootstrap, PCM, checkpoint and exact-replay gates.
 
+## Syphon Filter 2 product roadmap
+
+The SF2 guest runtime has reached live gameplay in all 21 campaign mission
+packages on both retail discs. Mission 3 has been completed interactively from
+its authored opening through the save menu and following cinematic. Mission
+startup coverage is broad, but full-campaign completion and product parity are
+not yet claimed.
+
+1. **Presentation stability** — eliminate intermittent world/HUD flicker,
+   stale-frame duplication, texture-atlas corruption, room-residency failures,
+   and remaining collision/floor loss. Keep interactive, cross-room, checkpoint,
+   and F5/F9 renderer regressions.
+2. **Complete SF2 HUD and gameplay UI** — restore the minimap/radar and timer,
+   target/threat bars, objective and pickup messages, general gameplay text,
+   remaining font/weapon atlas regions, and exact cutscene/checkpoint reveal
+   transitions.
+3. **Mission 1 opening fidelity** — preserve the complete Colorado Mountains
+   authored introduction through its parachute handoff instead of entering the
+   correct airborne state after a shortened sequence.
+4. **All-mission validation** — complete all 21 missions while auditing
+   objectives, conversations, failure conditions, bosses, special mechanics,
+   checkpoints, mission-specific audio/resources, and end-of-level transitions.
+5. **Connected SF2 campaign** — integrate title/menu selection, natural
+   mission-to-mission progression, persistent saves, cinematic handoffs,
+   Disc 1-to-Disc 2 transition, final completion/credits, and launcher support.
+6. **Audio, input, and PC polish** — validate music and dialogue interruption
+   across the campaign, tune mouse aiming, expose original/modern control
+   options, complete controller testing, and polish quick-state presentation.
+7. **SF1 product-feature parity** — after the compatibility campaign is
+   complete, bring SF2 to the same native presentation level as `sf-pc-port`:
+   high-resolution rendering, widescreen scene presentation, high-refresh
+   frame interpolation, PGXP geometry and perspective-correct textures,
+   renderer options, and equivalent launcher/settings integration.
+
 The older native-port milestones below are retained as implementation history.
 
 ## M0: input and build foundation

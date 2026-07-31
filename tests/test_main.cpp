@@ -288,6 +288,12 @@ void testSf2PresentationFrameCapture() {
   sf::game::Sf2GuestRuntimeDiagnostics guest_hud{
       .player_health = 75U,
       .player_armor = 300U,
+      .player_target_slot = 4,
+      .player_target_meter = 64,
+      .player_target_health_percent = 64U,
+      .player_target_active = true,
+      .player_danger = 72U,
+      .threat_state_valid = true,
       .player_equipped_item = 4U,
   };
   guest_hud.player_owned_items[0] = 1U << 4U;
@@ -301,15 +307,43 @@ void testSf2PresentationFrameCapture() {
               sf2_hud.inventory().current() == sf::game::WeaponId::m_16 &&
               sf2_hud.inventory().currentState().magazine == 7U &&
               sf2_hud.inventory().currentState().reserve == 23U &&
+              sf2_hud.targetBar() ==
+                  std::optional<std::uint8_t>{std::uint8_t{32U}} &&
+              sf2_hud.dangerBar() == 36U &&
               sf2_hud.weaponSwitchFrames() ==
                   sf::game::GameplayHud::weapon_switch_duration,
           "SF2 guest HUD projection lost authoritative vitals, inventory, "
-          "ammunition, or selection");
+          "ammunition, target meter, danger, or selection");
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud, true);
+  require(!sf2_hud.targetBar(),
+          "SF2 first-person aim exposed the third-person TARGET bar");
+  guest_hud.player_equipped_item = 20U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  require(!sf2_hud.targetBar(),
+          "SF2 knife lock-on exposed the ranged TARGET bar");
+  guest_hud.player_equipped_item = 19U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  require(!sf2_hud.targetBar(),
+          "SF2 hand-taser lock-on exposed the ranged TARGET bar");
+  guest_hud.player_equipped_item = 18U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  require(sf2_hud.targetBar().has_value(),
+          "SF2 air-taser lock-on lost the ranged TARGET bar");
+  guest_hud.player_equipped_item = 4U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  guest_hud.player_target_active = false;
   guest_hud.player_owned_items = {1U << 13U, 0U};
   guest_hud.player_equipped_item = 13U;
   sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
-  require(sf2_hud.inventory().current() == sf::game::WeaponId::unarmed,
-          "Unsupported SF2 item was aliased into the native HUD inventory");
+  require(sf2_hud.inventory().current() == sf::game::WeaponId::unarmed &&
+              !sf2_hud.targetBar(),
+          "Unsupported SF2 item or stale target was projected into the HUD");
+  guest_hud.player_health = 0U;
+  guest_hud.player_armor = 0U;
+  sf::game::projectSf2GuestHud(sf2_hud, guest_hud);
+  require(sf2_hud.displayedPrimaryBar() == 0U &&
+              sf2_hud.displayedPrimaryTrail() == 0U,
+          "SF2 zero-health projection retained a synthetic full red bar");
 
   sf::game::Sf2SampledMouseAccumulator mouse{10U};
   mouse.add(10U, 5, -7);

@@ -67,7 +67,7 @@ constexpr std::array sf2_missions{
                       "AIRBASE.OVL", "", "", 1},
     MissionDefinition{2U, "Colorado Interstate 70", "HWAY", "HWAY.OVL", "",
                       "", 2},
-    MissionDefinition{3U, "I-70 Suspension Bridge", "BRIDGE", "BRIDGE.OVL",
+    MissionDefinition{3U, "I-70 Mountain Bridge", "BRIDGE", "BRIDGE.OVL",
                       "", "", 3},
     MissionDefinition{4U, "McKenzie Airbase Exterior", "AIRBASEX",
                       "AIRBASEX.OVL", "", "", 4},
@@ -86,7 +86,7 @@ constexpr std::array sf2_missions{
                       11},
     MissionDefinition{12U, "Volkov Park", "MOSCOW3", "MOSCOW3.OVL", "", "",
                       12},
-    MissionDefinition{13U, "Gregorav", "GARAGE", "GARAGE.OVL", "", "", 13},
+    MissionDefinition{13U, "Gregorov", "GARAGE", "GARAGE.OVL", "", "", 13},
     MissionDefinition{14U, "Aljir Prison Break-in", "GULAG", "GULAG.OVL", "",
                       "", 14},
     MissionDefinition{15U, "Aljir Prison Escape", "GULAG2", "GULAG2.OVL", "",
@@ -99,7 +99,7 @@ constexpr std::array sf2_missions{
                       18},
     MissionDefinition{19U, "New York Sewer", "SLUMS2", "SLUMS2.OVL", "", "",
                       19},
-    MissionDefinition{20U, "Chance", "CHINBOSS", "CHINBOSS.OVL", "", "", 20},
+    MissionDefinition{20U, "Finale", "CHINBOSS", "CHINBOSS.OVL", "", "", 20},
 };
 
 constexpr std::array sf3_missions{

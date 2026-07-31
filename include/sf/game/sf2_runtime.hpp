@@ -106,6 +106,22 @@ struct Sf2GuestTimelineEvent {
   std::array<std::uint32_t, 4U> arguments{};
 };
 
+struct Sf2GuestRadarActor {
+  std::int32_t x{};
+  std::int32_t z{};
+  std::int16_t object_slot{-1};
+  std::uint16_t threat_q12{};
+  bool allied{};
+  bool selected{};
+};
+
+struct Sf2GuestScriptTimer {
+  std::uint32_t program{};
+  std::uint16_t timer_index{};
+  std::int16_t remaining_ticks{};
+  std::array<std::uint32_t, 2U> program_name_words{};
+};
+
 struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t pc{};
   std::uint32_t stack_pointer{};
@@ -127,11 +143,41 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint16_t last_collision_room_fallback{};
   std::uint64_t collision_request_fallbacks{};
   std::uint16_t last_collision_request_fallback{};
+  std::uint64_t player_collision_requests{};
+  std::uint64_t invalid_player_collision_requests{};
   std::int32_t player_x{};
   std::int32_t player_y{};
   std::int32_t player_z{};
+  std::int16_t player_forward_x{};
+  std::int16_t player_forward_z{4096};
+  std::array<Sf2GuestRadarActor, 16U> radar_actors{};
+  std::uint8_t radar_actor_count{};
   std::uint16_t player_health{};
   std::uint16_t player_armor{};
+  std::int16_t player_target_slot{-1};
+  std::int16_t player_target_meter{};
+  std::uint8_t player_target_health_percent{};
+  std::uint32_t player_target_flags{};
+  bool player_target_active{};
+  std::uint32_t objective_completion_bits{};
+  bool objective_state_valid{};
+  std::uint64_t objective_completion_events{};
+  std::uint32_t last_objective_completion_index{};
+  std::int32_t last_objective_completion_text{-1};
+  std::uint64_t pickup_presentation_events{};
+  std::uint32_t last_pickup_actor{};
+  std::uint32_t last_pickup_text{};
+  std::uint32_t last_pickup_item{};
+  std::array<std::uint32_t, 8U> last_pickup_text_words{};
+  std::array<char, 64U> last_pickup_text_bytes{};
+  std::int16_t player_object_slot{-1};
+  std::uint8_t player_danger{};
+  std::uint16_t player_threat_count{};
+  bool threat_state_valid{};
+  std::array<std::uint32_t, 3U> dialogue_state_words{
+      0xffffffffU, 0xffffffffU, 0xffffffffU};
+  std::uint32_t dialogue_state_word{};
+  bool dialogue_state_valid{};
   std::uint32_t player_equipped_item{};
   std::array<std::uint32_t, 2U> player_owned_items{};
   std::array<std::uint16_t, sf2_inventory_item_count> player_reserves{};
@@ -230,6 +276,11 @@ struct Sf2GuestRuntimeDiagnostics {
   std::array<std::uint32_t, 2U> last_script_dispatch_arguments{};
   std::uint64_t script_program_dispatches{};
   std::uint64_t script_activations{};
+  std::uint32_t last_script_activation_program{};
+  std::array<Sf2GuestScriptTimer, 16U> active_script_timers{};
+  std::uint8_t active_script_timer_count{};
+  std::int16_t mission_timer_ticks{};
+  bool mission_timer_visible{};
   std::uint64_t scene_xa_archive_opens{};
   std::uint64_t scene_speech_starts{};
   std::uint64_t scene_speech_callbacks{};
@@ -272,7 +323,8 @@ struct Sf2GuestRuntimeDiagnostics {
 // HUD presentation model. It never writes inventory, health or selection back
 // to the guest.
 void projectSf2GuestHud(GameplayHud &hud,
-                        const Sf2GuestRuntimeDiagnostics &guest) noexcept;
+                        const Sf2GuestRuntimeDiagnostics &guest,
+                        bool first_person_aim = false) noexcept;
 
 // Retains relative mouse motion until the retail 20 Hz PAD sampler advances.
 // This prevents motion collected on the other two 60 Hz presentation frames
