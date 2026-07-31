@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.2",
+    [string]$Version = "0.1.0-sf2-guest-alpha.3",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -116,8 +116,9 @@ SYPHON FILTER 2 PC — $Version
 EXPERIMENTAL GUEST-RUNTIME ALPHA
 Windows x64, $buildDate
 
-This package does not contain the game or a disc image. It requires a legally
-obtained Syphon Filter 2 USA Disc 1 BIN/CUE image.
+This package does not contain the game or a disc image. It requires legally
+obtained Syphon Filter 2 USA BIN/CUE images. Missions 1-8 use Disc 1;
+missions 9-21 use Disc 2.
 
 INSTALLATION
 ============
@@ -129,9 +130,10 @@ INSTALLATION
 
    New-Item -ItemType File -Path .\syphon_filter_cheats
 
-5. Start the validated Mission 3 alpha, replacing the example path:
+5. Start a mission, replacing N and the example path. Use Disc 1 for missions
+   1-8 and Disc 2 for missions 9-21:
 
-   .\syphon_filter.exe --no-launcher --mission=3 --scene-test "D:\PS1\Syphon Filter 2 (USA) (Disc 1).cue"
+   .\syphon_filter.exe --no-launcher --mission=N --scene-test "D:\PS1\Syphon Filter 2 (USA) (Disc 1).cue"
 
 The ordinary launcher remains the Syphon Filter 1 product launcher and does
 not expose this experimental SF2 path. Do not select an SF2 image there.
@@ -139,18 +141,22 @@ not expose this experimental SF2 path. Do not select an SF2 image there.
 CURRENT SCOPE
 =============
 
-- Mission 3 (I-70) is verified finishable from its in-engine opening through
-  the save menu and following cinematic.
+- All 21 mission packages boot into their authored in-engine openings through
+  direct mission launch. Mission 3 is verified finishable through its save
+  menu and following cinematic; campaign flow is not implemented.
 - Controls, combat, doors, climbing, weapons, dialogue, sound effects, death,
   checkpoint restart and in-session F5/F9 quick states are functional.
-- The HUD and weapon artwork are substantially restored, but a few UI atlas
-  regions and initialization transitions remain imperfect.
-- Music and the complete mission set are not validated.
+- The retail HUD, text, weapon artwork, radar actors/threat cones and
+  widescreen in-engine cinematic bars render through the guest GPU bridge.
+- Music and full completion of missions other than Mission 3 are not
+  validated.
 - A later scripted conversation can pause unevenly or fail to release player
   control; C skips it.
 - Collision/room residency can still intermittently allow Gabe to fall
   through the floor. The room-14 floor-request guard in this build needs
   broader interactive testing.
+- P reaches the retail pause/map input, but that transition is incomplete and
+  can hide Gabe's model after closing; avoid P in this build.
 
 Controls use the existing PC bindings. Mouse aiming works in first person;
 A/D strafe and C crouches. Mouse wheel and bracket keys select previous/next
@@ -200,8 +206,9 @@ EXPERIMENTAL SF2 GUEST ALPHA $Version
 =====================================
 
 This build runs retail Syphon Filter 2 R3000A gameplay inside the native PC
-runtime and presents the guest GPU/SPU output through PsyCross. Mission 3 is
-playable but this is a focused testing build, not a complete SF2 campaign port.
+runtime and presents the guest GPU/SPU output through PsyCross. All 21 missions
+can be launched directly and Mission 3 is verified finishable, but this is a
+testing build rather than a complete campaign port.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.
@@ -221,7 +228,7 @@ if (-not $commit) { $commit = "unknown" }
 
 $channel = if ($Sf2GuestAlpha) { "Experimental SF2 Guest Alpha" } else { "Public Test" }
 $supportedDisc = if ($Sf2GuestAlpha) {
-    "Syphon Filter 2 USA Disc 1, BIN/CUE"
+    "Syphon Filter 2 USA Disc 1 and Disc 2, BIN/CUE"
 } else {
     "Syphon Filter USA v1.1, SCUS-94240, BIN/CUE"
 }
