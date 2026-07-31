@@ -13688,6 +13688,24 @@ SceneViewerResult runSf2GuestScene(
   // time the player died.
   auto guest_hud_visible = false;
   auto quick_state_guest_hud_visible = false;
+  struct ObjectiveAutoplayState {
+    std::int32_t previous_x{};
+    std::int32_t previous_z{};
+    double heading{};
+    std::size_t waypoint{};
+    std::uint64_t loot_frame{};
+    std::uint16_t initial_armor{};
+    std::array<std::uint32_t, 2U> initial_owned_items{};
+    bool heading_known{};
+    bool baseline_captured{};
+    bool looted{};
+  };
+  auto objective_autoplay = ObjectiveAutoplayState{
+      .previous_x = runtime.diagnostics().player_x,
+      .previous_z = runtime.diagnostics().player_z,
+  };
+  auto quick_state_objective_autoplay =
+      std::optional<ObjectiveAutoplayState>{};
   const auto diagnostic_frame = [](const char *name) {
     const auto *value = SDL_getenv(name);
     if (value == nullptr) {
@@ -13700,6 +13718,12 @@ SceneViewerResult runSf2GuestScene(
                : std::nullopt;
   };
   const auto screenshot_frame = diagnostic_frame("SF2_CAPTURE_FRAME");
+  const auto screenshot_capture_count = static_cast<unsigned int>(
+      std::clamp<std::uint64_t>(
+          diagnostic_frame("SF2_CAPTURE_COUNT").value_or(1U), 1U, 8U));
+  auto screenshot_captures = 0U;
+  const auto automatic_objective =
+      diagnostic_frame("SF2_AUTOPLAY_OBJECTIVE").value_or(0U) != 0U;
   const auto automatic_quick_save_frame =
       diagnostic_frame("SF2_QUICK_SAVE_FRAME");
   const auto automatic_quick_load_frame =
@@ -13747,6 +13771,9 @@ SceneViewerResult runSf2GuestScene(
     if (quick_save_down && !quick_save_was_down) {
       if (runtime.captureQuickState()) {
         quick_state_guest_hud_visible = guest_hud_visible;
+        if (automatic_objective) {
+          quick_state_objective_autoplay = objective_autoplay;
+        }
         const auto saved = runtime.diagnostics();
         PsyX_Log_Info(
             "SF2 quick state saved: frame=%llu clock=%u "
@@ -13766,6 +13793,9 @@ SceneViewerResult runSf2GuestScene(
     if (quick_load_down && !quick_load_was_down) {
       if (runtime.restoreQuickState()) {
         guest_hud_visible = quick_state_guest_hud_visible;
+        if (automatic_objective && quick_state_objective_autoplay) {
+          objective_autoplay = *quick_state_objective_autoplay;
+        }
         audio.reset("sf2-quick-load");
         simulation_accumulator = 0.0;
         weapon_select =
@@ -13946,6 +13976,90 @@ SceneViewerResult runSf2GuestScene(
         .target_lock_held = raw.target_lock,
         .quick_turn = raw.quick_turn,
     };
+    if (automatic_objective && presented_frames >= 800U) {
+      static_cast<void>(runtime.setPlayerHealthForProbe(1000U));
+      const auto player = runtime.diagnostics();
+      if (!objective_autoplay.baseline_captured) {
+        objective_autoplay.initial_armor = player.player_armor;
+        objective_autoplay.initial_owned_items =
+            player.player_owned_items;
+        objective_autoplay.baseline_captured = true;
+      } else if (!objective_autoplay.looted &&
+                 (player.player_armor >
+                      objective_autoplay.initial_armor ||
+                  player.player_owned_items !=
+                      objective_autoplay.initial_owned_items)) {
+        objective_autoplay.looted = true;
+        objective_autoplay.loot_frame = presented_frames;
+        objective_autoplay.waypoint = 3U;
+        PsyX_Log_Info(
+            "SF2 objective autoplay looted truck: presented=%llu "
+            "player=(%d,%d,%d) room=%u\n",
+            static_cast<unsigned long long>(presented_frames),
+            player.player_x, player.player_y, player.player_z,
+            player.guest_current_room);
+      }
+      const auto velocity_x = static_cast<double>(
+          player.player_x - objective_autoplay.previous_x);
+      const auto velocity_z = static_cast<double>(
+          player.player_z - objective_autoplay.previous_z);
+      if (std::hypot(velocity_x, velocity_z) >= 2.0) {
+        objective_autoplay.heading =
+            std::atan2(velocity_z, velocity_x);
+        objective_autoplay.heading_known = true;
+      }
+      objective_autoplay.previous_x = player.player_x;
+      objective_autoplay.previous_z = player.player_z;
+      constexpr std::array<std::array<double, 2U>, 6U> waypoints{{
+          {3448.0, -25485.0},
+          {2423.0, -21363.0},
+          {1680.0, -18916.0},
+          {2423.0, -21363.0},
+          {3448.0, -25485.0},
+          {4206.0, -25824.0},
+      }};
+      auto delta_x =
+          waypoints[objective_autoplay.waypoint][0U] - player.player_x;
+      auto delta_z =
+          waypoints[objective_autoplay.waypoint][1U] - player.player_z;
+      auto distance = std::hypot(delta_x, delta_z);
+      if (distance <= 300.0 &&
+          objective_autoplay.waypoint + 1U < waypoints.size() &&
+          (objective_autoplay.looted ||
+           objective_autoplay.waypoint + 1U < 3U)) {
+        ++objective_autoplay.waypoint;
+        delta_x =
+            waypoints[objective_autoplay.waypoint][0U] - player.player_x;
+        delta_z =
+            waypoints[objective_autoplay.waypoint][1U] - player.player_z;
+        distance = std::hypot(delta_x, delta_z);
+      }
+      guest_input = game::GameplayInput{
+          .move = distance > 260.0 ? 1.0 : 0.0,
+          .run = true,
+          .interact =
+              !objective_autoplay.looted &&
+              objective_autoplay.waypoint == 2U && distance <= 340.0 &&
+              (presented_frames % 30U) < 6U,
+      };
+      if (objective_autoplay.heading_known) {
+        constexpr auto pi = 3.14159265358979323846;
+        auto error =
+            std::atan2(delta_z, delta_x) - objective_autoplay.heading;
+        while (error > pi) {
+          error -= 2.0 * pi;
+        }
+        while (error < -pi) {
+          error += 2.0 * pi;
+        }
+        guest_input.turn = -std::clamp(error, -1.0, 1.0);
+      }
+      if (objective_autoplay.looted &&
+          presented_frames - objective_autoplay.loot_frame < 12U) {
+        guest_input.kneel = true;
+        guest_input.move = 0.0;
+      }
+    }
     auto host_pad = game::legacyPadStateFromPlayerInput(guest_input);
     if (weapon_select_down) {
       // SF2's default controller layout assigns Change Weapon to Select.
@@ -14265,7 +14379,8 @@ SceneViewerResult runSf2GuestScene(
       }
       const auto capture_screenshot =
           !screenshot_captured && screenshot_frame &&
-          presented_frames >= *screenshot_frame;
+          presented_frames >=
+              *screenshot_frame + screenshot_captures;
       beginSf2GuestFrame();
       drawSf2GuestFrame(*frame, texture_bank);
       // The authored opening lasts roughly fifteen seconds. The retail HUD
@@ -14311,11 +14426,28 @@ SceneViewerResult runSf2GuestScene(
             captured_environment.ofs[1], captured_environment.tpage,
             captured_environment.dtd);
         PsyX_TakeScreenshot();
+        if (screenshot_capture_count > 1U) {
+          auto copy_error = std::error_code{};
+          std::filesystem::copy_file(
+              "SCREENSHOT.BMP",
+              "SCREENSHOT.sf2-frame-" +
+                  std::to_string(presented_frames) + ".BMP",
+              std::filesystem::copy_options::overwrite_existing,
+              copy_error);
+          if (copy_error) {
+            PsyX_Log_Error(
+                "SF2 capture copy failed: frame=%llu error=%s\n",
+                static_cast<unsigned long long>(presented_frames),
+                copy_error.message().c_str());
+          }
+        }
       }
       PsyX_EndScene();
       ++presented_frames;
       if (capture_screenshot) {
-        screenshot_captured = true;
+        ++screenshot_captures;
+        screenshot_captured =
+            screenshot_captures >= screenshot_capture_count;
       }
     }
   }

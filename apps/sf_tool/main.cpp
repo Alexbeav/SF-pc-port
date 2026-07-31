@@ -6541,6 +6541,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   auto objective_waypoint = std::size_t{};
   auto objective_looted = false;
   auto objective_loot_frame = std::uint32_t{};
+  auto objective_baseline_captured = false;
+  auto objective_initial_armor = std::uint16_t{};
+  auto objective_initial_owned_items =
+      std::array<std::uint32_t, 2U>{};
   auto weapon_select =
       sf::game::Sf2WeaponSelectPulseQueue{runtime.inputSampleCount()};
   auto weapon_pulses_queued = false;
@@ -6620,9 +6624,14 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         return 10;
       }
       const auto player = runtime.diagnostics();
-      if (!objective_looted &&
-          (player.player_armor != 0U ||
-           player.player_owned_items[0U] != 0x00100000U)) {
+      if (!objective_baseline_captured) {
+        objective_initial_armor = player.player_armor;
+        objective_initial_owned_items = player.player_owned_items;
+        objective_baseline_captured = true;
+      } else if (!objective_looted &&
+                 (player.player_armor > objective_initial_armor ||
+                  player.player_owned_items !=
+                      objective_initial_owned_items)) {
         objective_looted = true;
         objective_loot_frame = frame;
         objective_waypoint = 3U;
@@ -6898,12 +6907,15 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   }
   const auto input_mode =
       weapon_cycle   ? "weapons"
+      : objective_event && quick_state
+          ? "quickobjective"
+      : objective_event
+          ? "objective"
       : combat       ? "combat"
       : forward      ? "forward"
       : crouch       ? "crouch"
       : quick_state  ? "quickstate"
-      : objective_event ? "objective"
-                        : "neutral";
+                      : "neutral";
   std::cout << "SF2 product runtime completed: frames=" << frames
             << " input=" << input_mode
             << (objective_event
