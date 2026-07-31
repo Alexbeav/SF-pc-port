@@ -23,6 +23,8 @@ pre-release tags rather than a stable semantic-versioning promise.
   request rewrite and its misleading probe were retired.
 - Enabled the USA Disc 2 executable and corrected its resident movie catalog
   bridge to use `MOVIE2.HOG`.
+- Routed every SF2 scene-test mission, including Disc 2, through the retail
+  guest runtime instead of falling back to the archived native reconstruction.
 - Recovered Disc 2's campaign-to-archive permutation and kept mission loading
   on the retail TITLE handoff. All thirteen Disc 2 packages now reach live
   gameplay and pass 3,000-update combat/input stress routes in the headless

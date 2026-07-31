@@ -14256,8 +14256,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
   if (!preloaded_gameplay) {
     preloaded_gameplay = std::make_unique<game::GameplaySession>(mission);
   }
-  if (mission.gameId() == game::GameId::syphon_filter_2 &&
-      mission.definition().index < 8U) {
+  if (mission.gameId() == game::GameId::syphon_filter_2) {
     return runSf2GuestScene(mission, pad, previous_buttons, cue_path, input_,
                             *preloaded_gameplay);
   }
