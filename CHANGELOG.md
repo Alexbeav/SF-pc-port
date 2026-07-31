@@ -26,8 +26,8 @@ pre-release tags rather than a stable semantic-versioning promise.
 - Recovered Disc 2's campaign-to-archive permutation and kept mission loading
   on the retail TITLE handoff. All thirteen Disc 2 packages now reach live
   gameplay and pass 3,000-update combat/input stress routes in the headless
-  product runtime; nine cross one or more retail restart cycles. DISCO and
-  LABS2 also pass focused F5/F9 gates.
+  product runtime; nine cross one or more retail restart cycles. All thirteen
+  also pass 3,000-update exact F5/F9 replay gates.
 - Contained stale sound variants at the 24-voice SPU hardware boundary.
   LABS2 no longer faults when a released variant's reused voice byte exceeds
   the physical voice bank, while valid retail voice updates remain untouched.
