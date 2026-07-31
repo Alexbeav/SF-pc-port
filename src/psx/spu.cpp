@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstring>
 #include <limits>
 
 namespace sf::psx {
@@ -206,8 +207,16 @@ Spu::Spu()
 }
 
 void Spu::reset() noexcept {
-  *state_ = {};
+  // Assigning `SpuState{}` makes MSVC materialize the roughly 594 KiB state
+  // as a temporary on the caller's stack. During the already-deep guest
+  // runtime construction path that can exhaust Windows' default 1 MiB stack
+  // before the first frame. SpuState is pointer-free guest state and its
+  // value-initialized representation is all-zero apart from these two
+  // authored defaults, so initialize the owned storage directly.
+  static_assert(std::is_trivially_copyable_v<SpuState>);
+  std::memset(state_.get(), 0, sizeof(SpuState));
   state_->noise_level = 1U;
+  state_->cd_input_matrix = {0x80U, 0U, 0U, 0x80U};
   clearPcm();
 }
 

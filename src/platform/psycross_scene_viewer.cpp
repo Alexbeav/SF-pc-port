@@ -8171,13 +8171,39 @@ void renderPresentedPlayer(const game::GameplaySession &gameplay,
   }
 }
 
+[[nodiscard]] constexpr std::int16_t signedGpuCoordinate(
+    std::uint32_t value) noexcept {
+  const auto coordinate = static_cast<std::uint16_t>(value & 0x07ffU);
+  return static_cast<std::int16_t>(
+      (coordinate & 0x0400U) != 0U ? coordinate | 0xf800U : coordinate);
+}
+
 [[nodiscard]] constexpr std::int16_t packedScreenX(std::uint32_t word) {
-  return static_cast<std::int16_t>(word & 0xffffU);
+  return signedGpuCoordinate(word);
 }
 
 [[nodiscard]] constexpr std::int16_t packedScreenY(std::uint32_t word) {
-  return static_cast<std::int16_t>(word >> 16U);
+  return signedGpuCoordinate(word >> 16U);
 }
+
+// PS1 drawing coordinates are signed 11-bit values even though GP0 stores
+// each component in a 16-bit field. Retail uses 0x400 as an off-screen
+// sentinel in the radar OT; interpreting it as a signed 16-bit +1024 creates
+// a giant triangle across the scene instead of clipping it at -1024.
+static_assert(signedGpuCoordinate(0x000U) == 0);
+static_assert(signedGpuCoordinate(0x3ffU) == 1023);
+static_assert(signedGpuCoordinate(0x400U) == -1024);
+static_assert(signedGpuCoordinate(0x7ffU) == -1);
+static_assert(packedScreenX(0x04000400U) == -1024);
+static_assert(packedScreenY(0x04000400U) == -1024);
+
+[[nodiscard]] constexpr bool isDisabledGpuVertex(std::uint32_t word) noexcept {
+  return (word & 0x07ffU) == 0x0400U &&
+         ((word >> 16U) & 0x07ffU) == 0x0400U;
+}
+
+static_assert(isDisabledGpuVertex(0x04000400U));
+static_assert(!isDisabledGpuVertex(0x003eff56U));
 
 [[nodiscard]] constexpr double
 reprojectGuestCoordinate(double guest_coordinate, double draw_offset,
@@ -13265,7 +13291,21 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
     const auto y = [&words](std::size_t index) {
       return static_cast<float>(packedScreenY(words[index]));
     };
+    // SF2 disables preallocated polygons and lines by placing a vertex at
+    // (-1024,-1024). The PS1 rejects the resulting oversized primitive;
+    // PsyCross clips and rasterizes it instead, producing a screen-wide radar
+    // wedge. Preserve the retail rejection before handing it to PsyCross.
+    const auto has_disabled_vertex = [&words](
+                                         std::initializer_list<std::size_t>
+                                             coordinate_indices) {
+      return std::ranges::any_of(coordinate_indices, [&words](auto index) {
+        return isDisabledGpuVertex(words[index]);
+      });
+    };
     if (base_opcode == 0x3cU && words.size() == 12U) {
+      if (has_disabled_vertex({1U, 4U, 7U, 10U})) {
+        return;
+      }
       POLY_GT4 primitive{};
       setPolyGT4(&primitive);
       primitive.code = opcode;
@@ -13294,6 +13334,9 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x38U && words.size() == 8U) {
+      if (has_disabled_vertex({1U, 3U, 5U, 7U})) {
+        return;
+      }
       POLY_G4 primitive{};
       setPolyG4(&primitive);
       primitive.code = opcode;
@@ -13307,6 +13350,9 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x34U && words.size() == 9U) {
+      if (has_disabled_vertex({1U, 4U, 7U})) {
+        return;
+      }
       POLY_GT3 primitive{};
       setPolyGT3(&primitive);
       primitive.code = opcode;
@@ -13331,6 +13377,9 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x30U && words.size() == 6U) {
+      if (has_disabled_vertex({1U, 3U, 5U})) {
+        return;
+      }
       POLY_G3 primitive{};
       setPolyG3(&primitive);
       primitive.code = opcode;
@@ -13342,6 +13391,9 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x2cU && words.size() == 9U) {
+      if (has_disabled_vertex({1U, 3U, 5U, 7U})) {
+        return;
+      }
       POLY_FT4 primitive{};
       setPolyFT4(&primitive);
       primitive.code = opcode;
@@ -13367,16 +13419,52 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x28U && words.size() == 5U) {
+      if (has_disabled_vertex({1U, 2U, 3U, 4U})) {
+        return;
+      }
+      const auto minimum_x = std::min({packedScreenX(words[1U]),
+                                       packedScreenX(words[2U]),
+                                       packedScreenX(words[3U]),
+                                       packedScreenX(words[4U])});
+      const auto maximum_x = std::max({packedScreenX(words[1U]),
+                                       packedScreenX(words[2U]),
+                                       packedScreenX(words[3U]),
+                                       packedScreenX(words[4U])});
+      const auto minimum_y = std::min({packedScreenY(words[1U]),
+                                       packedScreenY(words[2U]),
+                                       packedScreenY(words[3U]),
+                                       packedScreenY(words[4U])});
+      const auto maximum_y = std::max({packedScreenY(words[1U]),
+                                       packedScreenY(words[2U]),
+                                       packedScreenY(words[3U]),
+                                       packedScreenY(words[4U])});
+      const auto full_width_black_overlay =
+          (words[0U] & 0x00ffffffU) == 0U &&
+          minimum_x == -screen_width / 2 &&
+          maximum_x == screen_width / 2 &&
+          (minimum_y == -screen_height / 2 ||
+           maximum_y == screen_height / 2);
+      auto horizontal_scale = 1.0F;
+      if (full_width_black_overlay) {
+        const auto presentation_scale = PsyX_CalculatePresentationScale(
+            g_windowWidth, g_windowHeight, g_cfg_aspectMode);
+        horizontal_scale = std::max(presentation_scale.x, 0.01F);
+      }
       POLY_F4 primitive{};
       setPolyF4(&primitive);
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
-      setXY4(&primitive, x(1U), y(1U), x(2U), y(2U), x(3U), y(3U),
-             x(4U), y(4U));
+      setXY4(&primitive, x(1U) / horizontal_scale, y(1U),
+             x(2U) / horizontal_scale, y(2U),
+             x(3U) / horizontal_scale, y(3U),
+             x(4U) / horizontal_scale, y(4U));
       DrawPrim(&primitive);
       return;
     }
     if (base_opcode == 0x24U && words.size() == 7U) {
+      if (has_disabled_vertex({1U, 3U, 5U})) {
+        return;
+      }
       POLY_FT3 primitive{};
       setPolyFT3(&primitive);
       primitive.code = opcode;
@@ -13399,6 +13487,9 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x20U && words.size() == 4U) {
+      if (has_disabled_vertex({1U, 2U, 3U})) {
+        return;
+      }
       POLY_F3 primitive{};
       setPolyF3(&primitive);
       primitive.code = opcode;
@@ -13408,6 +13499,9 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x40U && words.size() == 3U) {
+      if (has_disabled_vertex({1U, 2U})) {
+        return;
+      }
       LINE_F2 primitive{};
       setLineF2(&primitive);
       primitive.code = opcode;
@@ -14036,10 +14130,13 @@ SceneViewerResult runSf2GuestScene(
       diagnostic_frame("SF2_PIN_HEALTH").value_or(0U) != 0U;
   const auto trace_presentation =
       diagnostic_frame("SF2_TRACE_PRESENTATION").value_or(0U) != 0U;
-  const auto disable_native_hud =
-      diagnostic_frame("SF2_DISABLE_NATIVE_HUD").value_or(0U) != 0U;
   const auto disable_retail_auxiliary_ui =
       diagnostic_frame("SF2_DISABLE_RETAIL_AUX_UI").value_or(0U) != 0U;
+  const auto force_native_hud =
+      diagnostic_frame("SF2_ENABLE_NATIVE_HUD").value_or(0U) != 0U;
+  const auto disable_native_hud =
+      diagnostic_frame("SF2_DISABLE_NATIVE_HUD").value_or(0U) != 0U ||
+      (!disable_retail_auxiliary_ui && !force_native_hud);
   runtime.setRetailAuxiliaryUiEnabled(!disable_retail_auxiliary_ui);
   auto traced_presentation_sequence = std::uint64_t{};
   auto traced_gpu_submissions = std::uint64_t{};
@@ -14297,6 +14394,11 @@ SceneViewerResult runSf2GuestScene(
       return SceneViewerResult{buttons, SceneExitReason::return_to_title};
     }
     pause_was_down = pause_down;
+    const auto retail_menu_key =
+        static_cast<std::size_t>(KeyboardMouseInput::p);
+    const auto retail_menu_down =
+        retail_menu_key < keyboard_state.size() &&
+        keyboard_state[retail_menu_key] != 0U;
 
     int mouse_x{};
     int mouse_y{};
@@ -14484,6 +14586,13 @@ SceneViewerResult runSf2GuestScene(
       }
     }
     auto host_pad = game::legacyPadStateFromPlayerInput(guest_input);
+    if (retail_menu_down) {
+      // Escape remains the host scene-exit action. P is otherwise unused and
+      // maps directly to the retail Start bit so SF2's own pause/menu flow can
+      // be brought up independently of the host lifecycle control.
+      host_pad.buttons =
+          static_cast<std::uint16_t>(host_pad.buttons | 0x0008U);
+    }
     if (weapon_select_down) {
       // SF2's default controller layout assigns Change Weapon to Select.
       // Hold the synthesized edge until the guest's 20 Hz PAD sampler sees
