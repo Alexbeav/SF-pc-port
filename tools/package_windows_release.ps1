@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.3",
+    [string]$Version = "0.1.0-sf2-guest-alpha.4",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -142,12 +142,16 @@ CURRENT SCOPE
 =============
 
 - All 21 mission packages boot into their authored in-engine openings through
-  direct mission launch. Mission 3 is verified finishable through its save
-  menu and following cinematic; campaign flow is not implemented.
+  direct mission launch. Missions 3 and 7 are verified finishable; campaign
+  flow is not implemented.
 - Controls, combat, doors, climbing, weapons, dialogue, sound effects, death,
   checkpoint restart and in-session F5/F9 quick states are functional.
 - The retail HUD, text, weapon artwork, radar actors/threat cones and
   widescreen in-engine cinematic bars render through the guest GPU bridge.
+- Cross-mission startup no longer retains the stale full-screen map grid, and
+  PS1-sized polygon rejection removes the angle-dependent vertex explosions
+  previously most visible in Mission 7.
+- SF2 scoped weapons no longer abort when SF1's SCOPED.TIM is absent.
 - Music and full completion of missions other than Mission 3 are not
   validated.
 - A later scripted conversation can pause unevenly or fail to release player
