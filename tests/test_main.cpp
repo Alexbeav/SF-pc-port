@@ -3045,6 +3045,17 @@ void testRawSectorFile() {
                 data_sector,
                 [](std::byte value) { return value == std::byte{0x5a}; }),
         "Relative extent did not switch to the newly mounted archive");
+    media.clearRelativeExtent();
+    require(
+        media.readDataSector(19U, data_sector) &&
+            std::ranges::all_of(
+                data_sector,
+                [](std::byte value) { return value == std::byte{0xa5}; }) &&
+            media.readDataSector(20U, data_sector) &&
+            std::ranges::all_of(
+                data_sector,
+                [](std::byte value) { return value == std::byte{0x5a}; }),
+        "Clearing a relative extent did not restore absolute-disc reads");
     media.mapRelativeExtent(19U, 2U);
     require(
         media.readDataSector(0U, data_sector) &&

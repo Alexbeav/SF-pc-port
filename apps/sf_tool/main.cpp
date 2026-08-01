@@ -6632,7 +6632,11 @@ int probeSf2GuestBootstrap(const char *cue_path, std::uint64_t budget,
 
 int probeSf2ApcDialogue(const char *cue_path, std::uint32_t settle_frames) {
   constexpr std::uint32_t mission_index = 2U;
-  constexpr std::uint32_t timeout = 360U;
+  constexpr std::uint32_t start_timeout = 360U;
+  constexpr std::uint32_t completion_timeout = 6'000U;
+  auto disc = openDisc(cue_path);
+  const auto xa_extent = disc.image().find(
+      std::string{disc.game()->layout.streaming_audio_path});
   sf::game::Sf2GuestMissionRuntime runtime{
       std::filesystem::path{cue_path}, mission_index};
   if (!runtime.ready()) {
@@ -6665,7 +6669,7 @@ int probeSf2ApcDialogue(const char *cue_path, std::uint32_t settle_frames) {
   }
   auto cue6 = runtime.diagnostics();
   for (auto frame = 0U;
-       frame < timeout &&
+       frame < start_timeout &&
        (cue6.scene_speech_starts == baseline.scene_speech_starts ||
         cue6.xa_stream_starts == baseline.xa_stream_starts ||
         cue6.xa_file != 1U || cue6.xa_channel != 6U);
@@ -6675,24 +6679,29 @@ int probeSf2ApcDialogue(const char *cue_path, std::uint32_t settle_frames) {
     }
     cue6 = runtime.diagnostics();
   }
+  const auto cue6_absolute_start = std::ranges::any_of(
+      cue6.timeline_events,
+      [&](const sf::game::Sf2GuestTimelineEvent &event) {
+        return event.kind ==
+                   sf::game::Sf2GuestTimelineEventKind::xa_stream_start &&
+               event.arguments[1U] == xa_extent.extent_lba &&
+               event.arguments[2U] == 6U;
+      });
   if (cue6.scene_speech_starts != baseline.scene_speech_starts + 1U ||
       cue6.last_scene_speech_arguments[0U] != 6U ||
       cue6.xa_stream_starts <= baseline.xa_stream_starts ||
-      !cue6.xa_relative_extent_active || cue6.xa_file != 1U ||
+      !cue6_absolute_start || !cue6.xa_absolute_disc_active ||
+      cue6.xa_file != 1U ||
       cue6.xa_channel != 6U) {
     std::cerr << "SF2 APC dialogue did not enter cue 6\n";
     return 10;
   }
-  if (!runtime.stopSceneSpeechForProbe()) {
-    std::cerr << "SF2 APC dialogue could not stop cue 6\n";
-    return 10;
-  }
   auto stopped = runtime.diagnostics();
   for (auto frame = 0U;
-       frame < timeout &&
+       frame < completion_timeout &&
        (stopped.scene_speech_stops <= cue6.scene_speech_stops ||
-        stopped.xa_stream_stops <= cue6.xa_stream_stops ||
-        stopped.xa_relative_extent_active);
+         stopped.xa_stream_stops <= cue6.xa_stream_stops ||
+         stopped.xa_absolute_disc_active);
        ++frame) {
     if (!advance(1U)) {
       return 7;
@@ -6701,42 +6710,12 @@ int probeSf2ApcDialogue(const char *cue_path, std::uint32_t settle_frames) {
   }
   if (stopped.scene_speech_stops <= cue6.scene_speech_stops ||
       stopped.xa_stream_stops <= cue6.xa_stream_stops ||
-      stopped.xa_relative_extent_active || stopped.xa_stream_set != 0U) {
-    std::cerr << "SF2 APC dialogue did not stop cue 6\n";
-    return 10;
-  }
-  if (!runtime.startSceneSpeechForProbe(89U)) {
-    std::cerr << "SF2 APC dialogue could not start cue 89\n";
-    return 10;
-  }
-  auto boundary = runtime.diagnostics();
-  auto cue89_filter_seen =
-      boundary.xa_stream_set != 0U && boundary.xa_file == 1U &&
-      boundary.xa_channel == 14U;
-  for (auto frame = 0U;
-       frame < timeout &&
-       (boundary.xa_stream_starts <= stopped.xa_stream_starts ||
-        boundary.xa_relative_extent_active || boundary.xa_stream_set != 0U);
-       ++frame) {
-    if (!advance(1U)) {
-      return 7;
-    }
-    boundary = runtime.diagnostics();
-    cue89_filter_seen =
-        cue89_filter_seen ||
-        (boundary.xa_stream_set != 0U && boundary.xa_file == 1U &&
-         boundary.xa_channel == 14U);
-  }
-  if (boundary.scene_speech_starts != stopped.scene_speech_starts + 1U ||
-      boundary.last_scene_speech_arguments[0U] != 89U ||
-      boundary.xa_stream_starts <= stopped.xa_stream_starts ||
-      !cue89_filter_seen || boundary.xa_relative_extent_active ||
-      boundary.xa_stream_set != 0U) {
-    std::cerr << "SF2 APC dialogue cue-89 EOF did not restore the FOG\n";
+      stopped.xa_absolute_disc_active || stopped.xa_stream_set != 0U) {
+    std::cerr << "SF2 APC dialogue did not naturally complete cue 6\n";
     return 10;
   }
   std::cout << "SF2 APC dialogue action lifecycle passed: cue=6 filter=1/6 "
-               "cue=89 filter=1/14 mount=0\n";
+               "completed naturally and restored the FOG\n";
   return 0;
 }
 
@@ -7320,7 +7299,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       std::cerr << "SF2 product runtime stopped at frame " << frame
                 << ": xa=" << stopped.xa_stream_starts << "/"
                 << stopped.xa_stream_stops << "/mount:"
-                << (stopped.xa_relative_extent_active ? 1U : 0U) << " cd="
+                << (stopped.xa_absolute_disc_active ? 1U : 0U) << " cd="
                 << stopped.cd_lba << "/" << stopped.cd_reading
                 << " fault=" << runtime.faultDetail() << '\n';
       return 7;
@@ -8127,6 +8106,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   std::cout
             << " checkpoint-restores="
             << diagnostics.checkpoint_restores
+            << "/audio-discarded="
+            << diagnostics.checkpoint_audio_discarded_frames
             << " first-restore-frame=" << first_restore_frame
             << " min-health=" << minimum_player_health
             << " first-sprite-frame=" << first_sprite_frame
@@ -8323,7 +8304,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.xa_cue_plays << "/"
             << diagnostics.xa_stream_starts << "/"
             << diagnostics.xa_stream_stops << "/mount:"
-            << (diagnostics.xa_relative_extent_active ? 1U : 0U)
+            << (diagnostics.xa_absolute_disc_active ? 1U : 0U)
             << " completion-flow=" << diagnostics.campaign_advance_calls
             << "/" << diagnostics.movie_request_calls << "/"
             << diagnostics.movie_playback_init_calls << "/title="
@@ -8465,13 +8446,16 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   const auto restore_stability_missing =
       first_restore_frame != 0U &&
       frames - first_restore_frame < 300U;
+  const auto restore_audio_boundary_missing =
+      first_restore_frame != 0U &&
+      diagnostics.checkpoint_audio_discarded_frames == 0U;
   if (frames >= 800U && !retail_completion_flow &&
       (nonzero_pcm_frames == 0U || peak_pcm_sample == 0U ||
        maximum_active_spu_voices == 0U ||
        diagnostics.spu_key_on_writes <= 2U ||
        diagnostics.player_instance == 0U ||
        runtime.inputSampleCount() == 0U ||
-       restore_stability_missing)) {
+       restore_stability_missing || restore_audio_boundary_missing)) {
     std::cerr << "SF2 playable-alpha gate failed: PCM, SPU voices, player, "
                  "PAD cadence, or post-checkpoint stability is missing\n";
     return 8;

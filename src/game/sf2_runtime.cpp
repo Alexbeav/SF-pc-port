@@ -1158,6 +1158,18 @@ public:
   }
   [[nodiscard]] std::size_t
   takePcm(std::span<psx::SpuPcmFrame> destination) noexcept {
+    // Retail checkpoint restore suspends its sound-service callback while the
+    // synchronous mission loader owns the guest. The SPU hardware clock still
+    // advances during that interval, so exporting its loader-era mixture would
+    // refill the freshly reset host sink with seconds of stale PCM. Treat the
+    // restore as a stream-generation boundary and expose only PCM produced
+    // after retail has returned to stable app-state-0 submissions.
+    if (retail_restore_active_) {
+      checkpoint_audio_discarded_frames_ +=
+          vm_.audioDiagnostics().spu_pcm_frames;
+      vm_.clearPcm();
+      return 0U;
+    }
     return vm_.takePcm(destination);
   }
   void clearPcm() noexcept { vm_.clearPcm(); }
@@ -1198,7 +1210,7 @@ public:
       state.checkpoint_captured = checkpoint_captured_;
       state.retail_restore_active = retail_restore_active_;
       state.retail_restore_start_frame = retail_restore_start_frame_;
-      state.xa_relative_extent_active = xa_relative_extent_active_;
+      state.xa_absolute_disc_active = xa_absolute_disc_active_;
       state.mission_success_pending = mission_success_pending_;
       state.mission_complete_requested = mission_complete_requested_;
       state.mission_success_events = mission_success_events_;
@@ -1278,7 +1290,7 @@ public:
       retail_restore_active_ = quick_state_->retail_restore_active;
       retail_restore_start_frame_ =
           quick_state_->retail_restore_start_frame;
-      setXaRelativeExtentActive(quick_state_->xa_relative_extent_active);
+      setXaAbsoluteDiscActive(quick_state_->xa_absolute_disc_active);
       mission_success_pending_ = quick_state_->mission_success_pending;
       mission_complete_requested_ =
           quick_state_->mission_complete_requested;
@@ -1912,7 +1924,7 @@ public:
     result.xa_cue_plays = xa_cue_plays_;
     result.xa_stream_starts = xa_stream_starts_;
     result.xa_stream_stops = xa_stream_stops_;
-    result.xa_relative_extent_active = xa_relative_extent_active_;
+    result.xa_absolute_disc_active = xa_absolute_disc_active_;
     result.timeline_event_count = timeline_event_count_;
     result.timeline_events = timeline_events_;
     result.ui_text_event_count = ui_text_event_count_;
@@ -1922,6 +1934,8 @@ public:
     result.last_async_completion_caller = last_async_completion_caller_;
     result.input_samples = host_pad_samples_;
     result.checkpoint_restores = alpha_checkpoint_restores_;
+    result.checkpoint_audio_discarded_frames =
+        checkpoint_audio_discarded_frames_;
     result.mission_success_events = mission_success_events_;
     result.mission_failure_events = mission_failure_events_;
     result.mission_complete_requested = mission_complete_requested_;
@@ -3430,7 +3444,7 @@ private:
     bool checkpoint_captured{};
     bool retail_restore_active{};
     std::uint64_t retail_restore_start_frame{};
-    bool xa_relative_extent_active{};
+    bool xa_absolute_disc_active{};
     bool mission_success_pending{};
     bool mission_complete_requested{};
     std::uint64_t mission_success_events{};
@@ -3478,12 +3492,16 @@ private:
     }
   }
 
-  void setXaRelativeExtentActive(bool active) noexcept {
-    xa_relative_extent_active_ = active;
+  void setXaAbsoluteDiscActive(bool active) noexcept {
+    xa_absolute_disc_active_ = active;
     xa_stream_observed_active_ = false;
     if (active) {
-      cdrom_media_.mapRelativeExtent(xa_relative_extent_base_,
-                                     xa_relative_extent_sector_count_);
+      // The XA archive handle stores the ISO file's absolute extent LBA at
+      // +0x84. XaCue_ResolveAndPlay passes that value (plus an authored group
+      // offset) directly to CdlSetloc. Disable the mission-relative FOG window
+      // while speech owns the drive; mapping onto SCENES*.XA here would add
+      // its base twice and begin every cue at the wrong dialogue group.
+      cdrom_media_.clearRelativeExtent();
       return;
     }
     cdrom_media_.mapRelativeExtent(mission_relative_extent_base_,
@@ -3503,13 +3521,6 @@ private:
         (static_cast<std::uint64_t>(mission_extent.size) +
          assets::FogArchive::sector_size - 1U) /
         assets::FogArchive::sector_size);
-    const auto xa_extent =
-        disc_.image().find(std::string{disc_.game()->layout.streaming_audio_path});
-    xa_relative_extent_base_ = xa_extent.extent_lba;
-    xa_relative_extent_sector_count_ = static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(xa_extent.size) +
-         disc::Iso9660Image::logical_sector_size - 1U) /
-        disc::Iso9660Image::logical_sector_size);
     const auto resident =
         parseEmbeddedHog(disc_.executable(), "BEEPSX.VB");
     for (const auto &entry : resident.entries()) {
@@ -3572,7 +3583,7 @@ private:
           // A checkpoint restore owns the mission file loader. If death or
           // failure interrupted speech, abandon the gameplay-XA mount before
           // retail starts issuing relative FOG reads.
-          setXaRelativeExtentActive(false);
+          setXaAbsoluteDiscActive(false);
           // The corrected CD/XA scheduler can now service the retail
           // checkpoint loader. Preserve this boundary as an observation hook
           // and execute the original restore instead of rewinding a host
@@ -4314,10 +4325,10 @@ private:
         });
     vm_.bindHostCall(
         0x800f957cU, [this](LegacyHostCallContext &context) {
-          // Retail passes a sector relative to SCENES1.XA/SCENES2.XA. The
-          // mission loader uses the same low-LBA CD namespace for its FOG, so
-          // switch the mounted extent at the authentic XA entry boundary.
-          setXaRelativeExtentActive(true);
+          // Retail passes an absolute ISO sector from the SCENES archive
+          // handle. Temporarily disable the mission-relative FOG namespace at
+          // the authentic XA entry boundary.
+          setXaAbsoluteDiscActive(true);
           ++xa_stream_starts_;
           recordTimelineEvent(
               Sf2GuestTimelineEventKind::xa_stream_start, context);
@@ -4329,7 +4340,7 @@ private:
           // XA lifecycle owns the CD path, so immediately restore the mission
           // extent; successful streams retain SCENES*.XA until XaStream_Stop.
           if (static_cast<std::int32_t>(context.registerValue(2U)) < 0) {
-            setXaRelativeExtentActive(false);
+            setXaAbsoluteDiscActive(false);
           }
           context.continueGuestInstruction();
         });
@@ -4344,7 +4355,7 @@ private:
         0x800f9a48U, [this](LegacyHostCallContext &context) {
           // This JR RA is the single return from XaStream_Stop, after its CD
           // disable and scheduler-reset calls have completed.
-          setXaRelativeExtentActive(false);
+          setXaAbsoluteDiscActive(false);
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -4783,7 +4794,7 @@ private:
         }
       }
     }
-    if (xa_relative_extent_active_) {
+    if (xa_absolute_disc_active_) {
       const auto audio = vm_.audioDiagnostics();
       if (audio.xa_stream_set != 0U) {
         xa_stream_observed_active_ = true;
@@ -4791,7 +4802,7 @@ private:
         // One-sector EOF markers can retire without calling XaStream_Stop.
         // Restore relative reads to the mission FOG after any observed XA
         // stream naturally clears, matching the explicit stop return hook.
-        setXaRelativeExtentActive(false);
+        setXaAbsoluteDiscActive(false);
       }
     }
     return true;
@@ -4989,7 +5000,7 @@ private:
         !vm_.runtime().write32(0x8011f61cU, 0U)) {
       return false;
     }
-    setXaRelativeExtentActive(false);
+    setXaAbsoluteDiscActive(false);
     setStage("mission archive handoff");
     const auto mission =
         invokeNested(0x80153d30U, std::span<const std::uint32_t>{});
@@ -5373,9 +5384,7 @@ private:
   DiscCdRomMedia cdrom_media_;
   std::uint32_t mission_relative_extent_base_{};
   std::uint32_t mission_relative_extent_sector_count_{};
-  std::uint32_t xa_relative_extent_base_{};
-  std::uint32_t xa_relative_extent_sector_count_{};
-  bool xa_relative_extent_active_{};
+  bool xa_absolute_disc_active_{};
   bool xa_stream_observed_active_{};
   std::uint32_t mission_index_{};
   std::uint16_t runtime_selection_{};
@@ -5583,6 +5592,7 @@ private:
   bool retail_restore_active_{};
   std::uint64_t retail_restore_start_frame_{};
   std::uint64_t alpha_checkpoint_restores_{};
+  std::uint64_t checkpoint_audio_discarded_frames_{};
   bool mission_success_pending_{};
   bool mission_complete_requested_{};
   std::uint64_t mission_success_events_{};

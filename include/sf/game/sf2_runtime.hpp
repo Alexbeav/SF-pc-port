@@ -443,7 +443,7 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t xa_cue_plays{};
   std::uint64_t xa_stream_starts{};
   std::uint64_t xa_stream_stops{};
-  bool xa_relative_extent_active{};
+  bool xa_absolute_disc_active{};
   std::uint64_t timeline_event_count{};
   std::array<Sf2GuestTimelineEvent, 128U> timeline_events{};
   std::uint64_t ui_text_event_count{};
@@ -453,6 +453,7 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_async_completion_caller{};
   std::uint64_t input_samples{};
   std::uint64_t checkpoint_restores{};
+  std::uint64_t checkpoint_audio_discarded_frames{};
   std::uint64_t mission_success_events{};
   std::uint64_t mission_failure_events{};
   bool mission_complete_requested{};

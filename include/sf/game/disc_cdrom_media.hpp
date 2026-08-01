@@ -19,6 +19,10 @@ public:
     relative_extent_base_ = base_lba;
     relative_extent_sector_count_ = sector_count;
   }
+  void clearRelativeExtent() noexcept {
+    relative_extent_base_ = 0U;
+    relative_extent_sector_count_ = 0U;
+  }
 
   [[nodiscard]] std::uint32_t sectorCount() const noexcept override {
     return image_.sectorCount();

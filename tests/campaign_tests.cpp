@@ -253,6 +253,25 @@ void testRetailSavePromptAndTransientCampaign() {
           "Accepted mission save did not finalize after EOL");
 }
 
+void testSf2TrainChapterConnectedMovieOrder() {
+  const auto &catalog =
+      sf::game::missionCatalog(sf::game::GameId::syphon_filter_2);
+  const auto mission_count = static_cast<std::uint32_t>(catalog.size());
+  require(mission_count == 21U && catalog[5].ending_movie_path == "7_2.STR",
+          "SF2 Mission 6 lost its authored ending movie");
+
+  auto campaign =
+      sf::game::CampaignProgress::startUnsaved(5U, true, mission_count);
+  require(campaign &&
+              campaign->completeMissionWithoutSaving() ==
+                  sf::game::CampaignAdvance::next_mission &&
+              campaign->missionIndex() == 6U &&
+              campaign->openingMovieRequired(catalog[6]) &&
+              catalog[6].opening_movie_path == "8_1.STR" &&
+              catalog[6].ending_movie_path == "8_2.STR",
+          "SF2 Mission 6->7 did not preserve 7_2 -> 8_1 -> 8_2 order");
+}
+
 void testLoadAndFailurePaths() {
   sf::game::TitleSaveSlots slots{};
   slots[2] = sf::game::TitleSaveSlot{true, 0U, false};
@@ -623,6 +642,7 @@ int main() {
   testConnectedRetailCampaign();
   testAllRetailTransitionAssets();
   testRetailSavePromptAndTransientCampaign();
+  testSf2TrainChapterConnectedMovieOrder();
   testLoadAndFailurePaths();
   testLoadedProgressSurvivesMissionReplay();
   testSaveMigrationAndCompletedSlotUi();

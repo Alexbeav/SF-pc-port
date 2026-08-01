@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.5",
+    [string]$Version = "0.1.0-sf2-guest-alpha.6",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -149,14 +149,16 @@ not expose this experimental SF2 path. Do not select an SF2 image there.
 CURRENT SCOPE
 =============
 
-IMPORTANT AUDIO / CUTSCENE WARNING
-==================================
+AUDIO / CUTSCENE STATUS
+=======================
 
-- Mission 3 dialogue is not correctly sequenced. Voice lines can trigger at
-  the wrong locations and unrelated dialogue may play. Continue testing, but
-  do not use this build as a dialogue-fidelity reference.
-- Mission 1's in-engine parachute opening currently plays for only about one
-  second before skipping and can also play an incorrect voice line.
+- Mission 1's complete parachute opening, correct speech and gameplay handoff
+  pass interactively.
+- Mission 3's dialogue now selects the correct absolute XA sectors, ends
+  naturally and hands control back at the authored points. Death/checkpoint
+  reload also resumes with synchronized effects.
+- Mission 7 has been completed interactively with continuous music and
+  synchronized effects; its full host-audio diagnostic run remains healthy.
 
 - All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
@@ -178,13 +180,7 @@ IMPORTANT AUDIO / CUTSCENE WARNING
   deterministic probes; AIRBASE's natural Mission 2 handoff has also passed
   interactive playtesting, while AIRBASEX still needs equivalent coverage.
 - SF2 scoped weapons no longer abort when SF1's SCOPED.TIM is absent.
-- Mission 7 music cuts out shortly after gameplay begins. Occasional gameplay
-  audio timing/popping and the remaining AIRBASEX movie transition need
-  broader interactive coverage.
-- Mission 1's in-engine parachute opening is prematurely skipped. Other tested
-  mission openings play normally.
-- Mission 3 dialogue timing and selection remain under active investigation;
-  skip a stalled conversation with C when possible.
+- The remaining AIRBASEX movie transition needs broader interactive coverage.
 - Quick states are in-session only and do not persist after process exit.
 
 Controls use the existing PC bindings. Mouse aiming works in first person;
@@ -240,9 +236,9 @@ can be launched directly, the complete deterministic validation matrix passes,
 and connected campaign/save/movie handoffs are implemented. This remains a
 playtesting build rather than a finished PC port.
 
-Known warning: Mission 3 dialogue can trigger at incorrect locations and play
-unrelated voice lines. Mission 1's in-engine opening still skips early and can
-play an incorrect voice line. These are acknowledged Alpha 6 defects.
+Mission 1's opening, Mission 3 dialogue, post-checkpoint audio and Mission 7
+music now pass interactive checks. AIRBASEX's natural scripted movie
+transition remains the explicit playtest target.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.
