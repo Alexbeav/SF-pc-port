@@ -60,8 +60,9 @@ public:
 private:
   // 128 stereo frames are 2.9 ms at the native SPU rate. The callback sink
   // consumes a lock-free jitter ring, while the producer keeps any temporarily
-  // unwritten frames in FIFO staging. No generated SPU frame is replaced by a
-  // newer frame merely because the renderer or audio device stalled.
+  // unwritten frames in FIFO staging. Initial playback uses a small prebuffer;
+  // a live starvation resumes immediately so silence cannot become permanent
+  // A/V latency, with a short ramp masking each discontinuity.
   static constexpr std::size_t frames_per_buffer = 128U;
   static constexpr std::size_t maximum_queued_buffers = 24U;
   static constexpr std::size_t maximum_stream_frames =

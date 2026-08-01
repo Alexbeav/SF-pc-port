@@ -57,6 +57,8 @@ public:
     [[nodiscard]] DirectoryEntry find(const std::string& path);
     [[nodiscard]] std::vector<std::byte> readFile(const std::string& path);
     [[nodiscard]] RawSectorFile readRawSectorFile(const std::string& path);
+    [[nodiscard]] RawSectorFile readRawSectorRange(
+        std::uint32_t lba, std::uint32_t sector_count);
 
 private:
     Iso9660Image(DataTrack track, std::ifstream stream);

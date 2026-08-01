@@ -13040,10 +13040,11 @@ bool drawPauseMenu(const game::PauseMenu &menu,
 
 struct PsyCrossCampaignSaveRenderer::State {
   State(const game::MissionPackage &mission, KeyboardMouseBindings input)
-      : textures{mission}, input{input} {}
+      : textures{mission}, input{input}, game_id{mission.gameId()} {}
 
   HudTextureAtlas textures;
   KeyboardMouseBindings input;
+  game::GameId game_id{game::GameId::syphon_filter};
   std::uint64_t animation_tick{};
 };
 
@@ -13067,6 +13068,7 @@ void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
   constexpr auto normal = PauseRgb{150U, 160U, 230U};
   constexpr auto selected = PauseRgb{160U, 220U, 255U};
   constexpr auto muted = PauseRgb{85U, 95U, 160U};
+  const auto mission_catalog = game::missionCatalog(state_->game_id);
   const auto text = [&](std::string_view value, game::PauseRect bounds,
                         PauseRgb color = PauseRgb{150U, 160U, 230U},
                         game::PauseTextAlignment alignment =
@@ -13098,8 +13100,10 @@ void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
         label += "Empty";
       } else if (slots[index].campaign_complete) {
         label += "Complete";
-      } else if (slots[index].mission_index < game::missionCatalog().size()) {
-        label += game::missionCatalog()[slots[index].mission_index].title;
+      } else if (slots[index].mission_index < mission_catalog.size()) {
+        label += mission_catalog[slots[index].mission_index].title;
+      } else {
+        label += "Invalid";
       }
       const auto active = menu.slotSelection() == index;
       drawBorderedRect(
@@ -13132,6 +13136,7 @@ void PsyCrossCampaignSaveRenderer::drawLoadSlots(
   constexpr auto normal = PauseRgb{150U, 160U, 230U};
   constexpr auto selected = PauseRgb{160U, 220U, 255U};
   constexpr auto muted = PauseRgb{70U, 78U, 130U};
+  const auto mission_catalog = game::missionCatalog(state_->game_id);
   const auto text = [&](std::string_view value, game::PauseRect bounds,
                         PauseRgb color = PauseRgb{150U, 160U, 230U},
                         game::PauseTextAlignment alignment =
@@ -13147,13 +13152,13 @@ void PsyCrossCampaignSaveRenderer::drawLoadSlots(
     std::string label = "Slot " + std::to_string(index + 1U) + "  ";
     const auto enabled =
         slots[index].occupied && !slots[index].campaign_complete &&
-        slots[index].mission_index < game::missionCatalog().size();
+        slots[index].mission_index < mission_catalog.size();
     if (!slots[index].occupied) {
       label += "Empty";
     } else if (slots[index].campaign_complete) {
       label += "Campaign Complete";
     } else if (enabled) {
-      label += game::missionCatalog()[slots[index].mission_index].title;
+      label += mission_catalog[slots[index].mission_index].title;
     } else {
       label += "Invalid";
     }
@@ -13960,7 +13965,8 @@ SceneViewerResult runSf2GuestScene(
     const game::MissionPackage &mission, PADRAW &pad,
     std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
     const KeyboardMouseBindings &input,
-    game::GameplaySession &native_residency) {
+    game::GameplaySession &native_residency,
+    const std::optional<game::CampaignCarryState> &campaign_carry) {
   struct NativeFramebufferPageReset {
     ~NativeFramebufferPageReset() { GR_SetNativeFramebufferPage(0); }
   } native_framebuffer_page_reset;
@@ -13969,6 +13975,11 @@ SceneViewerResult runSf2GuestScene(
     const auto detail = runtime.faultDetail();
     PsyX_Log_Error("SF2 guest runtime bootstrap failed: %.*s\n",
                    static_cast<int>(detail.size()), detail.data());
+    return SceneViewerResult{previous_buttons,
+                             SceneExitReason::return_to_title};
+  }
+  if (campaign_carry && !runtime.applyCampaignCarryState(*campaign_carry)) {
+    PsyX_Log_Error("SF2 campaign carry could not be applied to retail RAM\n");
     return SceneViewerResult{previous_buttons,
                              SceneExitReason::return_to_title};
   }
@@ -13987,6 +13998,7 @@ SceneViewerResult runSf2GuestScene(
   // mission play. Keep roughly two presentation intervals of headroom while
   // retaining the bounded half-second callback ring.
   PsyCrossAudioOutput audio{12U, "sf2-gameplay"};
+  PsyCrossMoviePlayer movie_player;
   RelativeMouseCapture mouse_capture;
   mouse_capture.set(true);
   // One runtime update is one complete retail display submission. SF2 owns
@@ -14142,6 +14154,12 @@ SceneViewerResult runSf2GuestScene(
       diagnostic_frame("SF2_QUICK_SAVE_FRAME");
   const auto automatic_quick_load_frame =
       diagnostic_frame("SF2_QUICK_LOAD_FRAME");
+  const auto automatic_retail_menu_open_frame =
+      diagnostic_frame("SF2_RETAIL_MENU_OPEN_FRAME");
+  const auto automatic_retail_menu_close_frame =
+      diagnostic_frame("SF2_RETAIL_MENU_CLOSE_FRAME");
+  std::optional<std::uint64_t> automatic_retail_menu_open_sample;
+  std::optional<std::uint64_t> automatic_retail_menu_close_sample;
   const auto automatic_exit_frame =
       diagnostic_frame("SF2_EXIT_FRAME");
   const auto automatic_exit_clock =
@@ -14235,14 +14253,20 @@ SceneViewerResult runSf2GuestScene(
 
   const auto disc_number =
       static_cast<std::uint8_t>(mission.definition().index < 8U ? 1U : 2U);
-  const auto archive_selection = game::missionArchiveSelection(
+  const auto runtime_selection = game::missionRuntimeSelection(
       mission.gameId(), disc_number,
       static_cast<std::uint16_t>(mission.definition().index));
+  const auto archive_selection =
+      runtime_selection
+          ? game::missionArchiveSelection(mission.gameId(), disc_number,
+                                          *runtime_selection)
+          : std::nullopt;
   PsyX_Log_Info(
       "SF2 guest alpha: campaign=%u title=\"%s\" resource=%s disc=%u "
-      "archive=%u retail TITLE->mission direct GP0/SPU handoff\n",
+      "runtime=%u archive=%u retail TITLE->mission direct GP0/SPU handoff\n",
       mission.definition().index + 1U, mission.definition().title.data(),
       mission.definition().resource_name.data(), disc_number,
+      runtime_selection.value_or(0xffffU),
       archive_selection.value_or(0xffffU));
   for (;;) {
     const auto counter = SDL_GetPerformanceCounter();
@@ -14428,14 +14452,39 @@ SceneViewerResult runSf2GuestScene(
     pause_was_down = pause_down;
     const auto retail_menu_key =
         static_cast<std::size_t>(KeyboardMouseInput::p);
-    const auto retail_menu_down =
+    const auto current_input_sample = runtime.inputSampleCount();
+    const auto arm_retail_menu_pulse =
+        [presented_frames, current_input_sample](
+            const std::optional<std::uint64_t> &trigger_frame,
+            std::optional<std::uint64_t> &trigger_sample) {
+          if (!trigger_sample && trigger_frame &&
+              presented_frames >= *trigger_frame) {
+            trigger_sample = current_input_sample;
+          }
+        };
+    arm_retail_menu_pulse(automatic_retail_menu_open_frame,
+                          automatic_retail_menu_open_sample);
+    arm_retail_menu_pulse(automatic_retail_menu_close_frame,
+                          automatic_retail_menu_close_sample);
+    const auto sampled_retail_menu_pulse =
+        [current_input_sample](
+            const std::optional<std::uint64_t> &trigger_sample) {
+          // Hold Start until three guest PAD samples have observed it. Product
+          // presentation can run several host frames between 20 Hz guest
+          // samples, so a render-frame-width pulse is not deterministic.
+          return trigger_sample &&
+                 current_input_sample < *trigger_sample + 3U;
+        };
+    const auto automatic_retail_menu_down =
+        sampled_retail_menu_pulse(automatic_retail_menu_open_sample) ||
+        sampled_retail_menu_pulse(automatic_retail_menu_close_sample);
+    const auto retail_menu_down = automatic_retail_menu_down ||
         retail_menu_key < keyboard_state.size() &&
         keyboard_state[retail_menu_key] != 0U;
 
     int mouse_x{};
     int mouse_y{};
     SDL_GetRelativeMouseState(&mouse_x, &mouse_y);
-    const auto current_input_sample = runtime.inputSampleCount();
     mouse_motion.add(current_input_sample, mouse_x, mouse_y);
     const auto add_weapon_pulses = [&weapon_select](unsigned int count) {
       weapon_select.enqueue(count);
@@ -14632,6 +14681,19 @@ SceneViewerResult runSf2GuestScene(
       host_pad.buttons =
           static_cast<std::uint16_t>(host_pad.buttons | 0x0001U);
     }
+    if (weapon_state.application_state == 7U) {
+      // Gameplay movement is authored as analog input, while SF2's retail
+      // pause shell reads D-pad navigation. Reuse the configured forward/back
+      // actions so default W/S controls navigate its menu and submenus.
+      if (raw.move_forward) {
+        host_pad.buttons =
+            static_cast<std::uint16_t>(host_pad.buttons | 0x0010U);
+      }
+      if (raw.move_backward) {
+        host_pad.buttons =
+            static_cast<std::uint16_t>(host_pad.buttons | 0x0040U);
+      }
+    }
     host_pad.buttons =
         static_cast<std::uint16_t>(host_pad.buttons | controller_held);
     host_pad.face_axis_buttons = controller_held;
@@ -14676,12 +14738,78 @@ SceneViewerResult runSf2GuestScene(
         static_cast<void>(runtime.setPlayerHealthForProbe(150U));
       }
       if (!runtime.advanceHostUpdate()) {
+        if (runtime.missionCompleteRequested()) {
+          const auto carry =
+              game::sf2CampaignCarryState(runtime.diagnostics());
+          runtime.clearPcm();
+          mouse_capture.set(false);
+          PsyX_Log_Info("SF2 retail mission completion handoff\n");
+          return SceneViewerResult{previous_buttons,
+                                   SceneExitReason::mission_complete,
+                                   std::nullopt, carry};
+        }
         const auto detail = runtime.faultDetail();
         PsyX_Log_Error("SF2 guest runtime stopped: %.*s\n",
                        static_cast<int>(detail.size()), detail.data());
         mouse_capture.set(false);
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
+      }
+      if (runtime.missionCompleteRequested()) {
+        const auto carry =
+            game::sf2CampaignCarryState(runtime.diagnostics());
+        runtime.clearPcm();
+        mouse_capture.set(false);
+        PsyX_Log_Info("SF2 retail mission completion handoff\n");
+        return SceneViewerResult{previous_buttons,
+                                 SceneExitReason::mission_complete,
+                                 std::nullopt, carry};
+      }
+      if (const auto requested_movie =
+              runtime.consumeScriptedMovieRequest()) {
+        const auto catalog_indices = game::missionScriptedMovieCatalogIndices(
+            mission.gameId(), mission.definition().index);
+        const auto match =
+            std::ranges::find(catalog_indices, *requested_movie);
+        const auto scripted_movies = mission.scriptedMovies();
+        if (match == catalog_indices.end() ||
+            static_cast<std::size_t>(match - catalog_indices.begin()) >=
+                scripted_movies.size()) {
+          PsyX_Log_Error(
+              "SF2 retail movie request is not mapped for this mission: "
+              "catalog=%u\n",
+              static_cast<unsigned int>(*requested_movie));
+          mouse_capture.set(false);
+          return SceneViewerResult{previous_buttons,
+                                   SceneExitReason::return_to_title};
+        }
+        const auto movie_index =
+            static_cast<std::size_t>(match - catalog_indices.begin());
+        // The guest has reached MOVIE.OVL's exact decoder-init boundary.
+        // Retire queued gameplay PCM before the standalone STR takes over,
+        // then resume the still-live guest mission after the movie returns.
+        audio.reset("sf2-scripted-movie");
+        runtime.clearPcm();
+        mouse_capture.set(false);
+        GR_EnableDepth(0);
+        GR_SetDepthState(0, 0);
+        previous_buttons = movie_player.playStandalone(
+            scripted_movies[movie_index], pad, previous_buttons);
+        GR_EnableDepth(1);
+        GR_SetDepthState(1, 1);
+        GR_SetBlendMode(BM_NONE);
+        mouse_capture.set(true);
+        previous_counter = SDL_GetPerformanceCounter();
+        simulation_accumulator = simulation_step;
+        if (!runtime.completeScriptedMovie(*requested_movie)) {
+          PsyX_Log_Error(
+              "SF2 retail scripted movie completion event failed: "
+              "catalog=%u\n",
+              static_cast<unsigned int>(*requested_movie));
+          mouse_capture.set(false);
+          return SceneViewerResult{previous_buttons,
+                                   SceneExitReason::return_to_title};
+        }
       }
       // A slow host frame can execute several fixed guest updates in one
       // catch-up batch. Drain PCM after each update rather than after the
@@ -15226,13 +15354,14 @@ SceneViewerResult runSf2GuestScene(
         }
         PsyX_Log_Info(
             "SF2 presentation: presented=%llu sequence=%llu guest=%llu "
-            "clock=%u packets=%zu draws=%zu words=%zu ui-events=%llu "
+            "clock=%u app=%u packets=%zu draws=%zu words=%zu ui-events=%llu "
             "last-ui=%llu recent=%u composite=%u gp1=%zu flip=0x%06X "
             "segments=%zu bank=%u retail-gp=0x%08X retail-buffers=%u/%u\n",
             static_cast<unsigned long long>(presented_frames),
             static_cast<unsigned long long>(frame->sequence),
             static_cast<unsigned long long>(frame->guest_frame),
-            diagnostics.system_clock, frame->packets.size(),
+            diagnostics.system_clock, frame->application_state,
+            frame->packets.size(),
             frame->draw_command_count, frame->gp0_word_count,
             static_cast<unsigned long long>(diagnostics.ui_text_event_count),
             static_cast<unsigned long long>(last_ui_create_guest_frame),
@@ -15519,7 +15648,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
     std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
     std::uint32_t maximum_unlocked_mission,
     std::unique_ptr<game::GameplaySession> preloaded_gameplay,
-    std::unique_ptr<PsyCrossAudioOutput> preloaded_audio) {
+    std::unique_ptr<PsyCrossAudioOutput> preloaded_audio,
+    std::optional<game::CampaignCarryState> campaign_carry) {
   g_cfg_pgxpTextureCorrection = 1;
   g_cfg_pgxpZBuffer = 1;
   InitGeom();
@@ -15531,7 +15661,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
   }
   if (mission.gameId() == game::GameId::syphon_filter_2) {
     return runSf2GuestScene(mission, pad, previous_buttons, cue_path, input_,
-                            *preloaded_gameplay);
+                            *preloaded_gameplay, campaign_carry);
   }
   auto &gameplay = *preloaded_gameplay;
   // The retail terminal transition can retire the live mission/inventory

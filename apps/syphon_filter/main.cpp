@@ -134,6 +134,7 @@ void printUsage() {
       << "Mission aliases: --mission=N --level=N (retail mission number; "
          "SF1 has 20, SF2 has 21)\n"
       << "Gameplay test option: --all-weapons-test\n"
+      << "SF2 movie diagnostic: --sf2-pre-menu-movie=NAME.STR\n"
       << "Graphics options: --fullscreen --no-launcher "
          "--resolution=WIDTHxHEIGHT "
          "--msaa=0|2|4|8 --bilinear --nearest --anisotropic "
@@ -160,6 +161,7 @@ int main(int argc, char **argv) {
     sf::platform::loadLauncherSettings(graphics, input, language);
     bool show_launcher = true;
     std::optional<std::uint32_t> requested_mission;
+    std::optional<std::string> sf2_pre_menu_movie;
     std::vector<std::string_view> arguments;
     if (argc > 1) {
       arguments.reserve(static_cast<std::size_t>(argc - 1));
@@ -172,6 +174,14 @@ int main(int argc, char **argv) {
         retail_cheats.all_weapons = true;
       } else if (argument == "--no-launcher") {
         show_launcher = false;
+      } else if (argument.starts_with("--sf2-pre-menu-movie=")) {
+        const auto name = argument.substr(
+            std::string_view{"--sf2-pre-menu-movie="}.size());
+        if (name.empty()) {
+          std::cerr << "--sf2-pre-menu-movie requires an STR filename.\n";
+          return 64;
+        }
+        sf2_pre_menu_movie = std::string{name};
       } else if (argument == "--bilinear") {
         graphics.bilinear_filtering = true;
       } else if (argument == "--nearest") {
@@ -323,7 +333,11 @@ int main(int argc, char **argv) {
                 << definition.title << " [" << definition.resource_name
                 << "].\n";
       auto assets = sf::game::TitleAssets::load(disc);
-      auto movies = sf::game::TitleMovies::load(disc);
+      auto movies = sf::game::TitleMovies::load(
+          disc,
+          sf2_pre_menu_movie
+              ? std::optional<std::string_view>{*sf2_pre_menu_movie}
+              : std::nullopt);
       auto mission_cue_path = disc.cuePath();
       auto supported_game_serial = std::string{disc.game()->serial};
       host = sf::platform::createPsyCrossTitleHost(

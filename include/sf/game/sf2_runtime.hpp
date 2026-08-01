@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sf/core/sha256.hpp"
+#include "sf/game/campaign_state.hpp"
 #include "sf/game/hud.hpp"
 
 #include <array>
@@ -237,6 +238,17 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_renderer_text_actual{};
   std::uint32_t last_renderer_text_writer_pc{};
   std::uint32_t last_renderer_text_writer_instruction{};
+  std::uint64_t render_view_adds{};
+  std::uint64_t render_view_removes{};
+  std::uint32_t last_render_view_added{};
+  std::uint32_t last_render_view_removed{};
+  std::uint32_t render_view_head{};
+  std::uint32_t player_render_node{};
+  std::uint32_t player_render_flags{};
+  std::uint32_t player_render_next{};
+  std::array<std::uint32_t, 8U> render_view_chain{};
+  std::array<std::uint32_t, 8U> render_view_chain_nodes{};
+  std::array<std::uint32_t, 8U> render_view_chain_flags{};
   std::uint64_t rejected_renderer_ordering_tables{};
   std::uint64_t observed_gpu_submissions{};
   std::uint32_t last_gpu_submission_root{};
@@ -302,6 +314,9 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t retained_retail_fullscreen_rectangles{};
   std::uint32_t retained_retail_clut_rectangles{};
   std::array<std::uint64_t, 8U> retained_retail_clut_transfers{};
+  std::size_t retained_vram_setup_packets{};
+  std::uint64_t menu_vram_snapshots{};
+  std::uint64_t menu_vram_restores{};
   std::uint64_t spu_mixed_frames{};
   std::uint64_t spu_key_on_writes{};
   std::uint64_t spu_key_off_writes{};
@@ -381,6 +396,27 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_async_completion_caller{};
   std::uint64_t input_samples{};
   std::uint64_t checkpoint_restores{};
+  std::uint64_t mission_success_events{};
+  std::uint64_t mission_failure_events{};
+  bool mission_complete_requested{};
+  std::uint64_t campaign_advance_calls{};
+  std::uint64_t movie_request_calls{};
+  std::uint64_t movie_playback_init_calls{};
+  std::uint64_t scripted_movie_handoffs{};
+  std::uint32_t last_scripted_movie_catalog_index{0xffffffffU};
+  std::uint32_t selected_movie_catalog_index{0xffffffffU};
+  std::array<std::uint32_t, 4U> last_movie_request_arguments{};
+  std::array<std::uint32_t, 4U> last_movie_playback_arguments{};
+  std::uint64_t movie_selection_writes{};
+  std::uint32_t last_movie_selection_writer_pc{};
+  std::uint32_t last_movie_selection_writer_instruction{};
+  std::uint32_t last_movie_selection_write_value{};
+  std::array<std::uint32_t, 4U> movie_selection_writer_pcs{};
+  std::array<std::uint32_t, 4U> movie_selection_write_values{};
+  std::array<std::uint32_t, 8U> movie_playback_catalog_history{};
+  std::uint32_t title_transition_mode{};
+  std::uint32_t title_substate{};
+  std::uint8_t mounted_campaign_disc{};
 };
 
 // Projects only authoritative guest-owned player state into the native SF2
@@ -389,6 +425,11 @@ struct Sf2GuestRuntimeDiagnostics {
 void projectSf2GuestHud(GameplayHud &hud,
                         const Sf2GuestRuntimeDiagnostics &guest,
                         bool first_person_aim = false) noexcept;
+
+// Converts the authoritative retail SF2 inventory/vitals into the durable
+// cross-mission subset used by the native campaign host.
+[[nodiscard]] std::optional<CampaignCarryState>
+sf2CampaignCarryState(const Sf2GuestRuntimeDiagnostics &guest) noexcept;
 
 // Retains relative mouse motion until the retail 20 Hz PAD sampler advances.
 // This prevents motion collected on the other two 60 Hz presentation frames
@@ -502,7 +543,24 @@ public:
   setPlayerHealthForProbe(std::uint16_t health) noexcept;
   [[nodiscard]] bool
   startPlayerObjectInteractionForProbe(std::uint32_t selector) noexcept;
+  [[nodiscard]] bool
+  requestScriptedMovieForProbe(std::uint8_t catalog_index) noexcept;
+  [[nodiscard]] std::optional<std::uint8_t>
+  consumeScriptedMovieRequest() noexcept;
+  [[nodiscard]] bool
+  completeScriptedMovie(std::uint8_t catalog_index) noexcept;
+  [[nodiscard]] bool requestMissionSuccessForProbe() noexcept;
+  // Diagnostic-only continuation beyond the product's success handoff. This
+  // lets sf_tool observe retail campaign/movie selection without allowing the
+  // live product runtime to mutate past its captured carry boundary.
+  [[nodiscard]] bool resumeMissionShellForProbe() noexcept;
+  [[nodiscard]] bool
+  applyCampaignCarryState(const CampaignCarryState &state) noexcept;
   [[nodiscard]] bool advanceHostUpdate() noexcept;
+  // Retail success and failure both converge on application state 3. This
+  // signal is raised only when the success entry reaches that shared outcome
+  // transition, so death/restart cannot advance the campaign.
+  [[nodiscard]] bool missionCompleteRequested() const noexcept;
   [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
   presentationFrame() const noexcept;
   [[nodiscard]] std::size_t

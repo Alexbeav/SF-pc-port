@@ -51,8 +51,15 @@ struct SaveFileReadResult {
     SaveFileReadStatus status{SaveFileReadStatus::missing};
 };
 
-bool validSaveSlots(const TitleSaveSlots& slots) noexcept {
-    const auto mission_count = missionCatalog().size();
+std::uint32_t resolvedSaveMissionCount(std::uint32_t mission_count) noexcept {
+    return mission_count != 0U
+        ? mission_count
+        : static_cast<std::uint32_t>(missionCatalog().size());
+}
+
+bool validSaveSlots(const TitleSaveSlots& slots,
+                    std::uint32_t mission_count) noexcept {
+    mission_count = resolvedSaveMissionCount(mission_count);
     return std::ranges::all_of(slots, [mission_count](const auto& slot) {
         if (!slot.occupied) {
             return !slot.campaign_complete && !slot.pending_eol_mission &&
@@ -136,7 +143,8 @@ std::string safeSaveKey(std::string_view serial) {
     return key.empty() ? "unsupported" : key;
 }
 
-SaveFileReadResult readSaveFile(const std::filesystem::path& path) {
+SaveFileReadResult readSaveFile(const std::filesystem::path& path,
+                                std::uint32_t mission_count) {
     std::error_code error;
     const auto exists = std::filesystem::exists(path, error);
     if (error) {
@@ -167,7 +175,7 @@ SaveFileReadResult readSaveFile(const std::filesystem::path& path) {
         return {{}, SaveFileReadStatus::invalid};
     }
     auto slots = parseTitleSaveSlots(bytes);
-    if (!slots || !validSaveSlots(*slots)) {
+    if (!slots || !validSaveSlots(*slots, mission_count)) {
         return {{}, SaveFileReadStatus::invalid};
     }
     return {std::move(slots), SaveFileReadStatus::loaded};
@@ -177,7 +185,10 @@ SaveFileReadResult readSaveFile(const std::filesystem::path& path) {
 
 TitleAssets::TitleAssets(std::vector<TitleSprite> sprites) : sprites_(std::move(sprites)) {}
 
-TitleMovies::TitleMovies(std::vector<TitleMovie> sequence) : sequence_(std::move(sequence)) {}
+TitleMovies::TitleMovies(std::vector<TitleMovie> sequence,
+                         std::optional<TitleMovie> pre_menu_movie)
+    : sequence_(std::move(sequence)),
+      pre_menu_movie_(std::move(pre_menu_movie)) {}
 
 TitleAssets TitleAssets::load(GameDisc& disc) {
     struct Definition {
@@ -229,7 +240,39 @@ const TitleSprite& TitleAssets::sprite(TitleVisual visual) const {
     return sprites_[index];
 }
 
-TitleMovies TitleMovies::load(GameDisc& disc) {
+TitleMovies TitleMovies::load(
+    GameDisc& disc, std::optional<std::string_view> pre_menu_movie_name) {
+    if (disc.game() && disc.game()->id == GameId::syphon_filter_2) {
+        // SF2 stores frontend STRs as raw Mode-2 ranges in its per-disc MOVIE
+        // catalog rather than as standalone ISO files. Preserve the native
+        // title host's five-slot contract: three startup clips, its looping
+        // background, and the optional demonstration menu item.
+        constexpr std::array<std::string_view, movie_count> names{
+            "989LOGO.STR",
+            "EIDETIC.STR",
+            "LEGAL.STR",
+            "TITLE.STR",
+            "DEMO1.STR",
+        };
+        std::vector<TitleMovie> sequence;
+        sequence.reserve(names.size());
+        for (const auto name : names) {
+            sequence.push_back(loadSf2EmbeddedMovie(disc, name));
+        }
+        const auto pre_menu_name =
+            pre_menu_movie_name && !pre_menu_movie_name->empty()
+                ? *pre_menu_movie_name
+                : std::string_view{"ZINTRO.STR"};
+        auto pre_menu_movie = std::optional<TitleMovie>{
+            loadSf2EmbeddedMovie(disc, pre_menu_name)};
+        return TitleMovies{std::move(sequence), std::move(pre_menu_movie)};
+    }
+    if (pre_menu_movie_name) {
+      throw core::Error{
+          core::ErrorCode::unsupported,
+          "--sf2-pre-menu-movie requires a Syphon Filter 2 disc"};
+    }
+
     // Recovered from TITLE.OVL's logo sequence, Title_StartTitleMovie at
     // 0x80148f78 and Title_StartTrainingMovie at 0x80149300.
     constexpr std::array<const char*, movie_count> paths{
@@ -392,7 +435,7 @@ void TitleMenu::updateVisuals(std::uint32_t background_movie_frame) noexcept {
 
 std::string serializeTitleSaveSlots(const TitleSaveSlots& slots) {
     std::ostringstream output;
-    output << "SFPC_SAVE_V4\n";
+    output << "SFPC_SAVE_V5\n";
     for (std::size_t index = 0; index < slots.size(); ++index) {
         const auto& slot = slots[index];
         output << index << ' ' << (slot.occupied ? 1 : 0) << ' '
@@ -400,7 +443,8 @@ std::string serializeTitleSaveSlots(const TitleSaveSlots& slots) {
                << (slot.campaign_complete ? 1 : 0) << ' '
                << (slot.pending_eol_mission ? 1 : 0) << ' '
                << slot.pending_eol_mission.value_or(0U) << ' '
-               << (slot.carry ? 1 : 0);
+               << (slot.carry ? 1 : 0) << ' '
+               << (slot.carry && slot.carry->sequel ? 1 : 0);
         if (slot.carry) {
             output << ' ' << static_cast<unsigned>(slot.carry->current_weapon)
                    << ' ' << slot.carry->owned_weapons << ' '
@@ -410,6 +454,19 @@ std::string serializeTitleSaveSlots(const TitleSaveSlots& slots) {
             }
             for (const auto reserve : slot.carry->reserves) {
                 output << ' ' << reserve;
+            }
+            if (slot.carry->sequel) {
+                output << ' '
+                       << static_cast<unsigned>(
+                              slot.carry->sequel->current_item)
+                       << ' ' << slot.carry->sequel->owned_items[0U] << ' '
+                       << slot.carry->sequel->owned_items[1U];
+                for (const auto magazine : slot.carry->sequel->magazines) {
+                    output << ' ' << magazine;
+                }
+                for (const auto reserve : slot.carry->sequel->reserves) {
+                    output << ' ' << reserve;
+                }
             }
         }
         output << '\n';
@@ -422,13 +479,17 @@ std::optional<TitleSaveSlots> parseTitleSaveSlots(std::string_view bytes) {
     std::string magic;
     if (!std::getline(input, magic) ||
         (magic != "SFPC_SAVE_V1" && magic != "SFPC_SAVE_V2" &&
-         magic != "SFPC_SAVE_V3" && magic != "SFPC_SAVE_V4")) {
+         magic != "SFPC_SAVE_V3" && magic != "SFPC_SAVE_V4" &&
+         magic != "SFPC_SAVE_V5")) {
         return std::nullopt;
     }
     const auto version_two_or_newer = magic != "SFPC_SAVE_V1";
     const auto version_three_or_newer =
-        magic == "SFPC_SAVE_V3" || magic == "SFPC_SAVE_V4";
-    const auto version_four = magic == "SFPC_SAVE_V4";
+        magic == "SFPC_SAVE_V3" || magic == "SFPC_SAVE_V4" ||
+        magic == "SFPC_SAVE_V5";
+    const auto version_four_or_newer =
+        magic == "SFPC_SAVE_V4" || magic == "SFPC_SAVE_V5";
+    const auto version_five = magic == "SFPC_SAVE_V5";
 
     TitleSaveSlots slots{};
     for (std::size_t expected = 0; expected < slots.size(); ++expected) {
@@ -439,13 +500,16 @@ std::optional<TitleSaveSlots> parseTitleSaveSlots(std::string_view bytes) {
         unsigned int pending_eol{};
         std::uint32_t pending_eol_mission{};
         unsigned int has_carry{};
+        unsigned int has_sequel_carry{};
         if (!(input >> index >> occupied >> mission_index) ||
             (version_two_or_newer && !(input >> campaign_complete)) ||
             (version_three_or_newer &&
              !(input >> pending_eol >> pending_eol_mission)) ||
-            (version_four && !(input >> has_carry)) ||
+            (version_four_or_newer && !(input >> has_carry)) ||
+            (version_five && !(input >> has_sequel_carry)) ||
             index != expected || occupied > 1U || campaign_complete > 1U ||
-            pending_eol > 1U || has_carry > 1U ||
+            pending_eol > 1U || has_carry > 1U || has_sequel_carry > 1U ||
+            (has_sequel_carry != 0U && has_carry == 0U) ||
             (!pending_eol && pending_eol_mission != 0U)) {
             return std::nullopt;
         }
@@ -469,6 +533,28 @@ std::optional<TitleSaveSlots> parseTitleSaveSlots(std::string_view bytes) {
                     return std::nullopt;
                 }
             }
+            if (has_sequel_carry != 0U) {
+                unsigned int current_item{};
+                SequelCampaignCarryState sequel;
+                if (!(input >> current_item >> sequel.owned_items[0U] >>
+                      sequel.owned_items[1U]) ||
+                    current_item > std::numeric_limits<std::uint8_t>::max()) {
+                    return std::nullopt;
+                }
+                sequel.current_item =
+                    static_cast<std::uint8_t>(current_item);
+                for (auto& magazine : sequel.magazines) {
+                    if (!(input >> magazine)) {
+                        return std::nullopt;
+                    }
+                }
+                for (auto& reserve : sequel.reserves) {
+                    if (!(input >> reserve)) {
+                        return std::nullopt;
+                    }
+                }
+                state.sequel = std::move(sequel);
+            }
             if (!validCampaignCarry(state)) {
                 return std::nullopt;
             }
@@ -489,14 +575,16 @@ std::optional<TitleSaveSlots> parseTitleSaveSlots(std::string_view bytes) {
 }
 
 TitleSaveLoadResult loadTitleSaveSlotsFile(
-    const std::filesystem::path& path) noexcept {
+    const std::filesystem::path& path,
+    std::uint32_t mission_count) noexcept {
     try {
-        const auto primary = readSaveFile(path);
+        const auto primary = readSaveFile(path, mission_count);
         if (primary.status == SaveFileReadStatus::loaded) {
             return {*primary.slots, TitleSaveLoadStatus::loaded};
         }
 
-        const auto backup = readSaveFile(saveSiblingPath(path, ".bak"));
+        const auto backup = readSaveFile(saveSiblingPath(path, ".bak"),
+                                         mission_count);
         if (backup.status == SaveFileReadStatus::loaded) {
             return {*backup.slots, TitleSaveLoadStatus::recovered};
         }
@@ -512,9 +600,10 @@ TitleSaveLoadResult loadTitleSaveSlotsFile(
 
 bool storeTitleSaveSlotsFile(
     const std::filesystem::path& path,
-    const TitleSaveSlots& slots) noexcept {
+    const TitleSaveSlots& slots,
+    std::uint32_t mission_count) noexcept {
     try {
-        if (!validSaveSlots(slots)) {
+        if (!validSaveSlots(slots, mission_count)) {
             return false;
         }
         if (path.empty() || path.filename().empty()) {
@@ -552,7 +641,7 @@ bool storeTitleSaveSlotsFile(
             }
         }
 
-        const auto primary = readSaveFile(path);
+        const auto primary = readSaveFile(path, mission_count);
         const auto primary_exists = primary.status != SaveFileReadStatus::missing;
         auto primary_backed_up = false;
         if (primary_exists) {
@@ -599,7 +688,8 @@ bool storeTitleSaveSlotsFile(
         // A first commit has no previous primary to rotate. A stale/corrupt
         // .bak is no better than a missing one, so validate it before deciding
         // that this commit already has a recoverable copy.
-        if (readSaveFile(backup).status != SaveFileReadStatus::loaded) {
+        if (readSaveFile(backup, mission_count).status !=
+            SaveFileReadStatus::loaded) {
             const auto temporary_backup = saveSiblingPath(path, ".bak.tmp");
             error.clear();
             static_cast<void>(std::filesystem::remove(temporary_backup, error));
@@ -660,24 +750,28 @@ TitleSaveLocation defaultTitleSaveLocation(
 }
 
 TitleSaveMigrationStatus migrateLegacyTitleSaveSlotsFile(
-    const TitleSaveLocation& location) noexcept {
+    const TitleSaveLocation& location,
+    std::uint32_t mission_count) noexcept {
     try {
         if (location.primary.empty() || location.legacy.empty()) {
             return TitleSaveMigrationStatus::not_needed;
         }
-        const auto current = loadTitleSaveSlotsFile(location.primary);
+        const auto current = loadTitleSaveSlotsFile(location.primary,
+                                                    mission_count);
         if (current.status == TitleSaveLoadStatus::loaded ||
             current.status == TitleSaveLoadStatus::recovered) {
             return TitleSaveMigrationStatus::not_needed;
         }
-        const auto legacy = loadTitleSaveSlotsFile(location.legacy);
+        const auto legacy = loadTitleSaveSlotsFile(location.legacy,
+                                                   mission_count);
         if (legacy.status == TitleSaveLoadStatus::missing) {
             return current.status == TitleSaveLoadStatus::missing
                 ? TitleSaveMigrationStatus::not_needed
                 : TitleSaveMigrationStatus::failed;
         }
         if (legacy.status == TitleSaveLoadStatus::invalid ||
-            !storeTitleSaveSlotsFile(location.primary, legacy.slots)) {
+            !storeTitleSaveSlotsFile(location.primary, legacy.slots,
+                                     mission_count)) {
             return TitleSaveMigrationStatus::failed;
         }
         return TitleSaveMigrationStatus::migrated;

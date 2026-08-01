@@ -15,6 +15,7 @@ struct PsyCrossVideoMode {
 
 inline constexpr PsyCrossVideoMode gameplay_video_mode{384, 240};
 inline constexpr PsyCrossVideoMode movie_video_mode{320, 240};
+inline constexpr PsyCrossVideoMode wide_movie_video_mode{512, 240};
 
 inline void configurePsyCrossVideoMode(PsyCrossVideoMode mode, bool reset_graph) noexcept {
     SetVideoMode(MODE_NTSC);

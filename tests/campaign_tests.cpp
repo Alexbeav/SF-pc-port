@@ -164,6 +164,55 @@ void testRetailSavePromptAndTransientCampaign() {
               catacomb_movies[1] == "CUT/CAT2.STR",
           "Retail scripted CUT movie catalog is incomplete or out of order");
 
+  const auto sf2_airbase_movies = sf::game::missionScriptedMoviePaths(
+      sf::game::GameId::syphon_filter_2, 1U);
+  const auto sf2_airbasex_movies = sf::game::missionScriptedMoviePaths(
+      sf::game::GameId::syphon_filter_2, 4U);
+  const auto sf2_airbase_movie_indices =
+      sf::game::missionScriptedMovieCatalogIndices(
+          sf::game::GameId::syphon_filter_2, 1U);
+  const auto sf2_airbasex_movie_indices =
+      sf::game::missionScriptedMovieCatalogIndices(
+          sf::game::GameId::syphon_filter_2, 4U);
+  require(sf2_airbase_movies.size() == 2U &&
+              sf2_airbase_movies[0] == "3_2.STR" &&
+              sf2_airbase_movies[1] == "3_3.STR" &&
+              sf2_airbasex_movies.size() == 1U &&
+              sf2_airbasex_movies[0] == "6_3.STR" &&
+              sf2_airbase_movie_indices.size() == 2U &&
+              sf2_airbase_movie_indices[0] == 3U &&
+              sf2_airbase_movie_indices[1] == 4U &&
+              sf2_airbasex_movie_indices.size() == 1U &&
+              sf2_airbasex_movie_indices[0] == 10U &&
+              sf::game::missionScriptedMoviePaths(
+                  sf::game::GameId::syphon_filter_2, 2U)
+                  .empty(),
+          "SF2 retail scripted movie mapping is incomplete or out of order");
+
+  constexpr std::array<std::string_view, 21U> sf2_openings{
+      "2_1.STR",  "3_1.STR",  "4_1.STR",  "5_1.STR",  "6_1.STR",
+      "7_1.STR",  "8_1.STR",  "9_1.STR",  "10_1.STR", "11_1.STR",
+      "12_1.STR", "13_1.STR", "14_1.STR", "15_1.STR", "16_1.STR",
+      "",         "18_1.STR", "",         "",         "",
+      "",
+  };
+  constexpr std::array<std::string_view, 21U> sf2_endings{
+      "2_3.STR",  "3_4.STR", "",         "5_2.STR",  "6_3.STR",
+      "7_2.STR",  "8_2.STR", "9_2.STR",  "",         "",
+      "",         "13_2.STR", "14_2.STR", "15_3.STR", "",
+      "17_3.STR", "18_2.STR", "19_2.STR", "20_3.STR", "21_2.STR",
+      "",
+  };
+  const auto sf2_catalog =
+      sf::game::missionCatalog(sf::game::GameId::syphon_filter_2);
+  require(sf2_catalog.size() == sf2_endings.size(),
+          "SF2 EOL movie table does not cover the full campaign");
+  for (auto index = std::size_t{}; index < sf2_catalog.size(); ++index) {
+    require(sf2_catalog[index].opening_movie_path == sf2_openings[index] &&
+                sf2_catalog[index].ending_movie_path == sf2_endings[index],
+            "SF2 retail SOL/EOL movie selection is incomplete or out of order");
+  }
+
   sf::game::CampaignSaveMenu menu;
   require(menu.phase() == sf::game::CampaignSavePhase::prompt &&
               menu.saveSelected(),
@@ -283,9 +332,9 @@ void testSaveMigrationAndCompletedSlotUi() {
               !(*version_two)[0].pending_eol_mission,
           "V2 campaign save did not migrate to the current slot model");
   const auto current_bytes = sf::game::serializeTitleSaveSlots(*version_two);
-  require(current_bytes.starts_with("SFPC_SAVE_V4\n") &&
+  require(current_bytes.starts_with("SFPC_SAVE_V5\n") &&
               sf::game::parseTitleSaveSlots(current_bytes) == version_two,
-          "Migrated V2 save did not round-trip through V4");
+          "Migrated V2 save did not round-trip through V5");
 
   sf::game::TitleSaveSlots completed{};
   completed[0] = sf::game::TitleSaveSlot{true, 19U, true};
@@ -376,6 +425,13 @@ void testConnectedMissionCarryAndSaveRoundTrip() {
   carry.reserves[shotgun] = 18U;
   carry.health = 87U;
   carry.armor = 321U;
+  carry.sequel = sf::game::SequelCampaignCarryState{};
+  carry.sequel->current_item = 8U;
+  carry.sequel->owned_items = {1U << 8U, 1U << 1U};
+  carry.sequel->magazines[8U] = 4U;
+  carry.sequel->reserves[8U] = 18U;
+  carry.sequel->magazines[33U] = 2U;
+  carry.sequel->reserves[33U] = 9U;
   require(sf::game::validCampaignCarry(carry),
           "Valid campaign carry was rejected");
 
@@ -388,7 +444,7 @@ void testConnectedMissionCarryAndSaveRoundTrip() {
   const auto durable =
       sf::game::parseTitleSaveSlots(sf::game::serializeTitleSaveSlots(slots));
   require(durable && (*durable)[0].carry == carry,
-          "Campaign player state did not round-trip through V4");
+          "Campaign player state did not round-trip through V5");
   auto resumed = sf::game::CampaignProgress::resume(*durable, 0U);
   auto finalized = *durable;
   require(resumed &&
@@ -419,6 +475,40 @@ void testConnectedMissionCarryAndSaveRoundTrip() {
       std::filesystem::temp_directory_path() / "sf_invalid_carry.sav";
   require(!sf::game::storeTitleSaveSlotsFile(invalid_path, invalid_slots),
           "Objective inventory leaked into a durable campaign loadout");
+}
+
+void testSf2TwentyFirstMissionAndSaveValidation() {
+  const auto mission_count = static_cast<std::uint32_t>(
+      sf::game::missionCatalog(sf::game::GameId::syphon_filter_2).size());
+  require(mission_count == 21U, "SF2 campaign catalog lost its finale");
+
+  sf::game::TitleSaveSlots slots{};
+  auto campaign = sf::game::CampaignProgress::startNewInSlot(
+      slots, 0U, 19U, false, mission_count);
+  require(campaign && campaign->stageMissionCompletion(slots) &&
+              campaign->completeMission(slots) ==
+                  sf::game::CampaignAdvance::next_mission &&
+              campaign->missionIndex() == 20U && slots[0].mission_index == 20U,
+          "SF2 Mission 20 was incorrectly treated as the campaign finale");
+
+  const auto directory =
+      std::filesystem::temp_directory_path() / "sf2_campaign_21_tests";
+  std::filesystem::remove_all(directory);
+  const auto save_path = directory / "campaign.sav";
+  require(sf::game::storeTitleSaveSlotsFile(save_path, slots, mission_count),
+          "SF2 Mission 21 save was rejected by SF1's catalog bound");
+  auto loaded = sf::game::loadTitleSaveSlotsFile(save_path, mission_count);
+  auto resumed = sf::game::CampaignProgress::resume(
+      loaded.slots, 0U, mission_count);
+  require(loaded.status == sf::game::TitleSaveLoadStatus::loaded && resumed &&
+              resumed->missionIndex() == 20U &&
+              resumed->stageMissionCompletion(loaded.slots) &&
+              resumed->completeMission(loaded.slots) ==
+                  sf::game::CampaignAdvance::campaign_complete &&
+              loaded.slots[0].campaign_complete &&
+              loaded.slots[0].mission_index == 20U,
+          "SF2 Mission 21 did not save, resume, and complete atomically");
+  std::filesystem::remove_all(directory);
 }
 
 void testExplicitFullSaveOverwrite() {
@@ -502,7 +592,7 @@ void testUserDataSaveMigrationAndRecovery() {
               remigrated.slots[0] == sf::game::TitleSaveSlot{true, 7U, false} &&
               repaired_backup.status == sf::game::TitleSaveLoadStatus::loaded &&
               repaired_backup.slots == remigrated.slots,
-          "Legacy recovery did not replace the corrupt backup with V4");
+          "Legacy recovery did not replace the corrupt backup with V5");
   std::filesystem::remove_all(directory);
 }
 
@@ -538,6 +628,7 @@ int main() {
   testSaveMigrationAndCompletedSlotUi();
   testInterruptedEolRecovery();
   testConnectedMissionCarryAndSaveRoundTrip();
+  testSf2TwentyFirstMissionAndSaveValidation();
   testExplicitFullSaveOverwrite();
   testUserDataSaveMigrationAndRecovery();
   testBackupRepairFailureKeepsPrimary();

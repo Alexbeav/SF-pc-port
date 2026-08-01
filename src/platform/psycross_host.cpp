@@ -12,6 +12,7 @@
 #include "sf/game/game_disc.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/retail_cheats.hpp"
+#include "sf/game/supported_games.hpp"
 #include "sf/game/title.hpp"
 
 #include <PsyX/PsyX_globals.h>
@@ -23,7 +24,9 @@
 #include <psx/libpad.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -34,9 +37,94 @@
 namespace sf::platform {
 namespace {
 
+bool discContainsCampaignMission(const game::SupportedGame &disc,
+                                 std::uint32_t mission_index) noexcept {
+  return std::ranges::any_of(
+      game::missionResources(disc.id, disc.disc_number),
+      [mission_index](const game::GameMissionResource &resource) {
+        return resource.selection_index == mission_index;
+      });
+}
+
+std::optional<std::filesystem::path> verifiedSf2DiscCandidate(
+    const std::filesystem::path &candidate,
+    std::uint32_t mission_index) noexcept {
+  try {
+    auto disc = game::GameDisc::open(candidate);
+    if (disc.game() && disc.game()->id == game::GameId::syphon_filter_2 &&
+        discContainsCampaignMission(*disc.game(), mission_index)) {
+      return candidate;
+    }
+  } catch (const std::exception &) {
+  }
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path> resolveSf2CampaignDisc(
+    const std::filesystem::path &current_cue,
+    std::uint32_t mission_index) noexcept {
+  if (const auto current =
+          verifiedSf2DiscCandidate(current_cue, mission_index)) {
+    return current;
+  }
+
+  // Conventional multi-disc dumps differ only by the Disc 1/Disc 2 token.
+  // Try that path first so a game directory containing many unrelated CUEs
+  // does not need to be scanned at every campaign boundary.
+  auto paired_name = current_cue.filename().string();
+  const auto replace_disc_token = [&paired_name](std::string_view from,
+                                                  std::string_view to) {
+    const auto position = paired_name.find(from);
+    if (position == std::string::npos) {
+      return false;
+    }
+    paired_name.replace(position, from.size(), to);
+    return true;
+  };
+  if (replace_disc_token("Disc 1", "Disc 2") ||
+      replace_disc_token("disc 1", "disc 2") ||
+      replace_disc_token("DISC 1", "DISC 2") ||
+      replace_disc_token("Disc 2", "Disc 1") ||
+      replace_disc_token("disc 2", "disc 1") ||
+      replace_disc_token("DISC 2", "DISC 1")) {
+    const auto paired = current_cue.parent_path() / paired_name;
+    if (const auto verified =
+            verifiedSf2DiscCandidate(paired, mission_index)) {
+      return verified;
+    }
+  }
+
+  // Renamed dumps remain supported: identify sibling CUEs by their retail
+  // executable/volume metadata and accept only the disc that owns the target
+  // campaign resource.
+  std::error_code error;
+  for (std::filesystem::directory_iterator entry{current_cue.parent_path(),
+                                                  error},
+       end;
+       !error && entry != end; entry.increment(error)) {
+    if (!entry->is_regular_file(error) || error ||
+        entry->path() == current_cue) {
+      continue;
+    }
+    auto extension = entry->path().extension().string();
+    std::ranges::transform(extension, extension.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    if (extension != ".cue") {
+      continue;
+    }
+    if (const auto verified =
+            verifiedSf2DiscCandidate(entry->path(), mission_index)) {
+      return verified;
+    }
+  }
+  return std::nullopt;
+}
+
 detail::StandaloneMovieSkipPolicy
-endingMovieSkipPolicy(const game::MissionDefinition &definition) noexcept {
-  const auto catalog = game::missionCatalog();
+endingMovieSkipPolicy(game::GameId game_id,
+                      const game::MissionDefinition &definition) noexcept {
+  const auto catalog = game::missionCatalog(game_id);
   if (!catalog.empty() && definition.index == catalog.back().index) {
     // EOL/SILO.STR contains the credits and the post-credits scene.  It is a
     // single retail stream, so allowing a carried confirm/cancel edge from the
@@ -44,6 +132,17 @@ endingMovieSkipPolicy(const game::MissionDefinition &definition) noexcept {
     return detail::StandaloneMovieSkipPolicy::prevent;
   }
   return detail::StandaloneMovieSkipPolicy::allow;
+}
+
+void playSf2CampaignFinalMovie(
+    const std::filesystem::path &cue_path,
+    detail::PsyCrossMoviePlayer &movie_player, PADRAW &pad,
+    std::uint16_t &previous_buttons) {
+  auto disc = game::GameDisc::open(cue_path);
+  auto final_movie = game::loadSf2EmbeddedMovie(disc, "Z17_1.STR");
+  previous_buttons = movie_player.playStandalone(
+      final_movie, pad, previous_buttons,
+      detail::StandaloneMovieSkipPolicy::prevent);
 }
 
 void configureGraphics(const GraphicsSettings &settings) noexcept {
@@ -130,8 +229,9 @@ void configureTitleNotice() {
 }
 
 game::TitleSaveSlots
-loadTitleSaveSlots(const std::filesystem::path &path) noexcept {
-  const auto loaded = game::loadTitleSaveSlotsFile(path);
+loadTitleSaveSlots(const std::filesystem::path &path,
+                   std::uint32_t mission_count) noexcept {
+  const auto loaded = game::loadTitleSaveSlotsFile(path, mission_count);
   if (loaded.status == game::TitleSaveLoadStatus::invalid) {
     PsyX_Log_Error("Ignoring invalid or unreadable title save file\n");
   } else if (loaded.status == game::TitleSaveLoadStatus::recovered) {
@@ -141,8 +241,10 @@ loadTitleSaveSlots(const std::filesystem::path &path) noexcept {
 }
 
 bool storeTitleSaveSlots(const std::filesystem::path &path,
-                         const game::TitleSaveSlots &slots) noexcept {
-  const auto stored = game::storeTitleSaveSlotsFile(path, slots);
+                         const game::TitleSaveSlots &slots,
+                         std::uint32_t mission_count) noexcept {
+  const auto stored =
+      game::storeTitleSaveSlotsFile(path, slots, mission_count);
   if (!stored) {
     PsyX_Log_Error("Campaign progress could not be persisted\n");
   }
@@ -185,10 +287,11 @@ sampleHostKeyboardMouseActions(const KeyboardMouseBindings &bindings) {
 
 SaveStoreDecision
 storeTitleSaveSlotsWithRecovery(const std::filesystem::path &path,
-                                const game::TitleSaveSlots &slots, PADRAW &pad,
+                                const game::TitleSaveSlots &slots,
+                                std::uint32_t mission_count, PADRAW &pad,
                                 std::uint16_t &previous_buttons,
                                 const KeyboardMouseBindings &bindings) {
-  if (storeTitleSaveSlots(path, slots)) {
+  if (storeTitleSaveSlots(path, slots, mission_count)) {
     return SaveStoreDecision::stored;
   }
 
@@ -239,7 +342,7 @@ storeTitleSaveSlotsWithRecovery(const std::filesystem::path &path,
       return SaveStoreDecision::continue_without_saving;
     }
     if (((pressed & retry_buttons) != 0U || interact_pressed) &&
-        storeTitleSaveSlots(path, slots)) {
+        storeTitleSaveSlots(path, slots, mission_count)) {
       return SaveStoreDecision::stored;
     }
 
@@ -275,6 +378,8 @@ runCampaignSaveMenu(const game::MissionPackage &mission,
   auto keyboard_initialized = false;
   auto interact_was_down = false;
   auto pause_was_down = false;
+  auto previous_was_down = false;
+  auto next_was_down = false;
   for (;;) {
     PsyX_UpdateInput();
     ui_audio.update();
@@ -285,20 +390,31 @@ runCampaignSaveMenu(const game::MissionPackage &mission,
     const auto actions = sampleHostKeyboardMouseActions(bindings);
     const auto interact_down = actions[KeyboardMouseAction::interact];
     const auto pause_down = actions[KeyboardMouseAction::pause];
+    const auto previous_down =
+        actions[KeyboardMouseAction::move_forward];
+    const auto next_down =
+        actions[KeyboardMouseAction::move_backward];
     const auto interact_pressed =
         keyboard_initialized && interact_down && !interact_was_down;
     const auto pause_pressed =
         keyboard_initialized && pause_down && !pause_was_down;
+    const auto previous_pressed =
+        keyboard_initialized && previous_down && !previous_was_down;
+    const auto next_pressed =
+        keyboard_initialized && next_down && !next_was_down;
     keyboard_initialized = true;
     interact_was_down = interact_down;
     pause_was_down = pause_down;
+    previous_was_down = previous_down;
+    next_was_down = next_down;
     const auto current_analog = titleAnalogDirection(pad);
     const auto analog_previous = current_analog < 0 && analog_direction == 0;
     const auto analog_next = current_analog > 0 && analog_direction == 0;
     analog_direction = current_analog;
     const game::CampaignSaveInput input{
-        (pressed & previous_buttons_mask) != 0U || analog_previous,
-        (pressed & next_buttons_mask) != 0U || analog_next,
+        (pressed & previous_buttons_mask) != 0U || analog_previous ||
+            previous_pressed,
+        (pressed & next_buttons_mask) != 0U || analog_next || next_pressed,
         (pressed & confirm_buttons_mask) != 0U || interact_pressed,
         (pressed & cancel_buttons_mask) != 0U || pause_pressed,
     };
@@ -501,14 +617,17 @@ public:
     configureTitleNotice();
     const auto save_location =
         game::defaultTitleSaveLocation(cue_path_, supported_game_serial_);
-    const auto migration = game::migrateLegacyTitleSaveSlotsFile(save_location);
+    const auto campaign_mission_count = static_cast<std::uint32_t>(
+        game::missionCatalog(initial_mission_.gameId()).size());
+    const auto migration = game::migrateLegacyTitleSaveSlotsFile(
+        save_location, campaign_mission_count);
     if (migration == game::TitleSaveMigrationStatus::migrated) {
       PsyX_Log_Info("Migrated campaign save to the user-data directory\n");
     } else if (migration == game::TitleSaveMigrationStatus::failed) {
       PsyX_Log_Error("Legacy campaign save migration failed\n");
     }
     const auto &save_path = save_location.primary;
-    menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+    menu_.setSaveSlots(loadTitleSaveSlots(save_path, campaign_mission_count));
     PADRAW pad{};
     PadInitDirect(reinterpret_cast<unsigned char *>(&pad), nullptr);
     PadStartCom();
@@ -518,6 +637,8 @@ public:
     bool title_keyboard_initialized{};
     bool title_interact_was_down{};
     bool title_pause_was_down{};
+    bool title_previous_was_down{};
+    bool title_next_was_down{};
     detail::PsyCrossUiAudio ui_audio{cue_path_};
     detail::PsyCrossMoviePlayer movie_player;
     detail::PsyCrossCampaignSaveRenderer title_load_renderer{initial_mission_,
@@ -525,21 +646,33 @@ public:
     const detail::MovieOverlayCallbacks overlay{
         [this, &pad, &ui_audio, &title_cheat_latched,
          &title_keyboard_initialized, &title_interact_was_down,
-         &title_pause_was_down](std::uint16_t pressed,
+         &title_pause_was_down, &title_previous_was_down,
+         &title_next_was_down](std::uint16_t pressed,
                                 std::uint32_t movie_frame) {
           ui_audio.update();
           const auto actions = sampleHostKeyboardMouseActions(input_);
           const auto interact_down =
               actions[KeyboardMouseAction::interact];
           const auto pause_down = actions[KeyboardMouseAction::pause];
+          const auto previous_down =
+              actions[KeyboardMouseAction::move_forward];
+          const auto next_down =
+              actions[KeyboardMouseAction::move_backward];
           const auto interact_pressed = title_keyboard_initialized &&
                                         interact_down &&
                                         !title_interact_was_down;
           const auto pause_pressed = title_keyboard_initialized && pause_down &&
                                      !title_pause_was_down;
+          const auto previous_pressed =
+              title_keyboard_initialized && previous_down &&
+              !title_previous_was_down;
+          const auto next_pressed =
+              title_keyboard_initialized && next_down && !title_next_was_down;
           title_keyboard_initialized = true;
           title_interact_was_down = interact_down;
           title_pause_was_down = pause_down;
+          title_previous_was_down = previous_down;
+          title_next_was_down = next_down;
           const auto held =
               static_cast<std::uint16_t>(~readHostButtons(pad));
           const auto title_cheat = game::detectRetailTitleCheat(
@@ -562,8 +695,10 @@ public:
               analog_direction > 0 && title_analog_direction_ == 0;
           title_analog_direction_ = analog_direction;
           const game::TitleInput input{
-              .previous = (pressed & (0x80U | 0x10U)) != 0 || analog_previous,
-              .next = (pressed & (0x20U | 0x40U)) != 0 || analog_next,
+              .previous = (pressed & (0x80U | 0x10U)) != 0 ||
+                          analog_previous || previous_pressed,
+              .next = (pressed & (0x20U | 0x40U)) != 0 || analog_next ||
+                      next_pressed,
               .confirm = (pressed & (0x4000U | 0x8000U | 0x08U)) != 0 ||
                          interact_pressed,
               .cancel = (pressed & (0x2000U | 0x01U)) != 0 || pause_pressed,
@@ -654,12 +789,14 @@ public:
       auto campaign_carry = std::optional<game::CampaignCarryState>{};
       if (selected_command_ == game::TitleCommand::load_game) {
         campaign = game::CampaignProgress::resume(save_slots,
-                                                  menu_.loadSlotSelection());
+                                                  menu_.loadSlotSelection(),
+                                                  campaign_mission_count);
         if (!campaign) {
           PsyX_Log_Error("Load Game rejected invalid selected slot\n");
           uploadTitleAssets(assets_);
           configureTitleNotice();
-          menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+          menu_.setSaveSlots(
+              loadTitleSaveSlots(save_path, campaign_mission_count));
           continue;
         }
         PsyX_Log_Info("Load Game: slot=%zu mission=%u\n",
@@ -667,12 +804,14 @@ public:
         campaign_carry = save_slots[*campaign->saveSlot()].carry;
       } else {
         campaign = game::CampaignProgress::startUnsaved(
-            initial_mission_.definition().index, title_played_opening_movie);
+            initial_mission_.definition().index, title_played_opening_movie,
+            campaign_mission_count);
         if (!campaign) {
           PsyX_Log_Error("New Game rejected an invalid campaign cursor\n");
           uploadTitleAssets(assets_);
           configureTitleNotice();
-          menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+          menu_.setSaveSlots(
+              loadTitleSaveSlots(save_path, campaign_mission_count));
           continue;
         }
         PsyX_Log_Info("New Game FMV complete; opening unsaved mission %u\n",
@@ -681,14 +820,32 @@ public:
       detail::PsyCrossMissionStart mission_start;
       detail::PsyCrossSceneViewer scene_viewer{input_, cheats_};
       std::optional<game::MissionPackage> loaded_mission;
+      auto campaign_cue_path = cue_path_;
       auto exit_application = false;
       while (campaign->active()) {
         const auto mission_index = campaign->missionIndex();
+        if (initial_mission_.gameId() == game::GameId::syphon_filter_2) {
+          const auto resolved =
+              resolveSf2CampaignDisc(campaign_cue_path, mission_index);
+          if (!resolved) {
+            PsyX_Log_Error(
+                "SF2 campaign mission %u requires its matching retail disc "
+                "CUE beside %s\n",
+                mission_index + 1U, campaign_cue_path.string().c_str());
+            break;
+          }
+          if (*resolved != campaign_cue_path) {
+            campaign_cue_path = *resolved;
+            PsyX_Log_Info("SF2 campaign switched retail disc: %s\n",
+                          campaign_cue_path.string().c_str());
+          }
+        }
         game::MissionPackage *mission{};
-        if (mission_index == initial_mission_.definition().index) {
+        if (mission_index == initial_mission_.definition().index &&
+            campaign_cue_path == cue_path_) {
           mission = &initial_mission_;
         } else {
-          auto disc = game::GameDisc::open(cue_path_);
+          auto disc = game::GameDisc::open(campaign_cue_path);
           loaded_mission.emplace(
               game::MissionPackage::load(disc, mission_index));
           mission = &*loaded_mission;
@@ -699,7 +856,8 @@ public:
           if (!mission->endingMovie().path.empty()) {
             previous_buttons = movie_player.playStandalone(
                 mission->endingMovie(), pad, previous_buttons,
-                endingMovieSkipPolicy(mission->definition()));
+                endingMovieSkipPolicy(mission->gameId(),
+                                      mission->definition()));
           }
           auto candidate_campaign = *campaign;
           auto candidate_slots = save_slots;
@@ -710,7 +868,8 @@ public:
             break;
           }
           const auto store_decision = storeTitleSaveSlotsWithRecovery(
-              save_path, candidate_slots, pad, previous_buttons, input_);
+              save_path, candidate_slots, campaign_mission_count, pad,
+              previous_buttons, input_);
           if (store_decision == SaveStoreDecision::return_to_title) {
             break;
           }
@@ -720,6 +879,10 @@ public:
                                ? save_slots[*campaign->saveSlot()].carry
                                : std::nullopt;
           if (advance == game::CampaignAdvance::campaign_complete) {
+            if (mission->gameId() == game::GameId::syphon_filter_2) {
+              playSf2CampaignFinalMovie(campaign_cue_path, movie_player, pad,
+                                        previous_buttons);
+            }
             PsyX_Log_Info("Campaign complete\n");
             break;
           }
@@ -745,10 +908,12 @@ public:
                   << " textures and " << mission->worldModelCount()
                   << " world models\n";
         const auto scene_result =
-            scene_viewer.run(*mission, pad, previous_buttons, cue_path_,
+            scene_viewer.run(*mission, pad, previous_buttons,
+                             campaign_cue_path,
                              campaign->maximumUnlockedMission(),
                              mission_start.takePreloadedGameplay(),
-                             mission_start.takePreloadedAudio());
+                             mission_start.takePreloadedAudio(),
+                             campaign_carry);
         previous_buttons = scene_result.previous_buttons;
         if (scene_result.reason == detail::SceneExitReason::mission_selected &&
             scene_result.selected_mission) {
@@ -758,7 +923,8 @@ public:
             // normal mission selection can never move beyond the high-water
             // mark of the loaded save.
             auto replacement =
-                game::CampaignProgress::startUnsaved(selected, false);
+                game::CampaignProgress::startUnsaved(
+                    selected, false, campaign_mission_count);
             if (!replacement) {
               PsyX_Log_Error("Pause mission selection rejected mission %u\n",
                              selected + 1U);
@@ -790,57 +956,54 @@ public:
                 "Campaign transition has no coherent player carry; "
                 "continuing with mission defaults\n");
           }
+          if (!mission->endingMovie().path.empty()) {
+            previous_buttons = movie_player.playStandalone(
+                mission->endingMovie(), pad, previous_buttons,
+                endingMovieSkipPolicy(mission->gameId(),
+                                      mission->definition()));
+          }
+
+          // Retail presents EOL before asking whether to save. A committed
+          // slot therefore points at the next mission before its opening
+          // movie; loading that slot naturally resumes SOL -> briefing.
           const auto save_result =
               replaying_unlocked_mission
                   ? game::CampaignSaveResult{}
                   : runCampaignSaveMenu(*mission, save_slots, pad,
                                         previous_buttons, ui_audio, input_);
-          auto completion_is_saved = false;
+          auto candidate_campaign = *campaign;
+          auto candidate_slots = save_slots;
+          auto advance = game::CampaignAdvance::invalid;
           if (save_result.decision == game::CampaignSaveDecision::save &&
               save_result.slot) {
-            auto staged_campaign = *campaign;
-            auto staged_slots = save_slots;
-            if (!staged_campaign.stageMissionCompletionInSlot(
-                    staged_slots, *save_result.slot, carry_for_next)) {
+            if (!candidate_campaign.stageMissionCompletionInSlot(
+                    candidate_slots, *save_result.slot, carry_for_next)) {
               PsyX_Log_Error("Campaign save transaction rejected state\n");
               break;
             }
-            // The selected slot remains on this mission with a pending EOL.
-            // A shutdown during the following movie therefore resumes the
-            // exact retail handoff instead of skipping it.
+            advance = candidate_campaign.completeMission(candidate_slots);
+            if (advance == game::CampaignAdvance::invalid) {
+              PsyX_Log_Error(
+                  "Campaign save transaction could not advance\n");
+              break;
+            }
             const auto store_decision = storeTitleSaveSlotsWithRecovery(
-                save_path, staged_slots, pad, previous_buttons, input_);
+                save_path, candidate_slots, campaign_mission_count, pad,
+                previous_buttons, input_);
             if (store_decision == SaveStoreDecision::return_to_title) {
               break;
             }
-            if (store_decision == SaveStoreDecision::stored) {
-              *campaign = staged_campaign;
-              save_slots = staged_slots;
-              completion_is_saved = true;
+            if (store_decision != SaveStoreDecision::stored) {
+              candidate_campaign = *campaign;
+              candidate_slots = save_slots;
+              advance = candidate_campaign.completeMissionWithoutSaving();
             }
+          } else {
+            advance = candidate_campaign.completeMissionWithoutSaving();
           }
-          if (!mission->endingMovie().path.empty()) {
-            previous_buttons = movie_player.playStandalone(
-                mission->endingMovie(), pad, previous_buttons,
-                endingMovieSkipPolicy(mission->definition()));
-          }
-
-          auto candidate_campaign = *campaign;
-          auto candidate_slots = save_slots;
-          const auto advance =
-              completion_is_saved
-                  ? candidate_campaign.completeMission(candidate_slots)
-                  : candidate_campaign.completeMissionWithoutSaving();
           if (advance == game::CampaignAdvance::invalid) {
             PsyX_Log_Error("Campaign transition rejected inconsistent state\n");
             break;
-          }
-          if (completion_is_saved) {
-            const auto store_decision = storeTitleSaveSlotsWithRecovery(
-                save_path, candidate_slots, pad, previous_buttons, input_);
-            if (store_decision == SaveStoreDecision::return_to_title) {
-              break;
-            }
           }
           *campaign = candidate_campaign;
           save_slots = candidate_slots;
@@ -848,6 +1011,10 @@ public:
                                ? carry_for_next
                                : std::nullopt;
           if (advance == game::CampaignAdvance::campaign_complete) {
+            if (mission->gameId() == game::GameId::syphon_filter_2) {
+              playSf2CampaignFinalMovie(campaign_cue_path, movie_player, pad,
+                                        previous_buttons);
+            }
             PsyX_Log_Info("Campaign complete\n");
             break;
           }
@@ -863,7 +1030,8 @@ public:
       uploadTitleAssets(assets_);
       configureTitleNotice();
       menu_.completeSearch();
-      menu_.setSaveSlots(loadTitleSaveSlots(save_path));
+      menu_.setSaveSlots(
+          loadTitleSaveSlots(save_path, campaign_mission_count));
     }
     PadStopCom();
   }
@@ -937,6 +1105,7 @@ public:
       static_cast<void>(movie_player.playStandalone(mission_.endingMovie(), pad,
                                                     result.previous_buttons,
                                                     endingMovieSkipPolicy(
+                                                        mission_.gameId(),
                                                         mission_.definition())));
     }
     PadStopCom();

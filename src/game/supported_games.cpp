@@ -176,6 +176,29 @@ missionResources(GameId game, std::uint8_t disc_number) noexcept {
 }
 
 std::optional<std::uint16_t>
+missionRuntimeSelection(GameId game, std::uint8_t disc_number,
+                        std::uint16_t campaign_index) noexcept {
+  if (game != GameId::syphon_filter_2) {
+    return std::nullopt;
+  }
+  if (disc_number == 1U && campaign_index < sf2_disc1_missions.size()) {
+    return campaign_index;
+  }
+  if (disc_number != 2U || campaign_index < 8U ||
+      campaign_index >= 8U + sf2_disc2_missions.size()) {
+    return std::nullopt;
+  }
+  // Interactive identification of the actual mission content behind Disc 2's
+  // reported resource numbers. One-based, the campaign order is
+  // 10,21,9,11,12,13,15..20,14 for Missions 9..21.
+  constexpr std::array<std::uint16_t, 13U> disc2_runtime_selections{
+      9U, 20U, 8U, 10U, 11U, 12U, 14U,
+      15U, 16U, 17U, 18U, 19U, 13U,
+  };
+  return disc2_runtime_selections[campaign_index - 8U];
+}
+
+std::optional<std::uint16_t>
 missionArchiveSelection(GameId game, std::uint8_t disc_number,
                         std::uint16_t selection_index) noexcept {
   if (game != GameId::syphon_filter_2) {
@@ -188,8 +211,8 @@ missionArchiveSelection(GameId game, std::uint8_t disc_number,
       selection_index >= 8U + sf2_disc2_missions.size()) {
     return std::nullopt;
   }
-  // Disc 2's MissionArchive table retains the shared executable order,
-  // while the campaign resource catalog above is in player-facing order.
+  // Disc 2's MissionArchive table retains the shared executable order. This
+  // maps the runtime resource selection—not the player-facing campaign index.
   constexpr std::array<std::uint16_t, 13U> disc2_archive_selections{
       10U, 8U, 11U, 12U, 13U, 20U, 14U,
       15U, 16U, 17U, 18U, 19U, 9U,

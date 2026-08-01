@@ -40,17 +40,33 @@ its authored opening through the save menu and following cinematic. Mission
 startup coverage is broad, but full-campaign completion and product parity are
 not yet claimed.
 
-1. **Presentation stability** — eliminate intermittent world/HUD flicker,
-   stale-frame duplication, texture-atlas corruption, room-residency failures,
-   and remaining collision/floor loss. Keep interactive, cross-room, checkpoint,
-   and F5/F9 renderer regressions.
-2. **Complete SF2 HUD and gameplay UI** — restore the minimap/radar and timer,
-   target/threat bars, objective and pickup messages, general gameplay text,
-   remaining font/weapon atlas regions, and exact cutscene/checkpoint reveal
-   transitions.
-3. **Mission 1 opening fidelity** — preserve the complete Colorado Mountains
-   authored introduction through its parachute handoff instead of entering the
-   correct airborne state after a shortened sequence.
+Current August 2026 gate: the retail two-page presentation, complete gameplay
+HUD/radar/text path, widescreen cinematic overlays, pause/menu roundtrip,
+Mission 1 introduction, checkpoint restart, and in-session F5/F9 are stable in
+the tested routes. A reproducible 42-route matrix now passes 3,000-update
+quick-state and combat/restart coverage for Missions 1--21 across both discs
+with no collision-residency gap or renderer containment. Connected campaign
+save/carry/disc/movie handoff is implemented and deterministically reaches the
+Mission 3-to-4 boundary. Retail-indexed in-mission FMVs are also bridged for
+AIRBASE (`3_2`/`3_3`) and AIRBASEX (`6_3`). Retail success-shell tracing now
+maps every authored EOL selection on both discs, including Mission 21's
+`21_2.STR` and the post-campaign `Z17_1.STR`; all mapped ranges decode strictly.
+The final interactive Mission 3-to-4 handoff and broader natural completion
+playthroughs remain the release gate.
+
+1. **Presentation stability — complete for the current playtest gate.** The
+   persistent two-page renderer, atlas/state handling, room residency, floor
+   requests, and polygon validation eliminate every deterministically reproduced
+   world/HUD flicker, stale-frame, texture-accumulation, floor-loss, and vertex-
+   explosion case. Retain cross-room, checkpoint, pause, and F5/F9 regressions.
+2. **Complete SF2 HUD and gameplay UI — complete for gameplay.** Retail radar,
+   timer, actor dots/threat cones, TARGET/DANGER, health/armor, weapon art,
+   objective/pickup/general text, and cutscene/checkpoint reveal timing render
+   from the authored GPU packets. Pause/map presentation is also stable.
+3. **Mission 1 opening fidelity — complete.** The exact `2_1.STR` opening is
+   mapped, and moving Colorado Mountains' loading-confirmation pulse from PAD
+   poll 8 to poll 1 prevents that input edge from skipping the early parachute
+   choreography. Its 1,800-update neutral route reaches stable gameplay.
 4. **All-mission validation** — complete all 21 missions while auditing
    objectives, conversations, failure conditions, bosses, special mechanics,
    checkpoints, mission-specific audio/resources, and end-of-level transitions.

@@ -343,6 +343,15 @@ public:
         return !video_frames_.empty();
     }
 
+    [[nodiscard]] std::optional<std::pair<int, int>>
+    videoDimensions() const noexcept {
+        if (video_frames_.empty()) {
+            return std::nullopt;
+        }
+        return std::pair{
+            video_frames_.front().width, video_frames_.front().height};
+    }
+
     [[nodiscard]] std::optional<double> nextVideoTimestamp() const noexcept {
         if (video_frames_.empty()) {
             return std::nullopt;
@@ -388,19 +397,25 @@ public:
 
     MovieVideoTexture(const MovieVideoTexture&) = delete;
     MovieVideoTexture& operator=(const MovieVideoTexture&) = delete;
-    MovieVideoTexture() = default;
+    explicit MovieVideoTexture(PsyCrossVideoMode mode) noexcept : mode_(mode) {}
 
     void upload(const media::MovieVideoFrame& frame) {
         const auto expected_bytes =
             static_cast<std::size_t>(frame.width) *
             static_cast<std::size_t>(frame.height) * 4U;
         if (frame.width <= 0 || frame.height <= 0 ||
-            frame.width > movie_video_mode.width ||
-            frame.height > movie_video_mode.height ||
+            frame.width > mode_.width ||
+            frame.height > mode_.height ||
             frame.rgba8888.size() != expected_bytes) {
             throw core::Error{
                 core::ErrorCode::unsupported,
-                "Unsupported STR video dimensions"};
+                "Unsupported STR video dimensions: frame=" +
+                    std::to_string(frame.width) + "x" +
+                    std::to_string(frame.height) + " mode=" +
+                    std::to_string(mode_.width) + "x" +
+                    std::to_string(mode_.height) + " rgba_bytes=" +
+                    std::to_string(frame.rgba8888.size()) + " expected=" +
+                    std::to_string(expected_bytes)};
         }
 
         if (frame.width != width_ || frame.height != height_) {
@@ -454,9 +469,9 @@ public:
             return;
         }
         const auto screen_x =
-            static_cast<short>((movie_video_mode.width - width_) / 2);
+            static_cast<short>((mode_.width - width_) / 2);
         const auto screen_y =
-            static_cast<short>((movie_video_mode.height - height_) / 2);
+            static_cast<short>((mode_.height - height_) / 2);
 
         DR_TPAGE page{};
         // Native RGBA video stays outside the 15-bit PSX VRAM path. DFE remains
@@ -514,7 +529,10 @@ private:
         slice_count_ = 0;
     }
 
-    std::array<Slice, 2U> slices_{};
+    // PsyCross native textures are split into 160-pixel strips. SF1/title
+    // movies require two strips; SF2's 512-pixel story movies require four.
+    std::array<Slice, 4U> slices_{};
+    PsyCrossVideoMode mode_{};
     int width_{};
     int height_{};
     int slice_count_{};
@@ -673,7 +691,9 @@ bool playMovieData(
     std::vector<std::byte> sectors,
     PADRAW& pad,
     std::uint16_t& previous_buttons,
-    bool allow_skip = true) {
+    bool allow_skip = true,
+    bool select_stream_video_mode = false,
+    PsyCrossVideoMode restore_video_mode = gameplay_video_mode) {
     std::cout << "Playing " << path << '\n';
     // OpenAL source state is stream-local.  Reusing a stopped source across
     // consecutive STR files can retain an implementation-defined queue/
@@ -690,8 +710,26 @@ bool playMovieData(
     }
     constexpr std::size_t decoded_ahead_video_frames = 5U;
     stream.fill(decoded_ahead_video_frames, audio);
+    auto active_video_mode = movie_video_mode;
+    std::optional<ScopedPsyCrossVideoMode> stream_video_mode;
+    if (select_stream_video_mode) {
+        const auto dimensions = stream.videoDimensions();
+        if (dimensions &&
+            (dimensions->first <= 0 ||
+             dimensions->first > wide_movie_video_mode.width ||
+             dimensions->second <= 0 ||
+             dimensions->second > wide_movie_video_mode.height)) {
+            throw core::Error{
+                core::ErrorCode::unsupported,
+                "Unsupported STR video dimensions"};
+        }
+        if (dimensions && dimensions->first > movie_video_mode.width) {
+            active_video_mode = wide_movie_video_mode;
+        }
+        stream_video_mode.emplace(active_video_mode, restore_video_mode);
+    }
     media::MovieVideoFrame last_frame;
-    MovieVideoTexture video_texture;
+    MovieVideoTexture video_texture{active_video_mode};
     MoviePlaybackClock clock;
     bool has_frame = false;
 
@@ -730,19 +768,24 @@ bool playMovie(
     game::DiscMovie& movie,
     PADRAW& pad,
     std::uint16_t& previous_buttons,
-    bool allow_skip = true) {
+    bool allow_skip = true,
+    bool select_stream_video_mode = false,
+    PsyCrossVideoMode restore_video_mode = gameplay_video_mode) {
     return playMovieData(
         movie.path, std::move(movie.sectors.bytes), pad, previous_buttons,
-        allow_skip);
+        allow_skip, select_stream_video_mode, restore_video_mode);
 }
 
 bool playMovie(
     const game::DiscMovie& movie,
     PADRAW& pad,
     std::uint16_t& previous_buttons,
-    bool allow_skip = true) {
+    bool allow_skip = true,
+    bool select_stream_video_mode = false,
+    PsyCrossVideoMode restore_video_mode = gameplay_video_mode) {
     return playMovieData(
-        movie.path, movie.sectors.bytes, pad, previous_buttons, allow_skip);
+        movie.path, movie.sectors.bytes, pad, previous_buttons, allow_skip,
+        select_stream_video_mode, restore_video_mode);
 }
 
 bool drainOverlayAudio(
@@ -783,7 +826,7 @@ bool playBackgroundPass(
     constexpr std::size_t decoded_ahead_video_frames = 5U;
     stream.fill(decoded_ahead_video_frames, audio);
     media::MovieVideoFrame last_frame;
-    MovieVideoTexture video_texture;
+    MovieVideoTexture video_texture{movie_video_mode};
     MoviePlaybackClock clock;
     std::uint32_t movie_frame = 0;
     std::uint32_t last_movie_frame = 0;
@@ -830,11 +873,10 @@ std::uint16_t PsyCrossMoviePlayer::playStandalone(
     std::uint16_t previous_buttons,
     StandaloneMovieSkipPolicy skip_policy) {
     PsyX_Log_Info("Standalone movie entered: %s\n", movie.path.c_str());
-    const ScopedPsyCrossVideoMode video_mode{movie_video_mode, gameplay_video_mode};
     PsyCrossAudioContext session;
     const auto completed = playMovie(
         movie, pad, previous_buttons,
-        skip_policy == StandaloneMovieSkipPolicy::allow);
+        skip_policy == StandaloneMovieSkipPolicy::allow, true);
     PsyX_Log_Info(
         "Standalone movie %s: %s\n",
         completed ? "finished" : "skipped",
@@ -848,25 +890,37 @@ std::uint16_t PsyCrossMoviePlayer::play(
     std::uint16_t previous_buttons,
     const MovieOverlayCallbacks& overlay,
     bool play_startup_movies) {
-    const ScopedPsyCrossVideoMode video_mode{movie_video_mode, gameplay_video_mode};
     if (!overlay.update || !overlay.draw) {
         throw core::Error{core::ErrorCode::invalid_argument, "Title overlay callbacks are missing"};
     }
     PsyCrossAudioContext session;
-    if (play_startup_movies) {
-        for (auto& movie : movies.startupMovies()) {
-            if (!playMovie(movie, pad, previous_buttons)) {
-                std::cout << "Skipped " << movie.path << '\n';
+    {
+        const ScopedPsyCrossVideoMode video_mode{
+            movie_video_mode, gameplay_video_mode};
+        if (play_startup_movies) {
+            for (auto& movie : movies.startupMovies()) {
+                if (!playMovie(movie, pad, previous_buttons)) {
+                    std::cout << "Skipped " << movie.path << '\n';
+                }
+            }
+            if (auto* pre_menu = movies.preMenuMovie(); pre_menu != nullptr) {
+                if (!playMovie(
+                        *pre_menu, pad, previous_buttons, true, true,
+                        movie_video_mode)) {
+                    std::cout << "Skipped pre-menu movie " << pre_menu->path
+                              << '\n';
+                }
             }
         }
-    }
-    const auto& background = movies.backgroundMovie();
-    std::cout << "Playing looping menu background " << background.path << '\n';
-    while (playBackgroundPass(background, pad, previous_buttons, overlay)) {
+        const auto& background = movies.backgroundMovie();
+        std::cout << "Playing looping menu background " << background.path << '\n';
+        while (playBackgroundPass(background, pad, previous_buttons, overlay)) {
+        }
     }
     if (overlay.transition_movie) {
         if (auto* transition = overlay.transition_movie(); transition != nullptr) {
-            static_cast<void>(playMovie(*transition, pad, previous_buttons));
+            static_cast<void>(
+                playMovie(*transition, pad, previous_buttons, true, true));
         }
     }
     return previous_buttons;

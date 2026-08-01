@@ -1,4 +1,5 @@
 #include "sf/core/error.hpp"
+#include "sf/core/file_io.hpp"
 #include "sf/game/disc_movie.hpp"
 #include "sf/game/game_disc.hpp"
 #include "sf/game/mission.hpp"
@@ -6,6 +7,7 @@
 #include "sf/media/str_decoder.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +72,8 @@ MovieStats probeMovie(sf::game::DiscMovie movie) {
             movie.path + " does not use raw 2352-byte sectors"};
     }
 
+    const auto raw_bytes = movie.sectors.bytes.size();
+    const auto raw_sectors = movie.sectors.sector_count;
     auto decoder = sf::media::StrDecoder::open(std::move(movie.sectors.bytes));
     const auto frames_per_second = decoder.framesPerSecond();
     if (!std::isfinite(frames_per_second) || frames_per_second <= 0.0 ||
@@ -162,7 +166,9 @@ MovieStats probeMovie(sf::game::DiscMovie movie) {
     std::cout << movie.path << ": " << width << 'x' << height << " @ "
               << frames_per_second << " fps, video=" << stats.video_frames
               << ", audio=" << stats.audio_chunks
-              << ", samples=" << stats.stereo_sample_frames << '\n';
+              << ", samples=" << stats.stereo_sample_frames
+              << ", sectors=" << raw_sectors
+              << ", bytes=" << raw_bytes << '\n';
     return stats;
 }
 
@@ -239,19 +245,62 @@ void probeCampaignMovies(sf::game::GameDisc& disc, ProbeTotals& totals) {
               << ", unique=" << unique_paths.size() << '\n';
 }
 
+void probeSf2RecoveredMovies(sf::game::GameDisc& disc,
+                             ProbeTotals& totals) {
+    // Decode the archive's authoritative directory rather than a hand-picked
+    // mapping subset. This covers frontend, SOL, scripted, EOL, bonus, demo,
+    // and final movies while the campaign tests independently assert role.
+    for (const auto& entry : sf::game::sf2EmbeddedMovieCatalog(disc)) {
+        addStats(
+            totals,
+            probeMovie(sf::game::loadSf2EmbeddedMovie(disc, entry.name)));
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) {
-            std::cerr << "Usage: sf_movie_probe <game.cue>\n";
+        if (argc < 2 || argc > 4) {
+            std::cerr << "Usage: sf_movie_probe <game.cue> "
+                         "[--list|sf2-entry.STR [raw-output.str]]\n";
             return 64;
         }
 
         auto disc = sf::game::GameDisc::open(std::filesystem::path{argv[1]});
         ProbeTotals totals;
-        probeTitleMovies(disc, totals);
-        probeCampaignMovies(disc, totals);
+        if (disc.game() &&
+            disc.game()->id == sf::game::GameId::syphon_filter_2) {
+            if (argc == 3 && std::string_view{argv[2]} == "--list") {
+                std::cout << "index,name,sectors,bytes\n";
+                const auto catalog = sf::game::sf2EmbeddedMovieCatalog(disc);
+                for (std::size_t index = 0; index < catalog.size(); ++index) {
+                    const auto& entry = catalog[index];
+                    std::cout << index << ',' << entry.name << ','
+                              << entry.sector_count << ',' << entry.raw_size
+                              << '\n';
+                }
+                return 0;
+            }
+            if (argc >= 3) {
+                auto movie = sf::game::loadSf2EmbeddedMovie(disc, argv[2]);
+                if (argc == 4) {
+                    sf::core::writeBinaryFile(argv[3], movie.sectors.bytes,
+                                              true);
+                }
+                addStats(totals, probeMovie(std::move(movie)));
+            } else {
+                probeSf2RecoveredMovies(disc, totals);
+            }
+        } else {
+            if (argc >= 3) {
+                throw sf::core::Error{
+                    sf::core::ErrorCode::unsupported,
+                    "Named embedded movie entries are supported only for SF2"};
+            }
+            probeTitleMovies(disc, totals);
+            probeCampaignMovies(disc, totals);
+        }
         std::cout << "sf_movie_probe: PASS movies=" << totals.movies
                   << ", video=" << totals.video_frames
                   << ", audio-movies=" << totals.movies_with_audio

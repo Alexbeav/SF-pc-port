@@ -121,22 +121,42 @@ void testSupportedGames() {
               sf3_resources.back() ==
                   sf::game::GameMissionResource{18U, "SENATE2"},
           "Sequel mission resource mapping mismatch");
+  constexpr std::array<std::uint16_t, 13U> sf2_disc2_runtime_selections{
+      9U, 20U, 8U, 10U, 11U, 12U, 14U,
+      15U, 16U, 17U, 18U, 19U, 13U,
+  };
   constexpr std::array<std::uint16_t, 13U> sf2_disc2_archive_selections{
       10U, 8U, 11U, 12U, 13U, 20U, 14U,
       15U, 16U, 17U, 18U, 19U, 9U,
   };
+  constexpr std::array<std::uint16_t, 13U> sf2_disc2_campaign_archives{
+      8U, 9U, 10U, 11U, 12U, 13U, 14U,
+      15U, 16U, 17U, 18U, 19U, 20U,
+  };
   for (auto index = std::uint16_t{}; index < 8U; ++index) {
+    require(sf::game::missionRuntimeSelection(
+                sf::game::GameId::syphon_filter_2, 1U, index) == index,
+            "SF2 Disc 1 runtime selection mapping mismatch");
     require(sf::game::missionArchiveSelection(
                 sf::game::GameId::syphon_filter_2, 1U, index) == index,
             "SF2 Disc 1 archive selection mapping mismatch");
   }
   for (auto offset = std::uint16_t{};
        offset < sf2_disc2_archive_selections.size(); ++offset) {
+    const auto runtime_selection = sf::game::missionRuntimeSelection(
+        sf::game::GameId::syphon_filter_2, 2U,
+        static_cast<std::uint16_t>(8U + offset));
+    require(runtime_selection == sf2_disc2_runtime_selections[offset],
+            "SF2 Disc 2 runtime resource mapping mismatch");
     require(sf::game::missionArchiveSelection(
                 sf::game::GameId::syphon_filter_2, 2U,
                 static_cast<std::uint16_t>(8U + offset)) ==
                 sf2_disc2_archive_selections[offset],
-            "SF2 Disc 2 archive selection mapping mismatch");
+            "SF2 Disc 2 raw archive mapping mismatch");
+    require(sf::game::missionArchiveSelection(
+                sf::game::GameId::syphon_filter_2, 2U,
+                *runtime_selection) == sf2_disc2_campaign_archives[offset],
+            "SF2 Disc 2 campaign archive mapping mismatch");
   }
   require(!sf::game::missionArchiveSelection(
               sf::game::GameId::syphon_filter_2, 2U, 7U) &&
@@ -391,6 +411,32 @@ void testSf2PresentationFrameCapture() {
   require(sf2_hud.displayedPrimaryBar() == 0U &&
               sf2_hud.displayedPrimaryTrail() == 0U,
           "SF2 zero-health projection retained a synthetic full red bar");
+
+  guest_hud.player_health = 120U;
+  guest_hud.player_armor = 450U;
+  guest_hud.player_owned_items = {(1U << 4U) | (1U << 8U), 1U << 1U};
+  guest_hud.player_equipped_item = 8U;
+  guest_hud.player_magazines[4U] = 17U;
+  guest_hud.player_reserves[4U] = 51U;
+  guest_hud.player_magazines[8U] = 6U;
+  guest_hud.player_reserves[8U] = 19U;
+  guest_hud.player_magazines[33U] = 2U;
+  guest_hud.player_reserves[33U] = 9U;
+  const auto sf2_carry = sf::game::sf2CampaignCarryState(guest_hud);
+  require(sf2_carry && sf2_carry->health == 120U &&
+              sf2_carry->armor == 450U &&
+              sf2_carry->current_weapon ==
+                  static_cast<std::uint8_t>(sf::game::WeaponId::shotgun) &&
+              sf2_carry->magazines[static_cast<std::size_t>(
+                  sf::game::WeaponId::m_16)] == 17U &&
+              sf2_carry->reserves[static_cast<std::size_t>(
+                  sf::game::WeaponId::shotgun)] == 19U &&
+              sf2_carry->sequel &&
+              sf2_carry->sequel->owned_items ==
+                  guest_hud.player_owned_items &&
+              sf2_carry->sequel->magazines[33U] == 2U &&
+              sf2_carry->sequel->reserves[33U] == 9U,
+          "SF2 campaign carry lost retail selection, ammunition, or vitals");
 
   sf::game::Sf2SampledMouseAccumulator mouse{10U};
   mouse.add(10U, 5, -7);

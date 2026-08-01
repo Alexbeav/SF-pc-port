@@ -6516,6 +6516,30 @@ void testLegacyGameplayVmContinuousPump() {
               dispatched.return_value == 0x12345678U &&
               vm.runtime().state().pc == caller_address + 8U,
           "Legacy VM resume did not dispatch the preserved boundary call");
+
+  vm.runtime().reset(caller_address);
+  vm.bindHostCall(boundary_address,
+                  [](sf::game::LegacyHostCallContext &context) {
+                    context.setReturnValue(0x89abcdefU);
+                    context.yieldAfterHostCall();
+                  });
+  const auto yielded = vm.resumeCurrentPc(8U);
+  require(yielded.yieldedAfterHostCall() &&
+              yielded.yielded_host_call == boundary_address &&
+              !yielded.stoppedAtHostBoundary() &&
+              yielded.execution.reason == sf::psx::R3000StopReason::running &&
+              yielded.execution.instructions == 2U &&
+              yielded.host_calls == 1U &&
+              yielded.return_value == 0x89abcdefU &&
+              vm.runtime().state().pc == caller_address + 8U &&
+              vm.runtime().state().gpr[16U] == 0U,
+          "Legacy VM did not yield immediately after the requested host call");
+  const auto resumed_after_yield = vm.resumeCurrentPc(1U);
+  require(resumed_after_yield.execution.reason ==
+                  sf::psx::R3000StopReason::instruction_budget &&
+              resumed_after_yield.execution.instructions == 1U &&
+              vm.runtime().state().gpr[16U] == 1U,
+          "Legacy VM host-call yield did not preserve the guest continuation");
 }
 
 void testGuestPadBridge() {

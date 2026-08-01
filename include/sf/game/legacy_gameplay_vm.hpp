@@ -130,6 +130,11 @@ public:
   void continueGuestInstruction() noexcept {
     continue_guest_instruction_ = true;
   }
+  // Complete this HLE call normally, but return control to the caller before
+  // executing its guest continuation. This is used for host-owned work that
+  // must happen at an exact retail call boundary (for example STR playback)
+  // while preserving the live guest call stack for a later resume.
+  void yieldAfterHostCall() noexcept { yield_after_host_call_ = true; }
 
   [[nodiscard]] bool read8(std::uint32_t address,
                            std::uint8_t &value) const noexcept;
@@ -157,6 +162,7 @@ private:
   psx::R3000Runtime &runtime_;
   bool accepted_{true};
   bool continue_guest_instruction_{};
+  bool yield_after_host_call_{};
 };
 
 using LegacyHostCall = std::function<void(LegacyHostCallContext &)>;
@@ -166,12 +172,16 @@ struct LegacyGameplayVmResult {
   std::uint32_t return_value{};
   std::uint64_t host_calls{};
   std::optional<std::uint32_t> host_boundary;
+  std::optional<std::uint32_t> yielded_host_call;
 
   [[nodiscard]] bool completed() const noexcept {
     return execution.reason == psx::R3000StopReason::returned;
   }
   [[nodiscard]] bool stoppedAtHostBoundary() const noexcept {
     return host_boundary.has_value();
+  }
+  [[nodiscard]] bool yieldedAfterHostCall() const noexcept {
+    return yielded_host_call.has_value();
   }
 };
 
@@ -1145,8 +1155,9 @@ public:
   // scheduler-owned boundary.
   [[nodiscard]] LegacyGameplayVmResult
   resumeCurrentPcClockNeutral(std::uint64_t execution_budget = 1'000'000U);
-  // Stop before dispatching the host call at boundary_address. A later
-  // resumeCurrentPc() observes the same PC and dispatches that call normally.
+  // Stop before executing boundary_address. When the address has a bound
+  // host call, a later resumeCurrentPc() observes and dispatches it normally;
+  // an unbound address is also useful as an exact guest continuation fence.
   [[nodiscard]] LegacyGameplayVmResult
   runCurrentPcUntilHostBoundary(std::uint32_t boundary_address,
                                 std::uint64_t execution_budget = 1'000'000U);

@@ -63,6 +63,13 @@ struct SupportedGame {
 [[nodiscard]] std::span<const GameMissionResource>
 missionResources(GameId game, std::uint8_t disc_number) noexcept;
 
+// Converts a player-facing campaign mission index to the retail resource
+// selector used by that disc. SF2 Disc 2 stores several resources out of
+// campaign order; other mapped discs are identity selections.
+[[nodiscard]] std::optional<std::uint16_t>
+missionRuntimeSelection(GameId game, std::uint8_t disc_number,
+                        std::uint16_t campaign_index) noexcept;
+
 [[nodiscard]] std::optional<std::uint16_t>
 missionArchiveSelection(GameId game, std::uint8_t disc_number,
                         std::uint16_t selection_index) noexcept;

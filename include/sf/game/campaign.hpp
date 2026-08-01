@@ -65,16 +65,20 @@ class CampaignProgress final {
 public:
   [[nodiscard]] static std::optional<CampaignProgress>
   startUnsaved(std::uint32_t mission_index,
-               bool opening_movie_already_played) noexcept;
+               bool opening_movie_already_played,
+               std::uint32_t mission_count = 0U) noexcept;
   [[nodiscard]] static std::optional<CampaignProgress>
   startNew(TitleSaveSlots &slots, std::uint32_t mission_index,
-           bool opening_movie_already_played) noexcept;
+           bool opening_movie_already_played,
+           std::uint32_t mission_count = 0U) noexcept;
   [[nodiscard]] static std::optional<CampaignProgress>
   startNewInSlot(TitleSaveSlots &slots, std::size_t save_slot,
                  std::uint32_t mission_index,
-                 bool opening_movie_already_played) noexcept;
+                 bool opening_movie_already_played,
+                 std::uint32_t mission_count = 0U) noexcept;
   [[nodiscard]] static std::optional<CampaignProgress>
-  resume(const TitleSaveSlots &slots, std::size_t save_slot) noexcept;
+  resume(const TitleSaveSlots &slots, std::size_t save_slot,
+         std::uint32_t mission_count = 0U) noexcept;
 
   [[nodiscard]] std::optional<std::size_t> saveSlot() const noexcept {
     return save_slot_;
@@ -118,7 +122,8 @@ private:
   CampaignProgress(
       std::optional<std::size_t> save_slot, std::uint32_t mission_index,
       std::uint32_t maximum_unlocked_mission, bool opening_movie_handled,
-      std::optional<std::uint32_t> pending_eol_mission = std::nullopt) noexcept;
+      std::optional<std::uint32_t> pending_eol_mission,
+      std::uint32_t mission_count) noexcept;
 
   [[nodiscard]] CampaignAdvance advance() noexcept;
 
@@ -127,6 +132,7 @@ private:
   std::uint32_t maximum_unlocked_mission_{};
   bool opening_movie_handled_{};
   std::optional<std::uint32_t> pending_eol_mission_;
+  std::uint32_t mission_count_{};
   bool active_{true};
 };
 

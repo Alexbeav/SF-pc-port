@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -38,11 +39,31 @@ struct MissionDefinition {
 };
 
 [[nodiscard]] std::span<const MissionDefinition> missionCatalog() noexcept;
+[[nodiscard]] std::span<const MissionDefinition>
+missionCatalog(GameId game) noexcept;
+
+// Reads one raw Mode 2 STR range from SF2's MOVIE1.HOG/MOVIE2.HOG catalog.
+// The returned bytes retain their 2352-byte sectors for the native decoder.
+[[nodiscard]] DiscMovie loadSf2EmbeddedMovie(GameDisc &disc,
+                                             std::string_view name);
+struct Sf2EmbeddedMovieCatalogEntry {
+  std::string name;
+  std::uint32_t sector_offset{};
+  std::uint32_t sector_count{};
+  std::size_t raw_size{};
+};
+[[nodiscard]] std::vector<Sf2EmbeddedMovieCatalogEntry>
+sf2EmbeddedMovieCatalog(GameDisc &disc);
 [[nodiscard]] const MissionDefinition &missionDefinition(std::uint32_t index);
 [[nodiscard]] const MissionDefinition &missionDefinition(
     GameId game, std::uint32_t index);
 [[nodiscard]] std::span<const std::string_view>
 missionScriptedMoviePaths(std::uint32_t index) noexcept;
+[[nodiscard]] std::span<const std::string_view>
+missionScriptedMoviePaths(GameId game, std::uint32_t index) noexcept;
+[[nodiscard]] std::span<const std::uint8_t>
+missionScriptedMovieCatalogIndices(GameId game,
+                                   std::uint32_t index) noexcept;
 
 class MissionPackage final {
 public:

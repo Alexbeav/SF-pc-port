@@ -53,18 +53,25 @@ public:
     static constexpr std::size_t startup_movie_count = 3;
     static constexpr std::size_t movie_count = startup_movie_count + 2;
 
-    [[nodiscard]] static TitleMovies load(GameDisc& disc);
+    [[nodiscard]] static TitleMovies load(
+        GameDisc& disc,
+        std::optional<std::string_view> pre_menu_movie = std::nullopt);
 
     [[nodiscard]] std::vector<TitleMovie>& sequence() noexcept { return sequence_; }
     [[nodiscard]] const std::vector<TitleMovie>& sequence() const noexcept { return sequence_; }
     [[nodiscard]] std::span<TitleMovie> startupMovies() noexcept;
     [[nodiscard]] const TitleMovie& backgroundMovie() const;
     [[nodiscard]] const TitleMovie& trainingMovie() const;
+    [[nodiscard]] TitleMovie* preMenuMovie() noexcept {
+        return pre_menu_movie_ ? &*pre_menu_movie_ : nullptr;
+    }
 
 private:
-    explicit TitleMovies(std::vector<TitleMovie> sequence);
+    explicit TitleMovies(std::vector<TitleMovie> sequence,
+                         std::optional<TitleMovie> pre_menu_movie = std::nullopt);
 
     std::vector<TitleMovie> sequence_;
+    std::optional<TitleMovie> pre_menu_movie_;
 };
 
 enum class TitlePhase {
@@ -116,10 +123,12 @@ enum class TitleSaveMigrationStatus {
 };
 
 [[nodiscard]] TitleSaveLoadResult loadTitleSaveSlotsFile(
-    const std::filesystem::path& path) noexcept;
+    const std::filesystem::path& path,
+    std::uint32_t mission_count = 0U) noexcept;
 [[nodiscard]] bool storeTitleSaveSlotsFile(
     const std::filesystem::path& path,
-    const TitleSaveSlots& slots) noexcept;
+    const TitleSaveSlots& slots,
+    std::uint32_t mission_count = 0U) noexcept;
 [[nodiscard]] TitleSaveLocation titleSaveLocation(
     const std::filesystem::path& cue_path,
     std::string_view supported_game_serial,
@@ -128,7 +137,8 @@ enum class TitleSaveMigrationStatus {
     const std::filesystem::path& cue_path,
     std::string_view supported_game_serial) noexcept;
 [[nodiscard]] TitleSaveMigrationStatus migrateLegacyTitleSaveSlotsFile(
-    const TitleSaveLocation& location) noexcept;
+    const TitleSaveLocation& location,
+    std::uint32_t mission_count = 0U) noexcept;
 
 enum class TitleCommand {
     none,

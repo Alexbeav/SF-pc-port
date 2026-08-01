@@ -299,4 +299,18 @@ RawSectorFile Iso9660Image::readRawSectorFile(const std::string& path) {
     };
 }
 
+RawSectorFile Iso9660Image::readRawSectorRange(
+    std::uint32_t lba, std::uint32_t sector_count) {
+    if (sector_count == 0U || lba >= sector_count_ ||
+        sector_count > sector_count_ - lba) {
+        throw core::Error{core::ErrorCode::invalid_argument,
+                          "Raw sector range is outside the disc image"};
+    }
+    return RawSectorFile{
+        track_.sectorSize(),
+        sector_count,
+        readRawExtent(lba, sector_count),
+    };
+}
+
 } // namespace sf::disc

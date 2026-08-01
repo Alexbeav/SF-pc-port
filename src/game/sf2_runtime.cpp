@@ -4,6 +4,7 @@
 #include "sf/game/embedded_hog.hpp"
 #include "sf/game/game_disc.hpp"
 #include "sf/game/legacy_gameplay_vm.hpp"
+#include "sf/game/mission.hpp"
 #include "sf/game/runtime_profile.hpp"
 #include "sf/game/sf2_runtime.hpp"
 
@@ -395,6 +396,60 @@ void projectSf2GuestHud(
                 guest.threat_state_valid && guest.player_danger == 100U);
 }
 
+std::optional<CampaignCarryState>
+sf2CampaignCarryState(const Sf2GuestRuntimeDiagnostics &guest) noexcept {
+  CampaignCarryState state;
+  state.sequel = SequelCampaignCarryState{
+      .current_item = static_cast<std::uint8_t>(
+          guest.player_equipped_item & 0x3fU),
+      .owned_items = guest.player_owned_items,
+      .magazines = guest.player_magazines,
+      .reserves = guest.player_reserves,
+  };
+  state.owned_weapons = 1U; // unarmed is always available
+  for (auto item = std::size_t{}; item < sf2_inventory_item_count; ++item) {
+    const auto owned =
+        (guest.player_owned_items[item / 32U] &
+         (std::uint32_t{1U} << (item % 32U))) != 0U;
+    const auto weapon = sf2WeaponForItem(static_cast<std::uint8_t>(item));
+    if (!owned || !weapon) {
+      continue;
+    }
+    const auto slot = static_cast<std::size_t>(*weapon);
+    if (slot >= weapon_slot_count ||
+        (campaign_persistent_weapon_mask &
+         (std::uint32_t{1U} << slot)) == 0U) {
+      continue;
+    }
+    state.owned_weapons |= std::uint32_t{1U} << slot;
+    // A few SF2 item IDs are variants of one native weapon slot. They are
+    // mutually exclusive in ordinary play; max is deterministic and avoids
+    // manufacturing ammunition if a diagnostic state contains both.
+    state.magazines[slot] =
+        std::max(state.magazines[slot], guest.player_magazines[item]);
+    state.reserves[slot] =
+        std::max(state.reserves[slot], guest.player_reserves[item]);
+  }
+  if (const auto equipped = sf2WeaponForItem(static_cast<std::uint8_t>(
+          guest.player_equipped_item & 0x3fU))) {
+    const auto slot = static_cast<unsigned>(*equipped);
+    if (slot < weapon_slot_count &&
+        (state.owned_weapons & (std::uint32_t{1U} << slot)) != 0U) {
+      state.current_weapon = static_cast<std::uint8_t>(slot);
+    }
+  }
+  if ((state.owned_weapons &
+       (std::uint32_t{1U} << state.current_weapon)) == 0U) {
+    state.current_weapon = static_cast<std::uint8_t>(
+        std::countr_zero(state.owned_weapons));
+  }
+  state.health = guest.player_health;
+  state.armor = guest.player_armor;
+  return validCampaignCarry(state)
+             ? std::optional<CampaignCarryState>{state}
+             : std::nullopt;
+}
+
 Sf2SampledMouseAccumulator::Sf2SampledMouseAccumulator(
     std::uint64_t initial_sample) noexcept
     : sample_(initial_sample) {}
@@ -514,8 +569,16 @@ public:
       }
       const auto resources =
           missionResources(disc_.game()->id, disc_.game()->disc_number);
+      const auto runtime_selection = missionRuntimeSelection(
+          disc_.game()->id, disc_.game()->disc_number,
+          static_cast<std::uint16_t>(mission_index));
+      if (!runtime_selection) {
+        markFault("SF2 guest runtime has no mapped retail resource");
+        return;
+      }
+      runtime_selection_ = *runtime_selection;
       const auto mission = std::ranges::find(
-          resources, static_cast<std::uint16_t>(mission_index),
+          resources, runtime_selection_,
           &GameMissionResource::selection_index);
       if (mission == resources.end()) {
         markFault("SF2 guest runtime does not contain the selected mission");
@@ -800,6 +863,278 @@ public:
     const auto interaction = invokeNested(0x80041054U, arguments);
     return interaction.completed() || interaction.stoppedAtHostBoundary();
   }
+  [[nodiscard]] bool
+  requestScriptedMovieForProbe(std::uint8_t catalog_index) noexcept {
+    constexpr auto sf2_movie_catalog_capacity = 27U;
+    if (!ready_ || faulted_ ||
+        catalog_index >= sf2_movie_catalog_capacity) {
+      return false;
+    }
+    const std::array arguments{static_cast<std::uint32_t>(catalog_index)};
+    const auto request = invokeNested(0x8002c558U, arguments);
+    return request.completed() || request.stoppedAtHostBoundary() ||
+           request.yieldedAfterHostCall();
+  }
+  [[nodiscard]] std::optional<std::uint8_t>
+  consumeScriptedMovieRequest() noexcept {
+    if (!pending_scripted_movie_catalog_index_ ||
+        active_scripted_movie_catalog_index_) {
+      return std::nullopt;
+    }
+    active_scripted_movie_catalog_index_ =
+        pending_scripted_movie_catalog_index_;
+    pending_scripted_movie_catalog_index_.reset();
+    return active_scripted_movie_catalog_index_;
+  }
+  [[nodiscard]] bool
+  completeScriptedMovie(std::uint8_t catalog_index) noexcept {
+    if (!ready_ || faulted_ ||
+        active_scripted_movie_catalog_index_ != catalog_index) {
+      return false;
+    }
+    // Decoder init is a synchronous call inside MovieLoader (0x8002C188).
+    // Native playback replaced that call and yielded at its return PC. Let
+    // MovieLoader execute its authentic zero-result setup (0x8002C0BC) and
+    // return to its caller before invoking the asynchronous completion path.
+    // Calling MovieCompletion while still inside MovieLoader leaves stale
+    // mission callbacks installed; Missions 19/20 expose that immediately.
+    if (!scripted_movie_host_yielded_ ||
+        vm_.runtime().state().pc != 0x8002c27cU) {
+      return false;
+    }
+    std::uint32_t movie_loader_return{};
+    if (!vm_.runtime().read32(vm_.runtime().state().gpr[29U] + 0x24U,
+                              movie_loader_return)) {
+      return false;
+    }
+    scripted_movie_host_yielded_ = false;
+    const auto loader = runUntilBoundary(movie_loader_return);
+    if (!loader.stoppedAtHostBoundary()) {
+      return false;
+    }
+    // All movie globals and the application-state stack are now authentic.
+    // Retail MovieCompletion owns decoder teardown, restores the prior state,
+    // and emits the exact 0x001E0000 | catalog_index script event.
+    const auto completion = invokeNested(0x8002be68U, {});
+    if (!completion.completed() && !completion.stoppedAtHostBoundary()) {
+      return false;
+    }
+    active_scripted_movie_catalog_index_.reset();
+    scripted_movie_host_yielded_ = false;
+    return true;
+  }
+  [[nodiscard]] bool requestMissionSuccessForProbe() noexcept {
+    if (!ready_ || faulted_ || mission_complete_requested_) {
+      return false;
+    }
+    // invokeNested stops at a bound entry before executing the original
+    // function. Temporarily remove only the success-entry observer, seed the
+    // same observation it would have made, and retain the shared 0x8002D8D0
+    // observer. Reaching that callback therefore still proves retail's real
+    // success routine selected the terminal outcome path.
+    if (!vm_.unbindHostCall(0x8002d6d8U)) {
+      return false;
+    }
+    // Direct bootstrap retains the archive-order selection during gameplay.
+    // Disc 2's overlays consult that value, so translate to the player-facing
+    // campaign cursor only at the exact terminal handoff.
+    if (!vm_.runtime().write16(
+            0x8012b02cU,
+            static_cast<std::uint16_t>(mission_index_))) {
+      return false;
+    }
+    completion_flow_trace_active_ = true;
+    vm_.runtime().setWriteTrace(0x801279a8U, 0x801279a9U);
+    vm_.runtime().setWriteTracePc(0U, 0U);
+    ++mission_success_events_;
+    mission_success_pending_ = true;
+    // a0=1 is the routine's verified force-through argument. The authored
+    // action normally passes zero after satisfying every objective; a probe
+    // cannot cheaply reproduce those mission-specific predicates, so it
+    // exercises the identical accepted branch explicitly.
+    const std::array arguments{1U};
+    const auto result = invokeNested(0x8002d6d8U, arguments);
+    if (const auto &trace = vm_.runtime().writeTraceHit();
+        trace.width != 0U) {
+      ++movie_selection_writes_;
+      last_movie_selection_writer_pc_ = trace.pc;
+      last_movie_selection_writer_instruction_ = trace.instruction;
+      last_movie_selection_write_value_ = trace.value;
+      const auto slot = static_cast<std::size_t>(
+          (movie_selection_writes_ - 1U) % movie_selection_writer_pcs_.size());
+      movie_selection_writer_pcs_[slot] = trace.pc;
+      movie_selection_write_values_[slot] = trace.value;
+      vm_.runtime().clearWriteTraceHit();
+    }
+    vm_.bindHostCall(
+        0x8002d6d8U, [this](LegacyHostCallContext &context) {
+          if (!context.write16(
+                  0x8012b02cU,
+                  static_cast<std::uint16_t>(mission_index_))) {
+            context.rejectHostCall();
+            return;
+          }
+          ++mission_success_events_;
+          mission_success_pending_ = true;
+          context.continueGuestInstruction();
+        });
+    return result.completed() || result.stoppedAtHostBoundary();
+  }
+  [[nodiscard]] bool resumeMissionShellForProbe() noexcept {
+    if (!ready_ || faulted_ || !mission_complete_requested_) {
+      return false;
+    }
+    mission_complete_requested_ = false;
+    mission_success_pending_ = false;
+    completion_flow_trace_active_ = true;
+    vm_.runtime().setWriteTrace(0x801279a8U, 0x801279a9U);
+    vm_.runtime().setWriteTracePc(0U, 0U);
+    return true;
+  }
+  [[nodiscard]] bool
+  applyCampaignCarryState(const CampaignCarryState &state) noexcept {
+    if (!ready_ || faulted_ || !validCampaignCarry(state)) {
+      return false;
+    }
+    const auto item_for_weapon = [](WeaponId weapon)
+        -> std::optional<std::uint8_t> {
+      switch (weapon) {
+      case WeaponId::unarmed: return std::uint8_t{0U};
+      case WeaponId::silenced_9mm: return std::uint8_t{1U};
+      case WeaponId::pistol_9mm: return std::uint8_t{2U};
+      case WeaponId::knife: return std::uint8_t{20U};
+      case WeaponId::pistol_45: return std::uint8_t{3U};
+      case WeaponId::g_18: return std::uint8_t{10U};
+      case WeaponId::combat_shotgun: return std::uint8_t{9U};
+      case WeaponId::shotgun: return std::uint8_t{8U};
+      case WeaponId::pk_102: return std::uint8_t{7U};
+      case WeaponId::m_16: return std::uint8_t{4U};
+      case WeaponId::biz_2: return std::uint8_t{11U};
+      case WeaponId::hk_5: return std::uint8_t{5U};
+      case WeaponId::nightvision_rifle: return std::uint8_t{16U};
+      case WeaponId::sniper_rifle: return std::uint8_t{14U};
+      case WeaponId::taser: return std::uint8_t{18U};
+      case WeaponId::m_79: return std::uint8_t{21U};
+      case WeaponId::k3g4: return std::uint8_t{12U};
+      case WeaponId::fragmentation_grenade: return std::uint8_t{22U};
+      case WeaponId::gas_grenade: return std::uint8_t{23U};
+      default: return std::nullopt;
+      }
+    };
+    constexpr std::uint32_t player_pointer = 0x8012a574U;
+    constexpr std::uint32_t health_pointer_offset = 0x18U;
+    constexpr std::uint32_t inventory_pointer_offset = 0x20U;
+    constexpr std::uint32_t health_armor_offset = 0x06U;
+    constexpr std::uint32_t health_value_offset = 0x08U;
+    constexpr std::uint32_t inventory_owned_offset = 0x3cU;
+    constexpr std::uint32_t inventory_ammo_offset = 0x44U;
+    constexpr std::uint32_t inventory_equipped_offset = 0xccU;
+    std::uint32_t player{};
+    std::uint32_t health{};
+    std::uint32_t inventory{};
+    std::array<std::uint32_t, 2U> owned{};
+    if (!vm_.runtime().read32(player_pointer, player) || player == 0U ||
+        !vm_.runtime().read32(player + health_pointer_offset, health) ||
+        health == 0U ||
+        !vm_.runtime().read32(player + inventory_pointer_offset, inventory) ||
+        inventory == 0U ||
+        !vm_.runtime().read32(inventory + inventory_owned_offset, owned[0U]) ||
+        !vm_.runtime().read32(inventory + inventory_owned_offset + 4U,
+                              owned[1U])) {
+      return false;
+    }
+    const auto snapshot = vm_.captureSnapshot();
+    auto committed = false;
+    if (state.sequel) {
+      auto exact_inventory_written = true;
+      for (auto item = std::size_t{}; item < sf2_inventory_item_count; ++item) {
+        const auto ammo =
+            static_cast<std::uint32_t>(state.sequel->reserves[item]) |
+            (static_cast<std::uint32_t>(state.sequel->magazines[item]) <<
+             16U);
+        exact_inventory_written =
+            exact_inventory_written &&
+            vm_.runtime().write32(
+                inventory + inventory_ammo_offset +
+                    static_cast<std::uint32_t>(item * 4U),
+                ammo);
+      }
+      committed =
+          exact_inventory_written &&
+          vm_.runtime().write32(inventory + inventory_owned_offset,
+                                state.sequel->owned_items[0U]) &&
+          vm_.runtime().write32(inventory + inventory_owned_offset + 4U,
+                                state.sequel->owned_items[1U]) &&
+          vm_.runtime().write32(inventory + inventory_equipped_offset,
+                                state.sequel->current_item) &&
+          vm_.runtime().write16(health + health_value_offset, state.health) &&
+          vm_.runtime().write16(health + health_armor_offset, state.armor);
+    } else {
+      // V4 and older saves contain only the native weapon projection. Keep
+      // their compatible import path while new SF2 saves use the exact block.
+      for (auto item = std::size_t{}; item < sf2_inventory_item_count; ++item) {
+        const auto mapped = sf2WeaponForItem(static_cast<std::uint8_t>(item));
+        if (!mapped ||
+            (campaign_persistent_weapon_mask &
+             (std::uint32_t{1U} << static_cast<unsigned>(*mapped))) == 0U) {
+          continue;
+        }
+        owned[item / 32U] &= ~(std::uint32_t{1U} << (item % 32U));
+        if (!vm_.runtime().write32(
+                inventory + inventory_ammo_offset +
+                    static_cast<std::uint32_t>(item * 4U),
+                0U)) {
+          static_cast<void>(vm_.restoreSnapshot(snapshot));
+          return false;
+        }
+      }
+      for (auto slot = std::size_t{}; slot < weapon_slot_count; ++slot) {
+        if ((state.owned_weapons & (std::uint32_t{1U} << slot)) == 0U) {
+          continue;
+        }
+        const auto item = item_for_weapon(static_cast<WeaponId>(slot));
+        if (!item || *item == 0U) {
+          continue;
+        }
+        owned[*item / 32U] |= std::uint32_t{1U} << (*item % 32U);
+        const auto ammo = static_cast<std::uint32_t>(state.reserves[slot]) |
+                          (static_cast<std::uint32_t>(state.magazines[slot])
+                           << 16U);
+        if (!vm_.runtime().write32(
+                inventory + inventory_ammo_offset +
+                    static_cast<std::uint32_t>(*item * 4U),
+                ammo)) {
+          static_cast<void>(vm_.restoreSnapshot(snapshot));
+          return false;
+        }
+      }
+      const auto equipped =
+          item_for_weapon(static_cast<WeaponId>(state.current_weapon));
+      committed = equipped &&
+          vm_.runtime().write32(inventory + inventory_owned_offset,
+                                owned[0U]) &&
+          vm_.runtime().write32(inventory + inventory_owned_offset + 4U,
+                                owned[1U]) &&
+          vm_.runtime().write32(inventory + inventory_equipped_offset,
+                                *equipped) &&
+          vm_.runtime().write16(health + health_value_offset, state.health) &&
+          vm_.runtime().write16(health + health_armor_offset, state.armor);
+    }
+    if (!committed) {
+      static_cast<void>(vm_.restoreSnapshot(snapshot));
+      return false;
+    }
+    const auto checkpoint =
+        invokeNested(0x800ad48cU, std::span<const std::uint32_t>{});
+    if (!checkpoint.completed() && !checkpoint.stoppedAtHostBoundary()) {
+      static_cast<void>(vm_.restoreSnapshot(snapshot));
+      return false;
+    }
+    // A failure restart must return to the carried chapter state rather than
+    // the package's standalone defaults captured during bootstrap.
+    checkpoint_captured_ = true;
+    return true;
+  }
   [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
   presentationFrame() const noexcept {
     return presentation_frame_;
@@ -822,6 +1157,10 @@ public:
       state.gpu_draw_environment_words = gpu_draw_environment_words_;
       state.gpu_draw_environment_valid = gpu_draw_environment_valid_;
       state.vram_setup_packets = vram_setup_packets_;
+      state.menu_gameplay_vram_setup_packets =
+          menu_gameplay_vram_setup_packets_;
+      state.previous_application_state = previous_application_state_;
+      state.menu_transition_active = menu_transition_active_;
       state.pending_immediate_gpu_packets = pending_immediate_gpu_packets_;
       state.presentation_frame = presentation_frame_;
       state.pending_presentation = pending_presentation_;
@@ -842,6 +1181,18 @@ public:
       state.checkpoint_captured = checkpoint_captured_;
       state.retail_restore_active = retail_restore_active_;
       state.retail_restore_start_frame = retail_restore_start_frame_;
+      state.mission_success_pending = mission_success_pending_;
+      state.mission_complete_requested = mission_complete_requested_;
+      state.mission_success_events = mission_success_events_;
+      state.mission_failure_events = mission_failure_events_;
+      state.scripted_movie_handoffs = scripted_movie_handoffs_;
+      state.last_scripted_movie_catalog_index =
+          last_scripted_movie_catalog_index_;
+      state.pending_scripted_movie_catalog_index =
+          pending_scripted_movie_catalog_index_;
+      state.active_scripted_movie_catalog_index =
+          active_scripted_movie_catalog_index_;
+      state.scripted_movie_host_yielded = scripted_movie_host_yielded_;
       state.ui_text_event_count = ui_text_event_count_;
       state.ui_text_events = ui_text_events_;
       state.mission_timer_handle = mission_timer_handle_;
@@ -882,6 +1233,10 @@ public:
       published_sequence_ = quick_state_->published_sequence;
       gpu_gp0_stream_.swap(gpu_gp0_stream);
       vram_setup_packets_.swap(vram_setup_packets);
+      menu_gameplay_vram_setup_packets_ =
+          quick_state_->menu_gameplay_vram_setup_packets;
+      previous_application_state_ = quick_state_->previous_application_state;
+      menu_transition_active_ = quick_state_->menu_transition_active;
       pending_immediate_gpu_packets_.swap(pending_immediate_gpu_packets);
       active_script_programs_.swap(active_script_programs);
       gpu_gp0_scan_ = quick_state_->gpu_gp0_scan;
@@ -905,6 +1260,20 @@ public:
       retail_restore_active_ = quick_state_->retail_restore_active;
       retail_restore_start_frame_ =
           quick_state_->retail_restore_start_frame;
+      mission_success_pending_ = quick_state_->mission_success_pending;
+      mission_complete_requested_ =
+          quick_state_->mission_complete_requested;
+      mission_success_events_ = quick_state_->mission_success_events;
+      mission_failure_events_ = quick_state_->mission_failure_events;
+      scripted_movie_handoffs_ = quick_state_->scripted_movie_handoffs;
+      last_scripted_movie_catalog_index_ =
+          quick_state_->last_scripted_movie_catalog_index;
+      pending_scripted_movie_catalog_index_ =
+          quick_state_->pending_scripted_movie_catalog_index;
+      active_scripted_movie_catalog_index_ =
+          quick_state_->active_scripted_movie_catalog_index;
+      scripted_movie_host_yielded_ =
+          quick_state_->scripted_movie_host_yielded;
       ui_text_event_count_ = quick_state_->ui_text_event_count;
       ui_text_events_ = quick_state_->ui_text_events;
       mission_timer_handle_ = quick_state_->mission_timer_handle;
@@ -1046,6 +1415,40 @@ public:
         last_renderer_text_writer_pc_;
     result.last_renderer_text_writer_instruction =
         last_renderer_text_writer_instruction_;
+    result.render_view_adds = render_view_adds_;
+    result.render_view_removes = render_view_removes_;
+    result.last_render_view_added = last_render_view_added_;
+    result.last_render_view_removed = last_render_view_removed_;
+    static_cast<void>(vm_.runtime().read32(
+        vm_.runtime().state().gpr[28U] + 0x4fcU,
+        result.render_view_head));
+    if (result.player_instance != 0U &&
+        vm_.runtime().read32(result.player_instance + 0x0cU,
+                             result.player_render_node) &&
+        result.player_render_node != 0U) {
+      static_cast<void>(vm_.runtime().read32(
+          result.player_render_node + 0x104U,
+          result.player_render_flags));
+      static_cast<void>(vm_.runtime().read32(
+          result.player_render_node + 0x18cU,
+          result.player_render_next));
+    }
+    auto render_view = result.render_view_head;
+    for (auto index = std::size_t{};
+         index < result.render_view_chain.size() && render_view != 0U;
+         ++index) {
+      result.render_view_chain[index] = render_view;
+      std::uint32_t node{};
+      if (!vm_.runtime().read32(render_view + 0x0cU, node) || node == 0U) {
+        break;
+      }
+      result.render_view_chain_nodes[index] = node;
+      static_cast<void>(vm_.runtime().read32(
+          node + 0x104U, result.render_view_chain_flags[index]));
+      if (!vm_.runtime().read32(node + 0x18cU, render_view)) {
+        break;
+      }
+    }
     result.rejected_renderer_ordering_tables =
         rejected_renderer_ordering_tables_;
     result.observed_gpu_submissions = observed_gpu_submissions_;
@@ -1163,6 +1566,9 @@ public:
         last_rejected_sound_voice_;
     result.last_rejected_sound_voice_caller =
         last_rejected_sound_voice_caller_;
+    result.retained_vram_setup_packets = vram_setup_packets_.size();
+    result.menu_vram_snapshots = menu_vram_snapshots_;
+    result.menu_vram_restores = menu_vram_restores_;
     for (const auto &packet : vram_setup_packets_) {
       if (packet.guest_address == 0U ||
           sf2GpuCommandKind(packet) !=
@@ -1398,11 +1804,43 @@ public:
     result.last_async_completion_caller = last_async_completion_caller_;
     result.input_samples = host_pad_samples_;
     result.checkpoint_restores = alpha_checkpoint_restores_;
+    result.mission_success_events = mission_success_events_;
+    result.mission_failure_events = mission_failure_events_;
+    result.mission_complete_requested = mission_complete_requested_;
+    result.campaign_advance_calls = campaign_advance_calls_;
+    result.movie_request_calls = movie_request_calls_;
+    result.movie_playback_init_calls = movie_playback_init_calls_;
+    result.scripted_movie_handoffs = scripted_movie_handoffs_;
+    result.last_scripted_movie_catalog_index =
+        last_scripted_movie_catalog_index_;
+    result.selected_movie_catalog_index = selected_movie_catalog_index_;
+    result.last_movie_request_arguments = last_movie_request_arguments_;
+    result.last_movie_playback_arguments =
+        last_movie_playback_arguments_;
+    result.movie_selection_writes = movie_selection_writes_;
+    result.last_movie_selection_writer_pc =
+        last_movie_selection_writer_pc_;
+    result.last_movie_selection_writer_instruction =
+        last_movie_selection_writer_instruction_;
+    result.last_movie_selection_write_value =
+        last_movie_selection_write_value_;
+    result.movie_selection_writer_pcs = movie_selection_writer_pcs_;
+    result.movie_selection_write_values = movie_selection_write_values_;
+    result.movie_playback_catalog_history =
+        movie_playback_catalog_history_;
+    static_cast<void>(
+        vm_.runtime().read32(0x80156bd8U, result.title_transition_mode));
+    static_cast<void>(
+        vm_.runtime().read32(0x80156bdcU, result.title_substate));
+    static_cast<void>(
+        vm_.runtime().read8(0x8011f608U, result.mounted_campaign_disc));
     static_cast<void>(
         vm_.runtime().read32(profile_.application_state,
                              result.application_state));
-    static_cast<void>(vm_.runtime().read32(
-        0x8012b02cU, result.selected_mission_index));
+    std::uint16_t selected_mission_index{};
+    if (vm_.runtime().read16(0x8012b02cU, selected_mission_index)) {
+      result.selected_mission_index = selected_mission_index;
+    }
     static_cast<void>(
         vm_.runtime().read32(profile_.system_clock, result.system_clock));
     return result;
@@ -1411,6 +1849,17 @@ public:
   [[nodiscard]] bool advanceHostUpdate() noexcept {
     if (!ready_ || faulted_) {
       return false;
+    }
+    // Decoder init yielded with its retail caller still live. Do not allow a
+    // caller that missed the handoff to run MOVIE.OVL ahead of native STR
+    // playback; completeScriptedMovie() is the only operation that releases
+    // this boundary.
+    if (scripted_movie_host_yielded_) {
+      return true;
+    }
+    observeMissionOutcomeState();
+    if (mission_complete_requested_) {
+      return true;
     }
     // Preserve the 60 Hz guest/input contract: one public update retires one
     // retail display-list submission. Presentation publication is separate;
@@ -1424,6 +1873,13 @@ public:
       if (!advanceGuestBoundary(display_submitted)) {
         return false;
       }
+      if (scripted_movie_host_yielded_) {
+        return true;
+      }
+      observeMissionOutcomeState();
+      if (mission_complete_requested_) {
+        return true;
+      }
       if (display_submitted && presentation_frame_) {
         return true;
       }
@@ -1432,7 +1888,30 @@ public:
     return false;
   }
 
+  [[nodiscard]] bool missionCompleteRequested() const noexcept {
+    return mission_complete_requested_;
+  }
+
 private:
+  void observeMissionOutcomeState() noexcept {
+    if (!mission_success_pending_ || mission_complete_requested_) {
+      return;
+    }
+    std::uint32_t application_state{};
+    if (!vm_.runtime().read32(profile_.application_state,
+                              application_state)) {
+      return;
+    }
+    // Accepted MissionSuccess pushes state 11. Its overlay lifecycle can
+    // advance through loading state 9 into movie state 4 without publishing
+    // an intervening display list, so state 4 is the bounded fallback. The
+    // success-entry latch keeps unrelated scripted movies out of this path.
+    if (application_state == 11U || application_state == 4U) {
+      mission_complete_requested_ = true;
+      mission_success_pending_ = false;
+    }
+  }
+
   void normalizeInitialAuxiliaryRendererState() {
     // The direct TITLE-to-mission handoff leaves TITLE's full-screen map-grid
     // list attached to the resident auxiliary renderer. Retail's checkpoint
@@ -2020,6 +2499,19 @@ private:
     return authoredWorldPolygonCount(frame) >= 100U;
   }
 
+  [[nodiscard]] static bool
+  isAuthoredPresentationBase(const Sf2PresentationFrame &frame) noexcept {
+    // MENU.OVL (application state 7) owns a complete retail screen but does
+    // not contain a 3D world OT. Its first per-page submission is the small
+    // base/menu-status list, followed by the larger text/map list in the same
+    // clock. Treat that first visible list as a composition base; retaining
+    // the gameplay-only polygon threshold here freezes presentation on the
+    // preceding loading frame and leaves the host target black.
+    return isAuthoredWorldFrame(frame) ||
+           (frame.application_state == 7U &&
+            frame.draw_command_count != 0U);
+  }
+
   [[nodiscard]] std::vector<std::uint32_t> captureGpuSideEffects() {
     auto words = vm_.machine().takeGpuGp0Words();
     auto gp1_words = vm_.machine().takeGpuGp1Words();
@@ -2172,7 +2664,7 @@ private:
 
   void publishPendingPresentation() {
     if (!pending_presentation_ ||
-        !isAuthoredWorldFrame(*pending_presentation_)) {
+        !isAuthoredPresentationBase(*pending_presentation_)) {
       pending_presentation_.reset();
       return;
     }
@@ -2306,7 +2798,18 @@ private:
     const auto boundary = runUntilBoundary(profile_.gpu_submission_entry);
     if (const auto &trace = vm_.runtime().writeTraceHit();
         trace.width != 0U) {
-      ++hud_primitive_writes_;
+      if (completion_flow_trace_active_) {
+        ++movie_selection_writes_;
+        last_movie_selection_writer_pc_ = trace.pc;
+        last_movie_selection_writer_instruction_ = trace.instruction;
+        last_movie_selection_write_value_ = trace.value;
+        const auto slot = static_cast<std::size_t>(
+            (movie_selection_writes_ - 1U) %
+            movie_selection_writer_pcs_.size());
+        movie_selection_writer_pcs_[slot] = trace.pc;
+        movie_selection_write_values_[slot] = trace.value;
+      } else {
+        ++hud_primitive_writes_;
       auto slot = hud_primitive_writer_pcs_.size();
       for (auto index = std::size_t{};
            index < hud_primitive_writer_pcs_.size(); ++index) {
@@ -2328,6 +2831,7 @@ private:
           hud_primitive_writer_buffer_masks_[slot] |=
               static_cast<std::uint8_t>(1U << build_buffer);
         }
+      }
       }
       vm_.runtime().clearWriteTraceHit();
     }
@@ -2356,6 +2860,16 @@ private:
         return false;
       }
       vm_.runtime().clearWriteWatchHit();
+    }
+    if (boundary.yieldedAfterHostCall() &&
+        boundary.yielded_host_call == 0x80142e60U &&
+        pending_scripted_movie_catalog_index_) {
+      // The decoder-init replacement deliberately yields before MOVIE.OVL's
+      // continuation can install or service decoder callbacks. Return to the
+      // product so it can present the STR, then resume this exact guest stack
+      // through completeScriptedMovie(). No GPU boundary was retired here.
+      scripted_movie_host_yielded_ = true;
+      return true;
     }
     if (!boundary.stoppedAtHostBoundary()) {
       if (faulted_) {
@@ -2450,6 +2964,31 @@ private:
       markFault("could not read SF2 application state");
       return false;
     }
+    // MENU uses transient uploads in the gameplay texture region. The real
+    // GPU retains each application's authored VRAM contents, while the native
+    // bridge replays a single retained upload cache before every frame. Keep
+    // the pre-menu cache isolated so MENU.TIM/SCOPED.TIM cannot remain resident
+    // over actor textures after state 7 hands control back to gameplay.
+    if (previous_application_state_ == 0U && application_state == 9U &&
+        !menu_gameplay_vram_setup_packets_) {
+      menu_gameplay_vram_setup_packets_ = vram_setup_packets_;
+      menu_transition_active_ = false;
+      ++menu_vram_snapshots_;
+    }
+    if (application_state == 7U && menu_gameplay_vram_setup_packets_) {
+      menu_transition_active_ = true;
+    }
+    if (application_state == 0U && previous_application_state_ != 0U &&
+        menu_gameplay_vram_setup_packets_) {
+      if (menu_transition_active_) {
+        vram_setup_packets_ =
+            std::move(*menu_gameplay_vram_setup_packets_);
+        ++menu_vram_restores_;
+      }
+      menu_gameplay_vram_setup_packets_.reset();
+      menu_transition_active_ = false;
+    }
+    previous_application_state_ = application_state;
     if (retail_restore_active_ && application_state == 0U &&
         guest_frame_ > retail_restore_start_frame_ + 60U) {
       retail_restore_active_ = false;
@@ -2558,7 +3097,7 @@ private:
         static_cast<void>(vm_.runtime().read16(
             retail_display_buffer_index,
             frame->retail_display_buffer_index));
-        if (isAuthoredWorldFrame(*frame)) {
+        if (isAuthoredPresentationBase(*frame)) {
           // ClearImage/GP0(02) is emitted immediately before DrawOTag rather
           // than linked into the OT. It belongs at the front of this world
           // composition; dropping it leaves both persistent native pages to
@@ -2578,7 +3117,7 @@ private:
       const auto auxiliary_targets_world_page =
           auxiliary && frame->retail_draw_buffer_index ==
                            pending_presentation_->retail_draw_buffer_index;
-      if (frame && (isAuthoredWorldFrame(*frame) || auxiliary)) {
+      if (frame && (isAuthoredPresentationBase(*frame) || auxiliary)) {
         frame->submission_roots.push_back(frame->ordering_table_root);
         frame->submission_draw_counts.push_back(
             frame->draw_command_count);
@@ -2748,6 +3287,11 @@ private:
     std::array<std::uint32_t, 6U> gpu_draw_environment_words{};
     std::array<bool, 6U> gpu_draw_environment_valid{};
     std::vector<Sf2GpuPacket> vram_setup_packets;
+    std::optional<std::vector<Sf2GpuPacket>>
+        menu_gameplay_vram_setup_packets;
+    std::uint32_t previous_application_state{
+        std::numeric_limits<std::uint32_t>::max()};
+    bool menu_transition_active{};
     std::vector<Sf2GpuPacket> pending_immediate_gpu_packets;
     std::shared_ptr<const Sf2PresentationFrame> presentation_frame;
     std::optional<Sf2PresentationFrame> pending_presentation;
@@ -2768,6 +3312,15 @@ private:
     bool checkpoint_captured{};
     bool retail_restore_active{};
     std::uint64_t retail_restore_start_frame{};
+    bool mission_success_pending{};
+    bool mission_complete_requested{};
+    std::uint64_t mission_success_events{};
+    std::uint64_t mission_failure_events{};
+    std::uint64_t scripted_movie_handoffs{};
+    std::uint32_t last_scripted_movie_catalog_index{0xffffffffU};
+    std::optional<std::uint8_t> pending_scripted_movie_catalog_index;
+    std::optional<std::uint8_t> active_scripted_movie_catalog_index;
+    bool scripted_movie_host_yielded{};
     std::uint64_t ui_text_event_count{};
     std::array<Sf2GuestUiTextEvent, 64U> ui_text_events{};
     std::uint16_t mission_timer_handle{0xffffU};
@@ -2873,6 +3426,101 @@ private:
           // checkpoint loader. Preserve this boundary as an observation hook
           // and execute the original restore instead of rewinding a host
           // whole-machine snapshot from an unrelated instruction boundary.
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x8002d6d8U, [this](LegacyHostCallContext &context) {
+          ++mission_success_events_;
+          mission_success_pending_ = true;
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x8002da38U, [this](LegacyHostCallContext &context) {
+          ++mission_failure_events_;
+          // Both outcomes later request application state 3. A failure must
+          // explicitly cancel a pending success before that shared handoff.
+          mission_success_pending_ = false;
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x8002d8d0U, [this](LegacyHostCallContext &context) {
+          if (mission_success_pending_) {
+            mission_complete_requested_ = true;
+            mission_success_pending_ = false;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x8002c95cU, [this](LegacyHostCallContext &context) {
+          ++campaign_advance_calls_;
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80154054U, [this](LegacyHostCallContext &context) {
+          ++movie_request_calls_;
+          for (auto index = std::size_t{};
+               index < last_movie_request_arguments_.size(); ++index) {
+            last_movie_request_arguments_[index] = context.argument(index);
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80142e60U, [this](LegacyHostCallContext &context) {
+          ++movie_playback_init_calls_;
+          for (auto index = std::size_t{};
+               index < last_movie_playback_arguments_.size(); ++index) {
+            last_movie_playback_arguments_[index] = context.argument(index);
+          }
+          constexpr auto movie_catalog_begin = 0x801279d0U;
+          constexpr auto movie_catalog_end_begin = 0x80127a3cU;
+          constexpr auto movie_catalog_capacity = 27U;
+          selected_movie_catalog_index_ = 0xffffffffU;
+          for (auto index = 0U; index < movie_catalog_capacity; ++index) {
+            std::uint32_t begin{};
+            std::uint32_t end{};
+            if (context.read32(movie_catalog_begin + index * 4U, begin) &&
+                context.read32(movie_catalog_end_begin + index * 4U, end) &&
+                begin == last_movie_playback_arguments_[0U] &&
+                end == last_movie_playback_arguments_[1U]) {
+              selected_movie_catalog_index_ = index;
+              break;
+            }
+          }
+          const auto history_slot = static_cast<std::size_t>(
+              (movie_playback_init_calls_ - 1U) %
+              movie_playback_catalog_history_.size());
+          movie_playback_catalog_history_[history_slot] =
+              selected_movie_catalog_index_;
+          const auto mapped = missionScriptedMovieCatalogIndices(
+              GameId::syphon_filter_2, mission_index_);
+          const auto mapped_movie =
+              selected_movie_catalog_index_ <= 0xffU &&
+              std::ranges::find(
+                  mapped,
+                  static_cast<std::uint8_t>(selected_movie_catalog_index_)) !=
+                  mapped.end();
+          if (selected_movie_catalog_index_ <= 0xffU &&
+              (mapped_movie || completion_flow_trace_active_)) {
+            const auto catalog_index =
+                static_cast<std::uint8_t>(selected_movie_catalog_index_);
+            // Retail has already copied the full request, pushed state 9,
+            // restored the prior state at MovieLoader, and prepared its
+            // completion callback. Substitute only the decoder itself; the
+            // host presents the exact embedded STR, then invokes retail's
+            // normal MovieCompletion routine. The completion-flow probe also
+            // accepts an unmapped catalog index here solely to discover the
+            // exact retail-selected inter-mission movies; product playback
+            // remains restricted to the active mission's checked mapping.
+            if (!pending_scripted_movie_catalog_index_ &&
+                !active_scripted_movie_catalog_index_) {
+              pending_scripted_movie_catalog_index_ = catalog_index;
+              ++scripted_movie_handoffs_;
+              last_scripted_movie_catalog_index_ = catalog_index;
+            }
+            context.setReturnValue(0U);
+            context.yieldAfterHostCall();
+            return;
+          }
           context.continueGuestInstruction();
         });
     // Observe retail actor-damage dispatch without replacing it. This gives
@@ -3049,6 +3697,18 @@ private:
             }
             ++player_damage_events_;
           }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80066b54U, [this](LegacyHostCallContext &context) {
+          ++render_view_adds_;
+          last_render_view_added_ = context.argument(0U);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80066be0U, [this](LegacyHostCallContext &context) {
+          ++render_view_removes_;
+          last_render_view_removed_ = context.argument(0U);
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -4117,7 +4777,7 @@ private:
     // then misinterpreted as common descriptors.
     const auto archive_selection = missionArchiveSelection(
         disc_.game()->id, disc_.game()->disc_number,
-        static_cast<std::uint16_t>(mission_index_));
+        runtime_selection_);
     if (!archive_selection ||
         !vm_.runtime().write32(0x801582d4U, *archive_selection) ||
         !vm_.runtime().write32(0x80156bdcU, 17U) ||
@@ -4240,6 +4900,20 @@ private:
   }
 
   void bindMissionPad() {
+    if (mission_index_ == 0U) {
+      vm_.bindHostCall(
+          0x80029c0cU, [this](LegacyHostCallContext &context) {
+            if (!loading_confirm_sent_) {
+              // COLO's loading state and its unusually early skippable
+              // parachute choreography consume the same Cross sample. Take
+              // the retail accepted branch directly on the first dispatcher
+              // pass, leaving the authored controller record neutral.
+              context.setRegister(16U, 1U);
+              loading_confirm_sent_ = true;
+            }
+            context.continueGuestInstruction();
+          });
+    }
     vm_.bindHostCall(
         0x800222bcU, [this](LegacyHostCallContext &context) {
           const auto index = context.argument(1);
@@ -4273,7 +4947,13 @@ private:
           mission_pad_record_ = record;
           ++mission_pad_polls_;
           auto state = host_pad_;
-          if (!loading_confirm_sent_ && mission_pad_polls_ >= 8U) {
+          // Colorado Mountains begins its skippable parachute choreography
+          // unusually early. Send its required loading confirmation on the
+          // first poll so the release edge retires before the scene becomes
+          // skippable; the later generic pulse can land inside that intro.
+          constexpr auto loading_confirm_poll = 8U;
+          if (mission_index_ != 0U && !loading_confirm_sent_ &&
+              mission_pad_polls_ >= loading_confirm_poll) {
             state.buttons = 0x4000U;
             loading_confirm_sent_ = true;
           }
@@ -4445,6 +5125,7 @@ private:
   bool ui_instruction_trace_capped_{};
   DiscCdRomMedia cdrom_media_;
   std::uint32_t mission_index_{};
+  std::uint16_t runtime_selection_{};
   std::string fog_path_;
   std::vector<std::byte> fog_bytes_;
   std::vector<std::byte> init_overlay_;
@@ -4466,6 +5147,13 @@ private:
   std::array<std::uint32_t, 6U> gpu_draw_environment_words_{};
   std::array<bool, 6U> gpu_draw_environment_valid_{};
   std::vector<Sf2GpuPacket> vram_setup_packets_;
+  std::optional<std::vector<Sf2GpuPacket>>
+      menu_gameplay_vram_setup_packets_;
+  std::uint32_t previous_application_state_{
+      std::numeric_limits<std::uint32_t>::max()};
+  bool menu_transition_active_{};
+  std::uint64_t menu_vram_snapshots_{};
+  std::uint64_t menu_vram_restores_{};
   std::vector<Sf2GpuPacket> pending_immediate_gpu_packets_;
   std::uint64_t callback_ticks_{};
   std::uint64_t audio_callback_ticks_{};
@@ -4495,6 +5183,10 @@ private:
   std::int32_t last_world_collision_room_{};
   std::uint32_t last_player_floor_request_{};
   std::uint64_t player_floor_probes_{};
+  std::uint64_t render_view_adds_{};
+  std::uint64_t render_view_removes_{};
+  std::uint32_t last_render_view_added_{};
+  std::uint32_t last_render_view_removed_{};
   std::uint64_t player_floor_probe_true_{};
   std::uint64_t player_floor_probe_false_{};
   std::uint32_t player_floor_false_streak_{};
@@ -4637,6 +5329,29 @@ private:
   bool retail_restore_active_{};
   std::uint64_t retail_restore_start_frame_{};
   std::uint64_t alpha_checkpoint_restores_{};
+  bool mission_success_pending_{};
+  bool mission_complete_requested_{};
+  std::uint64_t mission_success_events_{};
+  std::uint64_t mission_failure_events_{};
+  std::uint64_t campaign_advance_calls_{};
+  std::uint64_t movie_request_calls_{};
+  std::uint64_t movie_playback_init_calls_{};
+  std::uint64_t scripted_movie_handoffs_{};
+  std::uint32_t last_scripted_movie_catalog_index_{0xffffffffU};
+  std::optional<std::uint8_t> pending_scripted_movie_catalog_index_;
+  std::optional<std::uint8_t> active_scripted_movie_catalog_index_;
+  std::uint32_t selected_movie_catalog_index_{0xffffffffU};
+  std::array<std::uint32_t, 4U> last_movie_request_arguments_{};
+  std::array<std::uint32_t, 4U> last_movie_playback_arguments_{};
+  std::uint64_t movie_selection_writes_{};
+  std::uint32_t last_movie_selection_writer_pc_{};
+  std::uint32_t last_movie_selection_writer_instruction_{};
+  std::uint32_t last_movie_selection_write_value_{};
+  std::array<std::uint32_t, 4U> movie_selection_writer_pcs_{};
+  std::array<std::uint32_t, 4U> movie_selection_write_values_{};
+  std::array<std::uint32_t, 8U> movie_playback_catalog_history_{};
+  bool completion_flow_trace_active_{};
+  bool scripted_movie_host_yielded_{};
   bool ready_{};
   bool faulted_{};
   std::string stage_{"construction"};
@@ -4702,8 +5417,40 @@ bool Sf2GuestMissionRuntime::startPlayerObjectInteractionForProbe(
   return impl_->startPlayerObjectInteractionForProbe(selector);
 }
 
+bool Sf2GuestMissionRuntime::requestScriptedMovieForProbe(
+    std::uint8_t catalog_index) noexcept {
+  return impl_->requestScriptedMovieForProbe(catalog_index);
+}
+
+std::optional<std::uint8_t>
+Sf2GuestMissionRuntime::consumeScriptedMovieRequest() noexcept {
+  return impl_->consumeScriptedMovieRequest();
+}
+
+bool Sf2GuestMissionRuntime::completeScriptedMovie(
+    std::uint8_t catalog_index) noexcept {
+  return impl_->completeScriptedMovie(catalog_index);
+}
+
+bool Sf2GuestMissionRuntime::requestMissionSuccessForProbe() noexcept {
+  return impl_->requestMissionSuccessForProbe();
+}
+
+bool Sf2GuestMissionRuntime::resumeMissionShellForProbe() noexcept {
+  return impl_->resumeMissionShellForProbe();
+}
+
+bool Sf2GuestMissionRuntime::applyCampaignCarryState(
+    const CampaignCarryState &state) noexcept {
+  return impl_->applyCampaignCarryState(state);
+}
+
 bool Sf2GuestMissionRuntime::advanceHostUpdate() noexcept {
   return impl_->advanceHostUpdate();
+}
+
+bool Sf2GuestMissionRuntime::missionCompleteRequested() const noexcept {
+  return impl_->missionCompleteRequested();
 }
 
 const std::shared_ptr<const Sf2PresentationFrame> &

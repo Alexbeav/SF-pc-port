@@ -101,8 +101,8 @@ void printUsage() {
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
          "[neutral|forward|combat|crouch|quickstate|quickobjective|"
-         "crouchback|objective|objective-dialogue|weapons|ui|uiobjective] "
-         "[resource-index-0-based]\n"
+         "crouchback|objective|objective-dialogue|weapons|pause|complete|completeflow|movies|ui|uiobjective] "
+         "[resource-index-0-based] [scripted-movie-ordinal-0-based]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -140,6 +140,20 @@ std::uint32_t parseSf2MissionIndex(const char *text) {
         "SF2 mission index must be in the range 0..20"};
   }
   return index;
+}
+
+std::uint32_t parseSf2MovieOrdinal(const char *text) {
+  const std::string_view value{text};
+  std::uint32_t ordinal{};
+  const auto *const value_end = value.data() + value.size();
+  const auto [end, error] =
+      std::from_chars(value.data(), value_end, ordinal);
+  if (error != std::errc{} || end != value_end || ordinal > 7U) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::invalid_format,
+        "SF2 scripted movie ordinal must be in the range 0..7"};
+  }
+  return ordinal;
 }
 
 int inspect(const char *path) {
@@ -6466,8 +6480,12 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool crouch_back,
                            bool quick_state, bool objective_event,
                            bool weapon_cycle, bool skip_objective_scene,
-                           bool scan_ui_objects,
-                           std::uint32_t mission_index) {
+                           bool scan_ui_objects, bool pause_flow,
+                           bool mission_complete_probe,
+                           bool retail_completion_flow,
+                           bool compact_movie_trace,
+                           std::uint32_t mission_index,
+                           std::uint32_t scripted_movie_ordinal) {
   sf::game::Sf2GuestMissionRuntime runtime{
       std::filesystem::path{cue_path}, mission_index};
   if (!runtime.ready()) {
@@ -6504,11 +6522,19 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     }
   };
   auto first_restore_frame = std::uint32_t{};
+  auto mission_completion_observed = false;
+  auto mission_shell_resumed = false;
+  auto campaign_carry_applied = false;
+  auto next_mission_carry_verified = false;
+  auto completion_carry = std::optional<sf::game::CampaignCarryState>{};
+  auto completion_baseline = sf::game::Sf2GuestRuntimeDiagnostics{};
   auto first_sprite_frame = std::uint32_t{};
   auto first_target_frame = std::uint32_t{};
   auto target_active_frames = std::uint32_t{};
   auto maximum_player_danger = std::uint8_t{};
   auto maximum_player_threat_count = std::uint16_t{};
+  auto maximum_radar_actor_count = std::uint8_t{};
+  auto valid_radar_heading_seen = false;
   auto last_objective_bits =
       runtime.diagnostics().objective_completion_bits;
   auto last_objective_event_count =
@@ -6584,9 +6610,43 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   equipped_item_transitions.emplace_back(0U, last_equipped_item);
   auto observed_renderer_repairs =
       runtime.diagnostics().renderer_text_repairs;
+  auto last_application_state = runtime.diagnostics().application_state;
+  auto pause_menu_frame = std::optional<std::uint32_t>{};
+  auto pause_gameplay_presentation_seen = false;
+  auto pause_menu_presentation_seen = false;
+  auto pause_restored_presentation_seen = false;
+  auto pause_menu_maximum_draw_commands = std::size_t{};
+  auto pause_gameplay_digest = sf::core::Sha256Digest{};
+  auto pause_menu_digest = sf::core::Sha256Digest{};
+  auto pause_restored_digest = sf::core::Sha256Digest{};
+  std::vector<std::pair<std::uint32_t, std::uint32_t>>
+      application_state_transitions;
+  application_state_transitions.emplace_back(0U, last_application_state);
   auto first_rejected_sound_bank_frame = std::uint32_t{};
   auto first_rejected_sound_bank_caller = std::uint32_t{};
   auto first_rejected_sound_bank_magic = std::uint32_t{};
+  const auto scripted_movie_catalog_indices =
+      sf::game::missionScriptedMovieCatalogIndices(
+          sf::game::GameId::syphon_filter_2, mission_index);
+  if (compact_movie_trace &&
+      scripted_movie_ordinal >= scripted_movie_catalog_indices.size()) {
+    std::cerr << "SF2 movie probe ordinal is not mapped for mission "
+              << mission_index + 1U << ": ordinal="
+              << scripted_movie_ordinal << '\n';
+    return 10;
+  }
+  const auto expected_scripted_movie_catalog_index =
+      compact_movie_trace
+          ? std::optional<std::uint8_t>{
+                scripted_movie_catalog_indices[scripted_movie_ordinal]}
+          : std::nullopt;
+  auto scripted_movie_probe_requested = false;
+  auto observed_scripted_movie_request =
+      std::optional<std::uint8_t>{};
+  auto scripted_movie_completion_observed = false;
+  std::vector<std::uint8_t> completion_movie_catalog_indices;
+  const auto scripted_movie_probe_frame =
+      frames > 200U ? frames - 200U : frames / 2U;
   constexpr std::array<std::array<double, 2U>, 6U>
       objective_waypoints{{
           {3448.0, -25485.0},
@@ -6597,6 +6657,94 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
           {4206.0, -25824.0},
       }};
   for (std::uint32_t frame = 0U; frame < frames; ++frame) {
+    if (expected_scripted_movie_catalog_index &&
+        frame == scripted_movie_probe_frame) {
+      scripted_movie_probe_requested =
+          runtime.requestScriptedMovieForProbe(
+              *expected_scripted_movie_catalog_index);
+      if (!scripted_movie_probe_requested) {
+        std::cerr << "SF2 movie probe could not submit the retail request\n";
+        return 10;
+      }
+    }
+    if (expected_scripted_movie_catalog_index &&
+        scripted_movie_probe_requested &&
+        !observed_scripted_movie_request) {
+      if (!runtime.captureQuickState()) {
+        std::cerr << "SF2 movie probe could not snapshot the loader state\n";
+        return 10;
+      }
+      const auto pending_movie = runtime.consumeScriptedMovieRequest();
+      if (!pending_movie) {
+        // MovieRequest_Start changes application state asynchronously; allow
+        // the authentic state-9 loader callback to reach decoder init.
+      } else if (!runtime.restoreQuickState()) {
+        std::cerr << "SF2 movie probe could not restore the pending "
+                     "handoff\n";
+        return 10;
+      } else {
+        const auto replayed_scripted_movie_request =
+            runtime.consumeScriptedMovieRequest();
+        if (replayed_scripted_movie_request != pending_movie) {
+          std::cerr << "SF2 movie handoff changed across F5/F9 restore\n";
+          return 10;
+        }
+        observed_scripted_movie_request =
+            replayed_scripted_movie_request;
+        if (!runtime.completeScriptedMovie(
+                *observed_scripted_movie_request)) {
+          std::cerr << "SF2 movie probe could not run retail completion\n";
+          return 10;
+        }
+        scripted_movie_completion_observed = true;
+      }
+    }
+    if (retail_completion_flow) {
+      if (const auto completion_movie =
+              runtime.consumeScriptedMovieRequest()) {
+        completion_movie_catalog_indices.push_back(*completion_movie);
+        if (!runtime.completeScriptedMovie(*completion_movie)) {
+          std::cerr << "SF2 completion-flow could not retire movie catalog "
+                    << static_cast<unsigned int>(*completion_movie) << '\n';
+          return 10;
+        }
+      }
+    }
+    if (mission_complete_probe && frame == 900U) {
+      sf::game::CampaignCarryState carry;
+      const auto m16 = static_cast<std::size_t>(sf::game::WeaponId::m_16);
+      const auto shotgun =
+          static_cast<std::size_t>(sf::game::WeaponId::shotgun);
+      carry.current_weapon = static_cast<std::uint8_t>(m16);
+      carry.owned_weapons = 1U | (1U << m16) | (1U << shotgun);
+      carry.magazines[m16] = 17U;
+      carry.reserves[m16] = 51U;
+      carry.magazines[shotgun] = 6U;
+      carry.reserves[shotgun] = 19U;
+      carry.health = 123U;
+      carry.armor = 321U;
+      carry.sequel = sf::game::SequelCampaignCarryState{};
+      carry.sequel->current_item = 4U;
+      carry.sequel->owned_items = {(1U << 4U) | (1U << 8U), 1U << 1U};
+      carry.sequel->magazines[4U] = 17U;
+      carry.sequel->reserves[4U] = 51U;
+      carry.sequel->magazines[8U] = 6U;
+      carry.sequel->reserves[8U] = 19U;
+      carry.sequel->magazines[33U] = 2U;
+      carry.sequel->reserves[33U] = 9U;
+      campaign_carry_applied = runtime.applyCampaignCarryState(carry);
+      if (!campaign_carry_applied) {
+        std::cerr << "SF2 completion probe could not apply campaign carry\n";
+        return 10;
+      }
+      completion_carry = carry;
+    }
+    if (mission_complete_probe && frame == 1'000U &&
+        ((completion_baseline = runtime.diagnostics()),
+         !runtime.requestMissionSuccessForProbe())) {
+      std::cerr << "SF2 completion probe could not enter retail success\n";
+      return 10;
+    }
     if (quick_state && frame == quick_load_frame) {
       if (!runtime.restoreQuickState()) {
         std::cerr << "SF2 quick-state probe could not restore\n";
@@ -6751,6 +6899,37 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
       }
     }
+    if (pause_flow) {
+      // Long authored openings do not all unlock Start at the same host
+      // frame. Retry a sampled pulse while gameplay owns state 0, then wait
+      // for the observed state-7 menu before sending the close pulse.
+      pad.buttons = static_cast<std::uint16_t>(pad.buttons & ~0x0008U);
+      const auto pause_state = runtime.diagnostics();
+      if (!pause_menu_frame && pause_state.application_state == 7U) {
+        pause_menu_frame = frame;
+      }
+      const auto pulse_window = (frame % 120U) < 6U;
+      const auto opening = frame >= 1'000U &&
+                           pause_state.menu_vram_snapshots == 0U &&
+                           pause_state.application_state == 0U &&
+                           pulse_window;
+      const auto closing = pause_menu_frame &&
+                           frame >= *pause_menu_frame + 120U &&
+                           pause_state.menu_vram_restores == 0U &&
+                           pause_state.application_state == 7U &&
+                           pulse_window;
+      if (opening || closing) {
+        pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0008U);
+      }
+    }
+    if (retail_completion_flow && mission_shell_resumed) {
+      // State 4 is the retail post-mission save/menu overlay. Periodic Cross
+      // edges accept its default path while preserving the guest's own menu
+      // and movie-selection logic for this diagnostic continuation.
+      pad.buttons = (frame % 120U) < 6U ? 0x4000U : 0U;
+      pad.left_x = 0x80U;
+      pad.left_y = 0x80U;
+    }
     if (quick_state && quick_original_segment) {
       quick_state_replay_pads.push_back(pad);
     } else if (quick_state && quick_replay_segment) {
@@ -6764,15 +6943,56 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     }
     runtime.setHostPadState(pad);
     if (!runtime.advanceHostUpdate()) {
+      if (runtime.missionCompleteRequested()) {
+        mission_completion_observed = true;
+        break;
+      }
+      if (retail_completion_flow) {
+        const auto stopped = runtime.diagnostics();
+        std::cerr << "SF2 completion-flow stopped: state="
+                  << stopped.application_state << " mission="
+                  << stopped.selected_mission_index << " calls="
+                  << stopped.campaign_advance_calls << "/"
+                  << stopped.movie_request_calls << "/"
+                  << stopped.movie_playback_init_calls << "/catalog="
+                  << stopped.selected_movie_catalog_index << ":request=0x"
+                  << std::hex << std::uppercase;
+        for (const auto argument : stopped.last_movie_request_arguments) {
+          std::cerr << argument << "/";
+        }
+        std::cerr << ":playback=0x";
+        for (const auto argument : stopped.last_movie_playback_arguments) {
+          std::cerr << argument << "/";
+        }
+        std::cerr << std::dec << " fault=" << runtime.faultDetail() << '\n';
+      }
       std::cerr << "SF2 product runtime stopped at frame " << frame << ": "
                 << runtime.faultDetail() << '\n';
       return 7;
+    }
+    if (runtime.missionCompleteRequested()) {
+      mission_completion_observed = true;
+      if (retail_completion_flow && !mission_shell_resumed) {
+        if (!runtime.resumeMissionShellForProbe()) {
+          std::cerr << "SF2 completion-flow probe could not resume retail "
+                       "mission shell\n";
+          return 10;
+        }
+        mission_shell_resumed = true;
+      } else {
+        break;
+      }
     }
     while (const auto count = runtime.takePcm(pcm)) {
       pcm_frames += count;
       inspect_pcm(count);
     }
     const auto frame_diagnostics = runtime.diagnostics();
+    if (frame_diagnostics.application_state != last_application_state) {
+      last_application_state = frame_diagnostics.application_state;
+      application_state_transitions.emplace_back(frame + 1U,
+                                                 last_application_state);
+    }
     if (frame_diagnostics.player_target_active) {
       ++target_active_frames;
       if (first_target_frame == 0U) {
@@ -6784,6 +7004,17 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     maximum_player_threat_count =
         std::max(maximum_player_threat_count,
                  frame_diagnostics.player_threat_count);
+    maximum_radar_actor_count =
+        std::max(maximum_radar_actor_count,
+                 frame_diagnostics.radar_actor_count);
+    const auto frame_forward_length_squared =
+        static_cast<std::int64_t>(frame_diagnostics.player_forward_x) *
+            frame_diagnostics.player_forward_x +
+        static_cast<std::int64_t>(frame_diagnostics.player_forward_z) *
+            frame_diagnostics.player_forward_z;
+    valid_radar_heading_seen =
+        valid_radar_heading_seen ||
+        frame_forward_length_squared >= 2048LL * 2048LL;
     if (frame_diagnostics.objective_completion_bits !=
         last_objective_bits) {
       last_objective_bits = frame_diagnostics.objective_completion_bits;
@@ -6941,6 +7172,31 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       continue;
     }
     observed_sequence = published->sequence;
+    if (pause_flow) {
+      std::vector<std::uint32_t> words;
+      words.reserve(published->gp0_word_count);
+      for (const auto &packet : published->packets) {
+        words.insert(words.end(), packet.gp0_words.begin(),
+                     packet.gp0_words.end());
+      }
+      const auto digest = sf::core::sha256(std::as_bytes(
+          std::span<const std::uint32_t>{words}));
+      if (frame_diagnostics.menu_vram_snapshots == 0U &&
+          published->application_state == 0U) {
+        pause_gameplay_presentation_seen = true;
+        pause_gameplay_digest = digest;
+      } else if (published->application_state == 7U) {
+        pause_menu_presentation_seen = true;
+        pause_menu_digest = digest;
+        pause_menu_maximum_draw_commands = std::max(
+            pause_menu_maximum_draw_commands,
+            published->draw_command_count);
+      } else if (frame_diagnostics.menu_vram_restores != 0U &&
+                 published->application_state == 0U) {
+        pause_restored_presentation_seen = true;
+        pause_restored_digest = digest;
+      }
+    }
     const auto sprite_commands = std::ranges::count_if(
         published->packets, [](const auto &packet) {
           if (packet.gp0_words.empty()) {
@@ -6990,6 +7246,122 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     inspect_pcm(count);
   }
   const auto diagnostics = runtime.diagnostics();
+  // Mission 8 -> 9 is the sole SF2 disc boundary. The platform resolver and
+  // campaign tests own that path; this guest probe can boot the next runtime
+  // directly only while the supplied CUE remains authoritative.
+  const auto next_mission_is_same_disc = mission_index != 7U;
+  if (retail_completion_flow && mission_index < 20U &&
+      next_mission_is_same_disc &&
+      sf::game::campaignMissionsShareCarry(mission_index,
+                                           mission_index + 1U)) {
+    if (!completion_carry || !completion_carry->sequel) {
+      std::cerr << "SF2 completion-flow lost its exact sequel carry\n";
+      return 10;
+    }
+    sf::game::Sf2GuestMissionRuntime next_runtime{
+        std::filesystem::path{cue_path}, mission_index + 1U};
+    if (!next_runtime.ready() ||
+        !next_runtime.applyCampaignCarryState(*completion_carry)) {
+      std::cerr << "SF2 completion-flow could not apply carry to mission "
+                << mission_index + 2U << '\n';
+      return 10;
+    }
+    next_runtime.setHostPadState({});
+    if (!next_runtime.advanceHostUpdate()) {
+      std::cerr << "SF2 completion-flow next mission did not advance: "
+                << next_runtime.faultDetail() << '\n';
+      return 10;
+    }
+    const auto next = next_runtime.diagnostics();
+    const auto &expected = *completion_carry->sequel;
+    next_mission_carry_verified =
+        next.player_health == completion_carry->health &&
+        next.player_armor == completion_carry->armor &&
+        next.player_equipped_item == expected.current_item &&
+        next.player_owned_items == expected.owned_items &&
+        next.player_magazines == expected.magazines &&
+        next.player_reserves == expected.reserves;
+    if (!next_mission_carry_verified) {
+      std::cerr << "SF2 completion-flow mission " << mission_index + 2U
+                << " did not retain exact health/armor/inventory carry\n";
+      return 10;
+    }
+  }
+  if (compact_movie_trace) {
+    std::cout << "SF2 movie trace: mission=" << mission_index + 1U
+              << " state=" << diagnostics.application_state
+              << " calls=" << diagnostics.movie_playback_init_calls
+              << " catalog=";
+    const auto count = std::min<std::uint64_t>(
+        diagnostics.movie_playback_init_calls,
+        diagnostics.movie_playback_catalog_history.size());
+    for (auto index = std::size_t{}; index < count; ++index) {
+      std::cout << diagnostics.movie_playback_catalog_history[index] << "/";
+    }
+    std::cout << " host-handoff=";
+    if (observed_scripted_movie_request) {
+      std::cout << static_cast<unsigned int>(
+          *observed_scripted_movie_request);
+    } else {
+      std::cout << "none";
+    }
+    std::cout << '\n';
+    if (expected_scripted_movie_catalog_index &&
+        (!scripted_movie_probe_requested ||
+         observed_scripted_movie_request !=
+             expected_scripted_movie_catalog_index ||
+         diagnostics.scripted_movie_handoffs == 0U ||
+         diagnostics.last_scripted_movie_catalog_index !=
+             *expected_scripted_movie_catalog_index)) {
+      std::cerr << "SF2 scripted movie request did not reach the expected "
+                   "native handoff: expected="
+                << static_cast<unsigned int>(
+                       *expected_scripted_movie_catalog_index)
+                << " observed=";
+      if (observed_scripted_movie_request) {
+        std::cerr << static_cast<unsigned int>(
+            *observed_scripted_movie_request);
+      } else {
+        std::cerr << "none";
+      }
+      std::cerr << " handoffs=" << diagnostics.scripted_movie_handoffs
+                << '\n';
+      return 10;
+    }
+    if (!scripted_movie_completion_observed) {
+      std::cerr << "SF2 movie probe did not complete the retail handoff\n";
+      return 10;
+    }
+    return 0;
+  }
+  std::array<std::uint32_t, 6U> pause_overlay_words{};
+  if (pause_flow) {
+    std::vector<std::byte> ram(sf::psx::R3000Runtime::ram_size);
+    if (!runtime.copyGuestRamForProbe(ram)) {
+      std::cerr << "SF2 pause probe could not copy guest RAM\n";
+      return 10;
+    }
+    const auto read32 = [&ram](std::uint32_t address) {
+      const auto offset = static_cast<std::size_t>(address & 0x1fffffU);
+      return static_cast<std::uint32_t>(
+          std::to_integer<std::uint8_t>(ram[offset]) |
+          (static_cast<std::uint32_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 1U]))
+           << 8U) |
+          (static_cast<std::uint32_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 2U]))
+           << 16U) |
+          (static_cast<std::uint32_t>(
+               std::to_integer<std::uint8_t>(ram[offset + 3U]))
+           << 24U));
+    };
+    constexpr std::array pause_addresses{
+        0x8014aef4U, 0x8014aef8U, 0x8014b110U,
+        0x8014b114U, 0x8014b118U, 0x8014b11cU};
+    for (auto index = std::size_t{}; index < pause_addresses.size(); ++index) {
+      pause_overlay_words[index] = read32(pause_addresses[index]);
+    }
+  }
   if (scan_ui_objects) {
     std::vector<std::byte> ram(sf::psx::R3000Runtime::ram_size);
     if (!runtime.copyGuestRamForProbe(ram)) {
@@ -7115,6 +7487,9 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   }
   const auto input_mode =
       weapon_cycle   ? "weapons"
+      : pause_flow   ? "pause"
+      : retail_completion_flow ? "completeflow"
+      : mission_complete_probe ? "complete"
       : objective_event && quick_state
           ? "quickobjective"
       : objective_event
@@ -7150,7 +7525,25 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.last_pad_caller << std::dec
             << " pad-index=" << diagnostics.last_pad_index
             << " state=" << diagnostics.application_state
-            << " mission=" << diagnostics.selected_mission_index
+            << "/transitions=";
+  for (const auto &[frame, state] : application_state_transitions) {
+    std::cout << frame << ":" << state << "/";
+  }
+  if (pause_flow) {
+    std::cout << "/menu=";
+    for (const auto word : pause_overlay_words) {
+      std::cout << "0x" << std::hex << std::uppercase << word << "/";
+    }
+    std::cout << std::dec << "presentation="
+              << (pause_gameplay_presentation_seen ? 1 : 0) << "/"
+              << (pause_menu_presentation_seen ? 1 : 0) << "/"
+              << (pause_restored_presentation_seen ? 1 : 0) << "/draws="
+              << pause_menu_maximum_draw_commands << "/digests="
+              << sf::core::toHex(pause_gameplay_digest).substr(0U, 12U)
+              << "/" << sf::core::toHex(pause_menu_digest).substr(0U, 12U)
+              << "/" << sf::core::toHex(pause_restored_digest).substr(0U, 12U);
+  }
+  std::cout << " mission=" << diagnostics.selected_mission_index
             << " clock=" << diagnostics.system_clock
             << " player=0x" << std::hex << std::uppercase
             << diagnostics.player_instance << std::dec << ":"
@@ -7158,7 +7551,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.player_z << ":forward="
             << diagnostics.player_forward_x << "/"
             << diagnostics.player_forward_z << ":radar="
-            << static_cast<unsigned int>(diagnostics.radar_actor_count)
+            << static_cast<unsigned int>(diagnostics.radar_actor_count) << "/"
+            << static_cast<unsigned int>(maximum_radar_actor_count)
             << ":room="
             << diagnostics.guest_current_room << "/"
             << diagnostics.guest_collision_room_count << ":collision=0x"
@@ -7241,6 +7635,23 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.last_renderer_text_actual << "/"
             << diagnostics.last_renderer_text_writer_pc << "/"
             << diagnostics.last_renderer_text_writer_instruction
+            << std::dec << " render-views=" << diagnostics.render_view_adds
+            << "/" << diagnostics.render_view_removes << ":0x" << std::hex
+            << diagnostics.last_render_view_added << "/"
+            << diagnostics.last_render_view_removed
+            << ":head/node/flags/next="
+            << diagnostics.render_view_head << "/"
+            << diagnostics.player_render_node << "/"
+            << diagnostics.player_render_flags << "/"
+            << diagnostics.player_render_next << ":chain=";
+  for (auto index = std::size_t{};
+       index < diagnostics.render_view_chain.size() &&
+       diagnostics.render_view_chain[index] != 0U; ++index) {
+    std::cout << diagnostics.render_view_chain[index] << "/"
+              << diagnostics.render_view_chain_nodes[index] << "/"
+              << diagnostics.render_view_chain_flags[index] << ",";
+  }
+  std::cout
             << std::dec
             << " rejected-renderer-ots="
             << diagnostics.rejected_renderer_ordering_tables
@@ -7326,6 +7737,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
               << static_cast<std::uint16_t>(packed >> 32U) << ","
               << static_cast<std::uint16_t>(packed >> 48U) << "/";
   }
+  std::cout << " setup-packets="
+            << diagnostics.retained_vram_setup_packets
+            << "/menu-vram=" << diagnostics.menu_vram_snapshots << "/"
+            << diagnostics.menu_vram_restores;
   std::cout
             << " checkpoint-restores="
             << diagnostics.checkpoint_restores
@@ -7470,6 +7885,49 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.xa_cue_plays << "/"
             << diagnostics.xa_stream_starts << "/"
             << diagnostics.xa_stream_stops
+            << " completion-flow=" << diagnostics.campaign_advance_calls
+            << "/" << diagnostics.movie_request_calls << "/"
+            << diagnostics.movie_playback_init_calls << "/title="
+            << diagnostics.title_transition_mode << "/"
+            << diagnostics.title_substate << "/disc="
+            << static_cast<unsigned int>(diagnostics.mounted_campaign_disc)
+            << "/catalog="
+            << diagnostics.selected_movie_catalog_index
+            << "/next-carry=" << next_mission_carry_verified
+            << "/movies=";
+  for (const auto catalog_index : completion_movie_catalog_indices) {
+    std::cout << static_cast<unsigned int>(catalog_index) << ",";
+  }
+  std::cout
+            << ":request=0x"
+            << std::hex << std::uppercase;
+  for (const auto argument : diagnostics.last_movie_request_arguments) {
+    std::cout << argument << "/";
+  }
+  std::cout << ":baseline=" << completion_baseline.campaign_advance_calls
+            << "/" << completion_baseline.movie_request_calls << "/"
+            << completion_baseline.movie_playback_init_calls << "/catalog="
+            << completion_baseline.selected_movie_catalog_index;
+  std::cout << ":playback=0x";
+  for (const auto argument : diagnostics.last_movie_playback_arguments) {
+    std::cout << argument << "/";
+  }
+  std::cout << ":playback-history=";
+  for (const auto index : diagnostics.movie_playback_catalog_history) {
+    std::cout << index << "/";
+  }
+  std::cout << ":selection-writes=" << std::dec
+            << diagnostics.movie_selection_writes << ":0x" << std::hex
+            << std::uppercase << diagnostics.last_movie_selection_writer_pc
+            << "/" << diagnostics.last_movie_selection_writer_instruction
+            << "/" << diagnostics.last_movie_selection_write_value
+            << ":history=";
+  for (auto index = std::size_t{};
+       index < diagnostics.movie_selection_writer_pcs.size(); ++index) {
+    std::cout << diagnostics.movie_selection_writer_pcs[index] << "@"
+              << diagnostics.movie_selection_write_values[index] << "/";
+  }
+  std::cout << std::dec
             << " timeline=" << diagnostics.timeline_event_count << ":";
   const auto first_timeline_event =
       diagnostics.timeline_event_count >
@@ -7552,7 +8010,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   const auto restore_stability_missing =
       first_restore_frame != 0U &&
       frames - first_restore_frame < 300U;
-  if (frames >= 800U &&
+  if (frames >= 800U && !retail_completion_flow &&
       (nonzero_pcm_frames == 0U || peak_pcm_sample == 0U ||
        maximum_active_spu_voices == 0U ||
        diagnostics.spu_key_on_writes <= 2U ||
@@ -7573,15 +8031,12 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cerr << "SF2 objective-event probe did not loot the truck\n";
     return 10;
   }
-  const auto radar_forward_length_squared =
-      static_cast<std::int64_t>(diagnostics.player_forward_x) *
-          diagnostics.player_forward_x +
-      static_cast<std::int64_t>(diagnostics.player_forward_z) *
-          diagnostics.player_forward_z;
+  const auto known_actor_radar_route =
+      objective_event || (combat && mission_index == 2U);
   if ((combat || objective_event) && frames >= 1'200U &&
-      (diagnostics.radar_actor_count == 0U ||
-       radar_forward_length_squared < 2048LL * 2048LL)) {
-    std::cerr << "SF2 radar probe did not retain actor poses and a valid "
+      (!valid_radar_heading_seen ||
+       (known_actor_radar_route && maximum_radar_actor_count == 0U))) {
+    std::cerr << "SF2 radar probe did not observe actor poses and a valid "
                  "player heading\n";
     return 10;
   }
@@ -7590,6 +8045,58 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
        !shotgun_observed || shotgun_stress_frames < 40U)) {
     std::cerr << "SF2 weapon-cycle probe did not complete the retail "
                  "selection and shotgun crouch/back/fire stress interval\n";
+    return 10;
+  }
+  if (pause_flow &&
+      (diagnostics.menu_vram_snapshots != 1U ||
+       diagnostics.menu_vram_restores != 1U ||
+       !pause_gameplay_presentation_seen ||
+       !pause_menu_presentation_seen ||
+       !pause_restored_presentation_seen ||
+       pause_menu_maximum_draw_commands == 0U ||
+       pause_menu_digest == pause_gameplay_digest)) {
+    std::cerr << "SF2 pause probe did not publish a distinct authored menu "
+                 "and restore gameplay presentation/VRAM residency\n";
+    return 10;
+  }
+  if (mission_complete_probe && !retail_completion_flow &&
+      (!mission_completion_observed ||
+       !campaign_carry_applied ||
+       diagnostics.mission_success_events != 1U ||
+       diagnostics.mission_failure_events != 0U ||
+       !diagnostics.mission_complete_requested ||
+       diagnostics.player_health != 123U ||
+       diagnostics.player_armor != 321U ||
+       diagnostics.player_equipped_item != 4U ||
+       diagnostics.player_magazines[4U] != 17U ||
+       diagnostics.player_reserves[4U] != 51U ||
+       diagnostics.player_magazines[8U] != 6U ||
+       diagnostics.player_reserves[8U] != 19U ||
+       diagnostics.player_owned_items[1U] != (1U << 1U) ||
+       diagnostics.player_magazines[33U] != 2U ||
+       diagnostics.player_reserves[33U] != 9U)) {
+    std::cerr << "SF2 completion probe did not preserve the retail "
+                 "success-only terminal handoff\n";
+    return 10;
+  }
+  if (retail_completion_flow &&
+      (!mission_completion_observed || !mission_shell_resumed ||
+       diagnostics.mission_success_events != 1U ||
+       diagnostics.mission_failure_events != 0U ||
+       (mission_index < 20U &&
+        (diagnostics.campaign_advance_calls != 1U ||
+         diagnostics.selected_mission_index != mission_index + 1U ||
+         diagnostics.application_state != 4U ||
+         diagnostics.title_transition_mode != 1U ||
+         diagnostics.movie_playback_init_calls !=
+             completion_baseline.movie_playback_init_calls +
+                 completion_movie_catalog_indices.size() ||
+         (next_mission_is_same_disc &&
+          sf::game::campaignMissionsShareCarry(mission_index,
+                                               mission_index + 1U) &&
+          !next_mission_carry_verified))))) {
+    std::cerr << "SF2 completion-flow probe did not cross the exact retail "
+                 "campaign/TITLE success handoff\n";
     return 10;
   }
   return 0;
@@ -11878,15 +12385,23 @@ int main(int argc, char **argv) {
                                     std::string_view{argv[1]} ==
                                         "probe-sf2-mission-transition");
     }
-    if ((argc >= 3 && argc <= 6) &&
+    if ((argc >= 3 && argc <= 7) &&
         std::string_view{argv[1]} == "probe-sf2-product-runtime") {
       const auto mode = argc >= 5 ? std::string_view{argv[4]}
                                   : std::string_view{};
+      if (argc == 7 && mode != "movies") {
+        printUsage();
+        return 1;
+      }
       if (!mode.empty() && mode != "neutral" && mode != "forward" &&
           mode != "combat" && mode != "crouch" &&
           mode != "crouchback" &&
           mode != "objective" && mode != "objective-dialogue" &&
-          mode != "weapons" && mode != "ui" && mode != "uiobjective" &&
+          mode != "weapons" && mode != "pause" && mode != "complete" &&
+          mode != "completeflow" &&
+          mode != "movies" &&
+          mode != "ui" &&
+          mode != "uiobjective" &&
           mode != "quickstate" && mode != "quickobjective") {
         printUsage();
         return 1;
@@ -11900,8 +12415,12 @@ int main(int argc, char **argv) {
               mode == "uiobjective" ||
               mode == "quickobjective" || mode == "objective-dialogue",
           mode == "weapons", mode != "objective-dialogue",
-          mode == "ui" || mode == "uiobjective",
-          argc == 6 ? parseSf2MissionIndex(argv[5]) : 2U);
+          mode == "ui" || mode == "uiobjective", mode == "pause",
+          mode == "complete" || mode == "completeflow",
+          mode == "completeflow",
+          mode == "movies",
+          argc >= 6 ? parseSf2MissionIndex(argv[5]) : 2U,
+          argc == 7 ? parseSf2MovieOrdinal(argv[6]) : 0U);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {
       return probeLegacyCd(argv[2]);

@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.4",
+    [string]$Version = "0.1.0-sf2-guest-alpha.5",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -130,10 +130,18 @@ INSTALLATION
 
    New-Item -ItemType File -Path .\syphon_filter_cheats
 
-5. Start a mission, replacing N and the example path. Use Disc 1 for missions
-   1-8 and Disc 2 for missions 9-21:
+5. For a standalone mission test, replace N and the example path. Use Disc 1
+   for missions 1-8 and Disc 2 for missions 9-21:
 
    .\syphon_filter.exe --no-launcher --mission=N --scene-test "D:\PS1\Syphon Filter 2 (USA) (Disc 1).cue"
+
+6. To test connected campaign flow, omit --scene-test. For example, this
+   starts at Mission 3 and continues through its save/movie/Mission 4 handoff:
+
+   .\syphon_filter.exe --no-launcher --mission=3 "D:\PS1\Syphon Filter 2 (USA) (Disc 1).cue"
+
+   Keep both disc dumps in the same directory with "Disc 1" and "Disc 2" in
+   their CUE names so the campaign can resolve the Mission 8-to-9 swap.
 
 The ordinary launcher remains the Syphon Filter 1 product launcher and does
 not expose this experimental SF2 path. Do not select an SF2 image there.
@@ -141,26 +149,34 @@ not expose this experimental SF2 path. Do not select an SF2 image there.
 CURRENT SCOPE
 =============
 
-- All 21 mission packages boot into their authored in-engine openings through
-  direct mission launch. Missions 3 and 7 are verified finishable; campaign
-  flow is not implemented.
+- All 21 missions boot through direct launch. A 42-route, 3,000-update matrix
+  covers every mission on both discs under quick-state and combat/restart
+  input, with no renderer containment or collision-residency gaps. Missions 3,
+  7 and 8 have also been completed interactively.
 - Controls, combat, doors, climbing, weapons, dialogue, sound effects, death,
   checkpoint restart and in-session F5/F9 quick states are functional.
 - The retail HUD, text, weapon artwork, radar actors/threat cones and
   widescreen in-engine cinematic bars render through the guest GPU bridge.
-- Cross-mission startup no longer retains the stale full-screen map grid, and
-  PS1-sized polygon rejection removes the angle-dependent vertex explosions
-  previously most visible in Mission 7.
+- P opens and closes the retail pause/map screen without replacing the live
+  mission, and cross-mission startup no longer retains its full-screen grid.
+- Connected campaign progression, SF2 inventory/vitals carry, save handoff,
+  every retail-selected EOL movie, the final Z17_1 stream, and automatic Disc
+  1-to-Disc 2 selection are implemented. Mission 8's complete ending-movie,
+  save, disc-swap, Mission 9 opening-movie and gameplay sequence has been
+  verified interactively.
+- Retail-indexed in-mission movies are bridged for AIRBASE (3_2/3_3) and
+  AIRBASEX (6_3). Their exact files and guest completion lifecycle pass
+  deterministic probes; AIRBASE's natural Mission 2 handoff has also passed
+  interactive playtesting, while AIRBASEX still needs equivalent coverage.
 - SF2 scoped weapons no longer abort when SF1's SCOPED.TIM is absent.
-- Music and full completion of missions other than Mission 3 are not
-  validated.
-- A later scripted conversation can pause unevenly or fail to release player
-  control; C skips it.
-- Collision/room residency can still intermittently allow Gabe to fall
-  through the floor. The room-14 floor-request guard in this build needs
-  broader interactive testing.
-- P reaches the retail pause/map input, but that transition is incomplete and
-  can hide Gabe's model after closing; avoid P in this build.
+- Mission 8 music cuts out shortly after gameplay begins. Occasional gameplay
+  audio timing/popping and the remaining AIRBASEX movie transition need
+  broader interactive coverage.
+- Mission 1's in-engine parachute opening is prematurely skipped. Other tested
+  mission openings play normally.
+- A Mission 3 conversation can run very late and eventually emit unrelated
+  Mission 2 dialogue; skip it with C if progression stalls.
+- Quick states are in-session only and do not persist after process exit.
 
 Controls use the existing PC bindings. Mouse aiming works in first person;
 A/D strafe and C crouches. Mouse wheel and bracket keys select previous/next
@@ -211,8 +227,9 @@ EXPERIMENTAL SF2 GUEST ALPHA $Version
 
 This build runs retail Syphon Filter 2 R3000A gameplay inside the native PC
 runtime and presents the guest GPU/SPU output through PsyCross. All 21 missions
-can be launched directly and Mission 3 is verified finishable, but this is a
-testing build rather than a complete campaign port.
+can be launched directly, the complete deterministic validation matrix passes,
+and connected campaign/save/movie handoffs are implemented. This remains a
+playtesting build rather than a finished PC port.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.

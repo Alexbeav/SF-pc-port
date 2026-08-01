@@ -66,7 +66,8 @@ public:
       std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
       std::uint32_t maximum_unlocked_mission,
       std::unique_ptr<game::GameplaySession> preloaded_gameplay = {},
-      std::unique_ptr<PsyCrossAudioOutput> preloaded_audio = {});
+      std::unique_ptr<PsyCrossAudioOutput> preloaded_audio = {},
+      std::optional<game::CampaignCarryState> campaign_carry = std::nullopt);
 
 private:
   KeyboardMouseBindings input_;

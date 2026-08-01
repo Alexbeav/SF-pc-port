@@ -7300,12 +7300,12 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
       continue;
     }
 
-    if (host_boundary && runtime_.state().pc == *host_boundary &&
-        findHostCall(*host_boundary) != nullptr) {
+    if (host_boundary && runtime_.state().pc == *host_boundary) {
       return boundary_result();
     }
 
     if (auto *hook = findHostCall(runtime_.state().pc); hook != nullptr) {
+      const auto host_call_pc = runtime_.state().pc;
       if (host_call_observer_) {
         host_call_observer_(runtime_.state().pc, runtime_.state());
       }
@@ -7363,6 +7363,13 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
             host_calls,
             std::nullopt,
         };
+      }
+      if (context.yield_after_host_call_) {
+        return LegacyGameplayVmResult{
+            {psx::R3000StopReason::running, instructions,
+             runtime_.state().pc, 0U},
+            runtime_.state().gpr[2], host_calls, std::nullopt,
+            host_call_pc};
       }
       continue;
     }

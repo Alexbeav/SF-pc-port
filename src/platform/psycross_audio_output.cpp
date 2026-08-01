@@ -391,13 +391,14 @@ ALsizei PsyCrossAudioOutput::fillStream(ALvoid *samples,
   }
   auto destination = std::span<psx::SpuPcmFrame>{
       static_cast<psx::SpuPcmFrame *>(samples), requested};
+  // The startup prebuffer belongs in startIfNeeded(), before the source first
+  // becomes audible. Once a live source starves, waiting for that entire
+  // prebuffer a second time turns a short scheduling stall into permanent
+  // A/V latency: the callback emits silence while the preserved guest FIFO
+  // grows behind the picture. Resume from the next available timeline sample
+  // instead and smooth only the discontinuity at the silence boundary.
   const auto recovering = callback_starved_.load(std::memory_order_relaxed);
-  const auto recovered =
-      !recovering || stream_frames_.size() >= minimum_start_frames_;
-  if (recovering && recovered) {
-    callback_starved_.store(false, std::memory_order_relaxed);
-  }
-  const auto supplied = recovered ? stream_frames_.pop(destination) : 0U;
+  const auto supplied = stream_frames_.pop(destination);
   callback_frames_read_.fetch_add(supplied, std::memory_order_relaxed);
 
   if (supplied < requested) {
@@ -406,12 +407,17 @@ ALsizei PsyCrossAudioOutput::fillStream(ALvoid *samples,
     if (!callback_starved_.exchange(true, std::memory_order_relaxed)) {
       callback_underruns_.fetch_add(1U, std::memory_order_relaxed);
     }
-  } else if (!recovering) {
+  } else {
     callback_starved_.store(false, std::memory_order_relaxed);
   }
 
   auto fade_remaining =
       fade_in_frames_remaining_.load(std::memory_order_relaxed);
+  if (recovering && supplied != 0U) {
+    // A preceding callback emitted silence. Fade the newly available guest
+    // samples in even when this callback is only a partial recovery.
+    fade_remaining = restart_fade_frames;
+  }
   for (auto index = std::size_t{}; index < supplied && fade_remaining != 0U;
        ++index) {
     const auto completed = restart_fade_frames - fade_remaining;
@@ -423,6 +429,24 @@ ALsizei PsyCrossAudioOutput::fillStream(ALvoid *samples,
         static_cast<std::int32_t>(destination[index].right) * numerator /
         static_cast<std::int32_t>(restart_fade_frames));
     --fade_remaining;
+  }
+  if (supplied < requested && supplied != 0U) {
+    // Taper the final available samples toward the zero-filled tail. Without
+    // this, a device callback that straddles the end of the ring makes an
+    // abrupt non-zero-to-zero edge which is heard as a pop.
+    const auto fade_count = std::min(supplied, restart_fade_frames);
+    const auto fade_begin = supplied - fade_count;
+    for (auto index = std::size_t{}; index < fade_count; ++index) {
+      const auto numerator =
+          static_cast<std::int32_t>(fade_count - index - 1U);
+      destination[fade_begin + index].left = static_cast<std::int16_t>(
+          static_cast<std::int32_t>(destination[fade_begin + index].left) *
+          numerator / static_cast<std::int32_t>(fade_count));
+      destination[fade_begin + index].right = static_cast<std::int16_t>(
+          static_cast<std::int32_t>(destination[fade_begin + index].right) *
+          numerator / static_cast<std::int32_t>(fade_count));
+    }
+    fade_remaining = restart_fade_frames;
   }
   fade_in_frames_remaining_.store(fade_remaining, std::memory_order_relaxed);
   return byte_count;
