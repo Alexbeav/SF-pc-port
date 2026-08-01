@@ -54,6 +54,14 @@ maps every authored EOL selection on both discs, including Mission 21's
 The final interactive Mission 3-to-4 handoff and broader natural completion
 playthroughs remain the release gate.
 
+Mission 5 interactive testing exposed a post-Alpha-7 blocker: its live retail
+script VM was being reset a second time by the host after `LEVEL` and five child
+programs were already active, risking loss of one-shot opening state. The duplicate
+reset is removed and the all-mission matrix now hard-fails unless retail owns
+exactly one `LEVEL` start. Automated actor residency and script gates pass;
+interactive AIRBASEX choreography and its natural `6_3.STR` transition remain
+the next human validation boundary.
+
 1. **Presentation stability — complete for the current playtest gate.** The
    persistent two-page renderer, atlas/state handling, room residency, floor
    requests, and polygon validation eliminate every deterministically reproduced

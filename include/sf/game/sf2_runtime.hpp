@@ -203,6 +203,11 @@ struct Sf2GuestRuntimeDiagnostics {
   std::int16_t player_forward_z{4096};
   std::array<Sf2GuestRadarActor, 16U> radar_actors{};
   std::uint8_t radar_actor_count{};
+  std::uint32_t object_record_count{};
+  std::uint16_t actor_record_count{};
+  std::uint16_t actor_instance_count{};
+  std::uint16_t actor_dormant_count{};
+  std::uint16_t actor_target_controller_count{};
   std::uint16_t player_health{};
   std::uint16_t player_armor{};
   std::int16_t player_target_slot{-1};
@@ -386,6 +391,10 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint8_t xa_last_received_channel{};
   std::uint64_t script_archive_loads{};
   std::uint16_t script_program_count{};
+  std::uint16_t script_program_count_at_start{};
+  std::uint64_t script_start_guest_frame{};
+  std::uint16_t script_active_programs_at_start_check{};
+  bool script_level_active_at_start_check{};
   std::uint32_t script_level_program{};
   std::uint32_t script_level_name_pointer{};
   std::array<std::uint32_t, 2U> script_level_name_words{};

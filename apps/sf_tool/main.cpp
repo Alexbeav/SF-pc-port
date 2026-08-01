@@ -7915,6 +7915,11 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.player_forward_z << ":radar="
             << static_cast<unsigned int>(diagnostics.radar_actor_count) << "/"
             << static_cast<unsigned int>(maximum_radar_actor_count)
+            << ":actors=" << diagnostics.actor_instance_count << "/"
+            << diagnostics.actor_record_count << "/dormant="
+            << diagnostics.actor_dormant_count << "/target="
+            << diagnostics.actor_target_controller_count << "/objects="
+            << diagnostics.object_record_count
             << ":room="
             << diagnostics.guest_current_room << "/"
             << diagnostics.guest_collision_room_count << ":collision=0x"
@@ -8228,6 +8233,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << "/" << maximum_relative_cd_lba
             << " scripts=" << diagnostics.script_archive_loads << ":"
             << diagnostics.script_program_count << "/"
+            << diagnostics.script_program_count_at_start << "@"
+            << diagnostics.script_start_guest_frame << "/preactive="
+            << diagnostics.script_active_programs_at_start_check << "/"
+            << diagnostics.script_level_active_at_start_check << "/"
             << diagnostics.script_level_starts << "/"
             << diagnostics.script_dispatches << "/"
             << diagnostics.script_event5_dispatches << "/"
@@ -8449,6 +8458,13 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   const auto restore_audio_boundary_missing =
       first_restore_frame != 0U &&
       diagnostics.checkpoint_audio_discarded_frames == 0U;
+  if (diagnostics.script_program_count != 0U &&
+      (!diagnostics.script_level_active_at_start_check ||
+       diagnostics.script_level_starts != 1U)) {
+    std::cerr << "SF2 mission-script startup gate failed: retail LEVEL was "
+                 "not already active exactly once\n";
+    return 10;
+  }
   if (frames >= 800U && !retail_completion_flow &&
       (nonzero_pcm_frames == 0U || peak_pcm_sample == 0U ||
        maximum_active_spu_voices == 0U ||

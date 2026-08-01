@@ -94,6 +94,9 @@ foreach ($mode in $Modes) {
             'rejected-sound-banks=(\d+):' 'rejected sound-bank count'
         $rejectedVoices = Read-Count $completed `
             'rejected-sound-voices=(\d+):' 'rejected sound-voice count'
+        $scriptLevelStarts = Read-Count $completed `
+            'scripts=\d+:\d+/\d+@\d+/preactive=\d+/1/(\d+)/' `
+            'retail LEVEL start count'
 
         if ($collisionGaps -ne 0 -or $rendererRepairs -ne 0 -or
             $rejectedOts -ne 0 -or $rejectedMerges -ne 0) {
@@ -107,6 +110,9 @@ foreach ($mode in $Modes) {
             $mission -notin @(2, 18)) {
             throw "Mission $mission $mode introduced an unexpected sound containment. See $logPath"
         }
+        if ($scriptLevelStarts -ne 1) {
+            throw "Mission $mission $mode restarted the retail LEVEL program. See $logPath"
+        }
 
         $results.Add([pscustomobject]@{
             Mission = $mission
@@ -119,6 +125,7 @@ foreach ($mode in $Modes) {
             RejectedListMerges = $rejectedMerges
             RejectedSoundBanks = $rejectedBanks
             RejectedSoundVoices = $rejectedVoices
+            ScriptLevelStarts = $scriptLevelStarts
             Log = [IO.Path]::GetFileName($logPath)
         })
         Write-Host ("Mission {0:D2} {1}: PASS (restores={2}, sound={3}/{4})" -f `

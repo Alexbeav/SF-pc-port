@@ -1745,6 +1745,13 @@ public:
     result.xa_last_received_file = xa_admission.last_received_file;
     result.xa_last_received_channel = xa_admission.last_received_channel;
     result.script_archive_loads = script_archive_loads_;
+    result.script_program_count_at_start =
+        script_program_count_at_start_;
+    result.script_start_guest_frame = script_start_guest_frame_;
+    result.script_active_programs_at_start_check =
+        script_active_programs_at_start_check_;
+    result.script_level_active_at_start_check =
+        script_level_active_at_start_check_;
     static_cast<void>(vm_.runtime().read16(
         state.gpr[28U] + 0x0db0U, result.script_program_count));
     constexpr std::uint32_t program_table = 0x8013c030U;
@@ -2400,6 +2407,7 @@ private:
     constexpr std::uint32_t object_record_stride = 0x4cU;
     constexpr std::uint32_t object_instance_offset = 0x34U;
     constexpr std::uint32_t object_class_offset = 0x2aU;
+    constexpr std::uint32_t object_flags_offset = 0x27U;
     constexpr std::uint32_t object_maximum_health_offset = 0x3eU;
     constexpr std::uint32_t object_health_offset = 0x40U;
     constexpr std::uint32_t instance_node_offset = 0x08U;
@@ -2426,6 +2434,7 @@ private:
         static_cast<std::uint32_t>(count) > maximum_objects) {
       return false;
     }
+    result.object_record_count = static_cast<std::uint32_t>(count);
 
     result.player_object_slot = -1;
     for (auto slot = 0; slot < count; ++slot) {
@@ -2480,10 +2489,24 @@ private:
       std::uint32_t instance{};
       std::uint16_t health_bits{};
       std::uint8_t object_class{};
+      std::uint8_t object_flags{};
       if (!vm_.runtime().read32(record + object_instance_offset, instance) ||
           !vm_.runtime().read16(record + object_health_offset, health_bits) ||
-          !vm_.runtime().read8(record + object_class_offset, object_class)) {
+          !vm_.runtime().read8(record + object_class_offset, object_class) ||
+          !vm_.runtime().read8(record + object_flags_offset, object_flags)) {
         return false;
+      }
+      const auto actor_class = object_class == 0x01U ||
+                               object_class == 0x02U ||
+                               object_class == 0x03U;
+      if (actor_class) {
+        ++result.actor_record_count;
+        if (instance != 0U) {
+          ++result.actor_instance_count;
+        }
+        if ((object_flags & 0x02U) != 0U) {
+          ++result.actor_dormant_count;
+        }
       }
       if (instance == 0U ||
           std::bit_cast<std::int16_t>(health_bits) <= 0) {
@@ -2515,6 +2538,9 @@ private:
       if (!vm_.runtime().read32(instance + instance_node_offset, node) ||
           !vm_.runtime().read32(instance + instance_target_offset, target)) {
         return false;
+      }
+      if (actor_class && target != 0U) {
+        ++result.actor_target_controller_count;
       }
       if (node == 0U || target == 0U) {
         continue;
@@ -2898,19 +2924,33 @@ private:
     if (level_program == 0U) {
       return true;
     }
+    script_active_programs_at_start_check_ =
+        static_cast<std::uint16_t>(std::min<std::size_t>(
+            active_script_programs_.size(),
+            std::numeric_limits<std::uint16_t>::max()));
+    script_level_active_at_start_check_ =
+        std::ranges::find(active_script_programs_, level_program) !=
+        active_script_programs_.end();
+    script_program_count_at_start_ = count;
+    script_start_guest_frame_ = guest_frame_;
+    // The retail mission handoff normally calls ResetAndStartLevel itself.
+    // Repeating it here after LEVEL is already active can erase one-shot
+    // activation side effects. AIRBASEX's missing opening actors and static
+    // Homan/truck exposed this duplicate-reset candidate. Only repair the
+    // historical direct-handoff case where the registry is ready but LEVEL is
+    // not active.
+    if (script_level_active_at_start_check_) {
+      scripts_started_ = true;
+      return true;
+    }
     const auto reset =
         invokeNested(0x800b3d34U, std::span<const std::uint32_t>{});
     if (!reset.completed() && !reset.stoppedAtHostBoundary()) {
       markFault("SF2 mission-script reset failed");
       return false;
     }
-    const std::array activation_arguments{level_program};
-    const auto activation =
-        invokeNested(0x800b39e4U, activation_arguments);
-    if (!activation.completed() && !activation.stoppedAtHostBoundary()) {
-      markFault("SF2 LEVEL program activation failed");
-      return false;
-    }
+    // ResetAndStartLevel resolves and activates LEVEL internally. Do not call
+    // MissionScript_Activate a second time after that authentic operation.
     scripts_started_ = true;
     return true;
   }
@@ -5546,6 +5586,10 @@ private:
   std::array<std::uint32_t, 8U> last_pickup_text_words_{};
   std::array<char, 64U> last_pickup_text_bytes_{};
   std::uint64_t script_level_starts_{};
+  std::uint16_t script_program_count_at_start_{};
+  std::uint64_t script_start_guest_frame_{};
+  std::uint16_t script_active_programs_at_start_check_{};
+  bool script_level_active_at_start_check_{};
   std::uint64_t script_dispatches_{};
   std::uint64_t script_event5_dispatches_{};
   std::array<std::uint32_t, 2U> last_script_dispatch_arguments_{};
