@@ -3038,6 +3038,20 @@ void testRawSectorFile() {
                 std::span{raw_sector}.subspan(15U),
                 [](std::byte value) { return value == std::byte{0x5a}; }),
         "Relative extent did not preserve payload and normalize raw MSF");
+    media.mapRelativeExtent(20U, 1U);
+    require(
+        media.readDataSector(0U, data_sector) &&
+            std::ranges::all_of(
+                data_sector,
+                [](std::byte value) { return value == std::byte{0x5a}; }),
+        "Relative extent did not switch to the newly mounted archive");
+    media.mapRelativeExtent(19U, 2U);
+    require(
+        media.readDataSector(0U, data_sector) &&
+            std::ranges::all_of(
+                data_sector,
+                [](std::byte value) { return value == std::byte{0xa5}; }),
+        "Relative extent did not restore the prior mounted archive");
     const auto raw = disc.readRawSectorFile("movie.str");
     require(raw.sector_size == sector_size, "Raw sector size mismatch");
     require(raw.sector_count == 2, "Raw sector count mismatch");

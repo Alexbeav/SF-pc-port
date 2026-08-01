@@ -149,7 +149,7 @@ not expose this experimental SF2 path. Do not select an SF2 image there.
 CURRENT SCOPE
 =============
 
-- All 21 missions boot through direct launch. A 42-route, 3,000-update matrix
+- All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
   input, with no renderer containment or collision-residency gaps. Missions 3,
   7 and 8 have also been completed interactively.
@@ -169,7 +169,7 @@ CURRENT SCOPE
   deterministic probes; AIRBASE's natural Mission 2 handoff has also passed
   interactive playtesting, while AIRBASEX still needs equivalent coverage.
 - SF2 scoped weapons no longer abort when SF1's SCOPED.TIM is absent.
-- Mission 8 music cuts out shortly after gameplay begins. Occasional gameplay
+- Mission 7 music cuts out shortly after gameplay begins. Occasional gameplay
   audio timing/popping and the remaining AIRBASEX movie transition need
   broader interactive coverage.
 - Mission 1's in-engine parachute opening is prematurely skipped. Other tested

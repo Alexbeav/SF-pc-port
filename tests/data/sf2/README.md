@@ -25,5 +25,17 @@ $env:SF2_PIN_HEALTH = "1"
   "<path-to-syphon-filter-2-disc-1.cue>"
 ```
 
+The same transcript can be run without opening a product window. This path
+retains the runtime's audio, XA, dialogue, collision, renderer, and script
+diagnostics while omitting host presentation and audio-device playback:
+
+```powershell
+.\build\windows-psycross\Release\sf_tool.exe `
+  probe-sf2-product-runtime `
+  "<path-to-syphon-filter-2-disc-1.cue>" `
+  5500 replay 2 `
+  ".\tests\data\sf2\mission3-truck-route.sf2pad"
+```
+
 The replay file contains only synthesized PS1 pad samples. It does not contain
 disc data, executable code, screenshots, audio, or other retail assets.

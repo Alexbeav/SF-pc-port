@@ -31,6 +31,27 @@ struct CpuClockScale {
       default;
 };
 
+// Read-only counters for CD-XA sector admission. They are deliberately kept
+// outside PsxMachineState: save-state restore owns guest-visible decoder/queue
+// state, while these monotonic counters describe the host run that produced
+// it and are used only for bounded diagnostics.
+struct XaSectorAdmissionDiagnostics {
+  std::uint64_t received{};
+  std::uint64_t admitted{};
+  std::uint64_t rejected_busy{};
+  std::uint64_t rejected_decode{};
+  std::uint64_t muted{};
+  std::uint64_t admitted_frames{};
+  std::size_t maximum_queued_frames_before_admission{};
+  bool has_received_sector{};
+  std::uint32_t first_received_lba{};
+  std::uint32_t last_received_lba{};
+  std::uint8_t first_received_file{};
+  std::uint8_t first_received_channel{};
+  std::uint8_t last_received_file{};
+  std::uint8_t last_received_channel{};
+};
+
 class DmaPort {
 public:
   virtual ~DmaPort() = default;
@@ -152,6 +173,10 @@ public:
   [[nodiscard]] const Spu &spu() const noexcept { return spu_; }
   [[nodiscard]] Spu &spu() noexcept { return spu_; }
   [[nodiscard]] const RootTimers &timers() const noexcept { return timers_; }
+  [[nodiscard]] const XaSectorAdmissionDiagnostics &
+  xaSectorAdmissionDiagnostics() const noexcept {
+    return xa_sector_admission_diagnostics_;
+  }
   // GPU presentation is host-owned, but linear DMA and direct GP0 writes also
   // carry persistent VRAM uploads which an ordering-table snapshot cannot
   // reconstruct. Drain their byte-exact word stream at a product boundary.
@@ -203,6 +228,7 @@ private:
   CdRomController cdrom_;
   Spu spu_;
   XaAudioDecoder xa_decoder_;
+  XaSectorAdmissionDiagnostics xa_sector_admission_diagnostics_{};
   RootTimers timers_;
   CpuClockScale cpu_clock_scale_{};
   std::uint64_t pending_cpu_ticks_{};

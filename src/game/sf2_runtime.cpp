@@ -1181,6 +1181,7 @@ public:
       state.checkpoint_captured = checkpoint_captured_;
       state.retail_restore_active = retail_restore_active_;
       state.retail_restore_start_frame = retail_restore_start_frame_;
+      state.xa_relative_extent_active = xa_relative_extent_active_;
       state.mission_success_pending = mission_success_pending_;
       state.mission_complete_requested = mission_complete_requested_;
       state.mission_success_events = mission_success_events_;
@@ -1260,6 +1261,7 @@ public:
       retail_restore_active_ = quick_state_->retail_restore_active;
       retail_restore_start_frame_ =
           quick_state_->retail_restore_start_frame;
+      setXaRelativeExtentActive(quick_state_->xa_relative_extent_active);
       mission_success_pending_ = quick_state_->mission_success_pending;
       mission_complete_requested_ =
           quick_state_->mission_complete_requested;
@@ -1279,6 +1281,12 @@ public:
       mission_timer_handle_ = quick_state_->mission_timer_handle;
       mission_timer_text_ = quick_state_->mission_timer_text;
       mission_timer_text_updates_ = quick_state_->mission_timer_text_updates;
+      // Timeline counters intentionally describe the whole host run rather
+      // than guest state, but the bounded callback window is expressed in
+      // guest-frame coordinates. Do not compare a restored earlier frame to
+      // the pre-restore speech frame; the next authentic speech start arms a
+      // fresh window.
+      last_scene_speech_timeline_frame_.reset();
       scheduler_fault_detail_.clear();
       vm_.runtime().clearWriteWatchHit();
       last_valid_collision_room_ = 0xffffU;
@@ -1354,6 +1362,35 @@ public:
           result.dialogue_state_valid;
     }
     result.dialogue_state_word = result.dialogue_state_words.front();
+    std::uint32_t mission_progress{};
+    if (vm_.runtime().read32(0x8011f570U, mission_progress) &&
+        mission_progress != 0U) {
+      static_cast<void>(vm_.runtime().read32(
+          mission_progress + 0x04U,
+          result.mission_progress_visible_bits));
+    }
+    std::uint32_t player_state_root{};
+    std::uint32_t player_packed_state_record{};
+    if (vm_.runtime().read32(0x8012a574U, player_state_root) &&
+        player_state_root != 0U &&
+        vm_.runtime().read32(player_state_root + 0x20U,
+                             player_packed_state_record) &&
+        player_packed_state_record != 0U) {
+      static_cast<void>(vm_.runtime().read32(
+          player_packed_state_record + 0x540U,
+          result.player_packed_state_pointer));
+      constexpr auto predicate_operand = std::uint32_t{51U};
+      const auto tagged_slot = result.player_packed_state_pointer & 3U;
+      const auto bit = predicate_operand + tagged_slot * 8U;
+      const auto bitset = result.player_packed_state_pointer & ~3U;
+      if (bitset != 0U && vm_.runtime().read32(
+                              bitset + (bit >> 5U) * 4U,
+                              result.player_packed_state_bit51_word)) {
+        result.player_packed_state_bit51 =
+            (result.player_packed_state_bit51_word &
+             (1U << (bit & 31U))) != 0U;
+      }
+    }
     // MissionObjective_Complete (0x8002E6E8) sets bits in word +0x0C of
     // the state record rooted at GP+0x90C (0x8011F570). Read that exact
     // retail state so the native overlay can reproduce completion notices
@@ -1624,11 +1661,25 @@ public:
     }
     const auto audio = vm_.audioDiagnostics();
     result.spu_mixed_frames = audio.spu_mixed_frames;
+    result.spu_pcm_frames = audio.spu_pcm_frames;
+    result.spu_dropped_pcm_frames = audio.spu_dropped_pcm_frames;
     const auto &spu_state = vm_.machine().spu().state();
     result.spu_key_on_writes = spu_state.key_on_writes;
     result.spu_key_off_writes = spu_state.key_off_writes;
     result.spu_last_key_on_mask = spu_state.last_key_on_mask;
     result.spu_last_key_off_mask = spu_state.last_key_off_mask;
+    result.spu_endx = spu_state.endx;
+    for (auto voice = std::size_t{}; voice < spu_state.voices.size();
+         ++voice) {
+      const auto &voice_state = spu_state.voices[voice];
+      if (voice_state.active != 0U) {
+        result.spu_active_voice_mask |=
+            static_cast<std::uint32_t>(1U << voice);
+      }
+      result.spu_voice_block_flags[voice] = voice_state.block_flags;
+      result.spu_voice_block_addresses[voice] = voice_state.block_address;
+      result.spu_voice_repeat_addresses[voice] = voice_state.repeat_address;
+    }
     result.active_spu_voices = audio.active_spu_voices;
     result.spu_control = audio.spu_control;
     result.spu_status = audio.spu_status;
@@ -1647,6 +1698,23 @@ public:
     result.xa_stream_set = audio.xa_stream_set;
     result.xa_file = audio.xa_file;
     result.xa_channel = audio.xa_channel;
+    const auto &xa_admission =
+        vm_.machine().xaSectorAdmissionDiagnostics();
+    result.xa_sectors_received = xa_admission.received;
+    result.xa_sectors_admitted = xa_admission.admitted;
+    result.xa_sectors_rejected_busy = xa_admission.rejected_busy;
+    result.xa_sectors_rejected_decode = xa_admission.rejected_decode;
+    result.xa_sectors_muted = xa_admission.muted;
+    result.xa_frames_admitted = xa_admission.admitted_frames;
+    result.xa_maximum_queued_frames =
+        xa_admission.maximum_queued_frames_before_admission;
+    result.xa_has_received_sector = xa_admission.has_received_sector ? 1U : 0U;
+    result.xa_first_received_lba = xa_admission.first_received_lba;
+    result.xa_last_received_lba = xa_admission.last_received_lba;
+    result.xa_first_received_file = xa_admission.first_received_file;
+    result.xa_first_received_channel = xa_admission.first_received_channel;
+    result.xa_last_received_file = xa_admission.last_received_file;
+    result.xa_last_received_channel = xa_admission.last_received_channel;
     result.script_archive_loads = script_archive_loads_;
     static_cast<void>(vm_.runtime().read16(
         state.gpr[28U] + 0x0db0U, result.script_program_count));
@@ -1774,6 +1842,38 @@ public:
     }
     result.spatial_sound_starts = spatial_sound_starts_;
     result.scene_sound_cue_plays = scene_sound_cue_plays_;
+    constexpr std::array sound_service_global_offsets{
+        0x07b8U, 0x07c0U, 0x07c4U, 0x0800U,
+        0x0804U, 0x0808U, 0x080cU, 0x0810U,
+    };
+    for (auto index = std::size_t{};
+         index < sound_service_global_offsets.size(); ++index) {
+      static_cast<void>(vm_.runtime().read32(
+          state.gpr[28U] + sound_service_global_offsets[index],
+          result.sound_service_globals[index]));
+    }
+    static_cast<void>(vm_.runtime().read32(
+        state.gpr[28U] + 0x07dcU, result.sound_sequence_pointer));
+    if (result.sound_sequence_pointer != 0U) {
+      static_cast<void>(vm_.runtime().read8(
+          result.sound_sequence_pointer + 0x06U,
+          result.sound_sequence_flags));
+      static_cast<void>(vm_.runtime().read32(
+          result.sound_sequence_pointer + 0x1cU,
+          result.sound_sequence_cursor));
+      static_cast<void>(vm_.runtime().read32(
+          result.sound_sequence_pointer + 0x24U,
+          result.sound_sequence_countdown));
+      static_cast<void>(vm_.runtime().read32(
+          result.sound_sequence_pointer + 0x30U,
+          result.sound_sequence_step));
+      static_cast<void>(vm_.runtime().read16(
+          result.sound_sequence_pointer + 0x38U,
+          result.sound_sequence_tempo));
+      static_cast<void>(vm_.runtime().read16(
+          result.sound_sequence_pointer + 0x3aU,
+          result.sound_sequence_loop_count));
+    }
     for (auto index = std::size_t{};
          index < result.interrupt_callbacks.size(); ++index) {
       static_cast<void>(vm_.runtime().read32(
@@ -1795,6 +1895,7 @@ public:
     result.xa_cue_plays = xa_cue_plays_;
     result.xa_stream_starts = xa_stream_starts_;
     result.xa_stream_stops = xa_stream_stops_;
+    result.xa_relative_extent_active = xa_relative_extent_active_;
     result.timeline_event_count = timeline_event_count_;
     result.timeline_events = timeline_events_;
     result.ui_text_event_count = ui_text_event_count_;
@@ -2992,7 +3093,7 @@ private:
     if (retail_restore_active_ && application_state == 0U &&
         guest_frame_ > retail_restore_start_frame_ + 60U) {
       retail_restore_active_ = false;
-      if (!installSoundFlushCallback()) {
+      if (!installSoundServiceCallback()) {
         markFault("could not restore SF2 sound callback after checkpoint");
         return false;
       }
@@ -3312,6 +3413,7 @@ private:
     bool checkpoint_captured{};
     bool retail_restore_active{};
     std::uint64_t retail_restore_start_frame{};
+    bool xa_relative_extent_active{};
     bool mission_success_pending{};
     bool mission_complete_requested{};
     std::uint64_t mission_success_events{};
@@ -3340,7 +3442,10 @@ private:
       psx::CdRomController::cpu_clock_hz / 120U;
   static constexpr std::uint64_t retrace_period_ =
       psx::CdRomController::cpu_clock_hz / 60U;
-  static constexpr std::uint32_t callback_stack_ = 0x807f0000U;
+  // Keep interrupt callbacks below the executable at 0x80010000. The old
+  // 0x807F0000 address mirrored onto physical RAM at 0x001F0000, where large
+  // checkpoint CD transfers could overwrite saved callback return addresses.
+  static constexpr std::uint32_t callback_stack_ = 0x8000b000U;
   static constexpr std::uint32_t return_trampoline_ = 0x8000c000U;
   static constexpr std::uint32_t exception_trampoline_ = 0x8000c100U;
   static constexpr std::uint32_t processed_pad_records_ = 0x80122fecU;
@@ -3356,6 +3461,17 @@ private:
     }
   }
 
+  void setXaRelativeExtentActive(bool active) noexcept {
+    xa_relative_extent_active_ = active;
+    if (active) {
+      cdrom_media_.mapRelativeExtent(xa_relative_extent_base_,
+                                     xa_relative_extent_sector_count_);
+      return;
+    }
+    cdrom_media_.mapRelativeExtent(mission_relative_extent_base_,
+                                   mission_relative_extent_sector_count_);
+  }
+
   void setStage(std::string_view stage) {
     stage_.assign(stage);
   }
@@ -3363,6 +3479,19 @@ private:
   void loadAssets() {
     fog_bytes_ = disc_.image().readFile(fog_path_);
     init_overlay_ = disc_.image().readFile("BIN/INIT.OVL");
+    const auto mission_extent = disc_.image().find(fog_path_);
+    mission_relative_extent_base_ = mission_extent.extent_lba;
+    mission_relative_extent_sector_count_ = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(mission_extent.size) +
+         assets::FogArchive::sector_size - 1U) /
+        assets::FogArchive::sector_size);
+    const auto xa_extent =
+        disc_.image().find(std::string{disc_.game()->layout.streaming_audio_path});
+    xa_relative_extent_base_ = xa_extent.extent_lba;
+    xa_relative_extent_sector_count_ = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(xa_extent.size) +
+         disc::Iso9660Image::logical_sector_size - 1U) /
+        disc::Iso9660Image::logical_sector_size);
     const auto resident =
         parseEmbeddedHog(disc_.executable(), "BEEPSX.VB");
     for (const auto &entry : resident.entries()) {
@@ -3422,6 +3551,10 @@ private:
           ++alpha_checkpoint_restores_;
           retail_restore_active_ = true;
           retail_restore_start_frame_ = guest_frame_;
+          // A checkpoint restore owns the mission file loader. If death or
+          // failure interrupted speech, abandon the gameplay-XA mount before
+          // retail starts issuing relative FOG reads.
+          setXaRelativeExtentActive(false);
           // The corrected CD/XA scheduler can now service the retail
           // checkpoint loader. Preserve this boundary as an observation hook
           // and execute the original restore instead of rewinding a host
@@ -4061,6 +4194,14 @@ private:
             last_scene_speech_callback_arguments_[index] =
                 context.argument(static_cast<std::uint32_t>(index));
           }
+          constexpr std::uint64_t speech_callback_trace_window = 30U;
+          if (last_scene_speech_timeline_frame_ &&
+              guest_frame_ >= *last_scene_speech_timeline_frame_ &&
+              guest_frame_ - *last_scene_speech_timeline_frame_ <=
+                  speech_callback_trace_window) {
+            recordTimelineEvent(
+                Sf2GuestTimelineEventKind::scene_speech_callback, context);
+          }
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -4155,9 +4296,23 @@ private:
         });
     vm_.bindHostCall(
         0x800f957cU, [this](LegacyHostCallContext &context) {
+          // Retail passes a sector relative to SCENES1.XA/SCENES2.XA. The
+          // mission loader uses the same low-LBA CD namespace for its FOG, so
+          // switch the mounted extent at the authentic XA entry boundary.
+          setXaRelativeExtentActive(true);
           ++xa_stream_starts_;
           recordTimelineEvent(
               Sf2GuestTimelineEventKind::xa_stream_start, context);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800f97a8U, [this](LegacyHostCallContext &context) {
+          // XaFilteredStream_Start has one return. A negative result means no
+          // XA lifecycle owns the CD path, so immediately restore the mission
+          // extent; successful streams retain SCENES*.XA until XaStream_Stop.
+          if (static_cast<std::int32_t>(context.registerValue(2U)) < 0) {
+            setXaRelativeExtentActive(false);
+          }
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -4165,6 +4320,13 @@ private:
           ++xa_stream_stops_;
           recordTimelineEvent(
               Sf2GuestTimelineEventKind::xa_stream_stop, context);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800f9a48U, [this](LegacyHostCallContext &context) {
+          // This JR RA is the single return from XaStream_Stop, after its CD
+          // disable and scheduler-reset calls have completed.
+          setXaRelativeExtentActive(false);
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -4548,8 +4710,14 @@ private:
         return false;
       }
     }
-    if (!vm_.servicePsxCdReadyCallback()) {
-      scheduler_fault_detail_ = "CD ready callback";
+    LegacyGameplayVmResult cd_ready_result{};
+    if (!vm_.servicePsxCdReadyCallback(&cd_ready_result, callback_stack_)) {
+      scheduler_fault_detail_ =
+          "CD ready callback reason=" +
+          std::string{psx::toString(cd_ready_result.execution.reason)} +
+          " pc=" + std::to_string(cd_ready_result.execution.pc) +
+          " instruction=" +
+          std::to_string(cd_ready_result.execution.instruction);
       return false;
     }
     if (!serviceDmaCallback(1U << (24U + 3U), 0x8011d114U)) {
@@ -4600,11 +4768,13 @@ private:
     return true;
   }
 
-  [[nodiscard]] bool installSoundFlushCallback() noexcept {
-    constexpr std::uint32_t sound_flush = 0x80104b40U;
+  [[nodiscard]] bool installSoundServiceCallback() noexcept {
+    // The shortened TITLE-to-mission handoff omits the outer lifecycle which
+    // services this exact sequel sound-command/sequence flush at 120 Hz.
+    constexpr std::uint32_t sound_service = 0x80104b40U;
     constexpr auto sound_callback_slot =
         profile_.interrupt_callback_table + 6U * 4U;
-    return vm_.runtime().write32(sound_callback_slot, sound_flush);
+    return vm_.runtime().write32(sound_callback_slot, sound_service);
   }
 
   [[nodiscard]] bool serviceDmaCallback(std::uint32_t flag,
@@ -4790,18 +4960,14 @@ private:
         !vm_.runtime().write32(0x8011f61cU, 0U)) {
       return false;
     }
-    const auto fog = disc_.image().find(fog_path_);
-    cdrom_media_.mapRelativeExtent(
-        fog.extent_lba,
-        (fog.size + assets::FogArchive::sector_size - 1U) /
-            assets::FogArchive::sector_size);
+    setXaRelativeExtentActive(false);
     setStage("mission archive handoff");
     const auto mission =
         invokeNested(0x80153d30U, std::span<const std::uint32_t>{});
     if (!mission.completed() && !mission.stoppedAtHostBoundary()) {
       return false;
     }
-    if (!installSoundFlushCallback()) {
+    if (!installSoundServiceCallback()) {
       return false;
     }
     bindMissionPad();
@@ -4904,11 +5070,16 @@ private:
       vm_.bindHostCall(
           0x80029c0cU, [this](LegacyHostCallContext &context) {
             if (!loading_confirm_sent_) {
-              // COLO's loading state and its unusually early skippable
-              // parachute choreography consume the same Cross sample. Take
-              // the retail accepted branch directly on the first dispatcher
-              // pass, leaving the authored controller record neutral.
-              context.setRegister(16U, 1U);
+              // COLO shares its loading dispatcher with the unusually early
+              // skippable parachute scene. The former bridge forced s0=1,
+              // which is the dispatcher's decoded Cross-press condition and
+              // consequently skipped the authored scene. Retail's adjacent
+              // loading-ready byte reaches the same accepted path without
+              // synthesizing input; the dispatcher clears it after setup.
+              if (!context.write8(0x8011f684U, 1U)) {
+                context.rejectHostCall();
+                return;
+              }
               loading_confirm_sent_ = true;
             }
             context.continueGuestInstruction();
@@ -4981,6 +5152,53 @@ private:
          ++index) {
       event.arguments[index] =
           context.argument(static_cast<std::uint32_t>(index));
+    }
+    const auto audio = vm_.audioDiagnostics();
+    event.cd_lba = audio.cd_lba;
+    event.spu_cd_frames = static_cast<std::uint32_t>(
+        std::min<std::size_t>(audio.spu_cd_frames,
+                              std::numeric_limits<std::uint32_t>::max()));
+    event.cd_reading = audio.cd_reading;
+    event.cd_muted = audio.cd_muted;
+    event.cd_adpcm_muted = audio.cd_adpcm_muted;
+    event.xa_stream_set = audio.xa_stream_set;
+    event.xa_file = audio.xa_file;
+    event.xa_channel = audio.xa_channel;
+    std::uint32_t mission_progress{};
+    if (vm_.runtime().read32(0x8011f570U, mission_progress) &&
+        mission_progress != 0U) {
+      static_cast<void>(vm_.runtime().read32(
+          mission_progress + 0x04U,
+          event.mission_progress_visible_bits));
+    }
+    std::uint32_t player_state_root{};
+    std::uint32_t player_packed_state_record{};
+    if (vm_.runtime().read32(0x8012a574U, player_state_root) &&
+        player_state_root != 0U &&
+        vm_.runtime().read32(player_state_root + 0x20U,
+                             player_packed_state_record) &&
+        player_packed_state_record != 0U) {
+      static_cast<void>(vm_.runtime().read32(
+          player_packed_state_record + 0x540U,
+          event.player_packed_state_pointer));
+      constexpr auto predicate_operand = std::uint32_t{51U};
+      const auto tagged_slot = event.player_packed_state_pointer & 3U;
+      const auto bit = predicate_operand + tagged_slot * 8U;
+      const auto bitset = event.player_packed_state_pointer & ~3U;
+      if (bitset != 0U && vm_.runtime().read32(
+                              bitset + (bit >> 5U) * 4U,
+                              event.player_packed_state_bit51_word)) {
+        event.player_packed_state_bit51 =
+            (event.player_packed_state_bit51_word &
+             (1U << (bit & 31U))) != 0U;
+      }
+    }
+    const auto &xa = vm_.machine().xaSectorAdmissionDiagnostics();
+    event.xa_sectors_received = xa.received;
+    event.xa_sectors_admitted = xa.admitted;
+    if (kind == Sf2GuestTimelineEventKind::scene_speech_start ||
+        kind == Sf2GuestTimelineEventKind::scene_speech_stop) {
+      last_scene_speech_timeline_frame_ = guest_frame_;
     }
     ++timeline_event_count_;
   }
@@ -5124,6 +5342,11 @@ private:
       std::numeric_limits<std::uint32_t>::max()};
   bool ui_instruction_trace_capped_{};
   DiscCdRomMedia cdrom_media_;
+  std::uint32_t mission_relative_extent_base_{};
+  std::uint32_t mission_relative_extent_sector_count_{};
+  std::uint32_t xa_relative_extent_base_{};
+  std::uint32_t xa_relative_extent_sector_count_{};
+  bool xa_relative_extent_active_{};
   std::uint32_t mission_index_{};
   std::uint16_t runtime_selection_{};
   std::string fog_path_;
@@ -5307,7 +5530,8 @@ private:
   std::uint64_t xa_stream_starts_{};
   std::uint64_t xa_stream_stops_{};
   std::uint64_t timeline_event_count_{};
-  std::array<Sf2GuestTimelineEvent, 64U> timeline_events_{};
+  std::array<Sf2GuestTimelineEvent, 128U> timeline_events_{};
+  std::optional<std::uint64_t> last_scene_speech_timeline_frame_;
   std::uint64_t ui_text_event_count_{};
   std::array<Sf2GuestUiTextEvent, 64U> ui_text_events_{};
   std::uint16_t mission_timer_handle_{0xffffU};

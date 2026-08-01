@@ -108,6 +108,64 @@ void PsyX_Pad_OpenController(Sint32 deviceId, int slot)
 		// assign device id automatically
 		if (controller->deviceId == -1)
 			controller->deviceId = deviceId;
+
+		eprintinfo("Controller slot %d opened: '%s'\n", slot + 1,
+			SDL_GameControllerName(controller->gc));
+	}
+	else
+	{
+		eprinterr("Failed to open controller %d for slot %d: %s\n",
+			deviceId, slot + 1, SDL_GetError());
+	}
+}
+
+static bool PsyX_Pad_IsDeviceAlreadyOpen(Sint32 deviceId)
+{
+	const SDL_JoystickID instanceId = SDL_JoystickGetDeviceInstanceID(deviceId);
+	if (instanceId < 0)
+		return false;
+
+	for (int i = 0; i < MAX_CONTROLLERS; i++)
+	{
+		PsyXController* controller = &g_controllers[i];
+		if (controller->gc == NULL)
+			continue;
+
+		SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller->gc);
+		if (joystick != NULL && SDL_JoystickInstanceID(joystick) == instanceId)
+			return true;
+	}
+	return false;
+}
+
+static void PsyX_Pad_OpenConnectedController(int slot)
+{
+	if (slot < 0 || slot >= MAX_CONTROLLERS || g_controllers[slot].gc != NULL)
+		return;
+
+	const int configuredDevice = g_cfg_controllerToSlotMapping[slot];
+	if (configuredDevice >= 0)
+	{
+		if (configuredDevice < SDL_NumJoysticks() &&
+			SDL_IsGameController(configuredDevice) &&
+			!PsyX_Pad_IsDeviceAlreadyOpen(configuredDevice))
+		{
+			PsyX_Pad_OpenController(configuredDevice, slot);
+		}
+		return;
+	}
+
+	// SDL normally emits CONTROLLERDEVICEADDED after subsystem startup, but
+	// that event is not guaranteed to survive every host/window bootstrap.
+	// Attach an already-connected controller when LIBPAD registers its buffer
+	// so launch-time devices work just as reliably as hot-plugged devices.
+	for (int device = 0; device < SDL_NumJoysticks(); device++)
+	{
+		if (!SDL_IsGameController(device) ||
+			PsyX_Pad_IsDeviceAlreadyOpen(device))
+			continue;
+		PsyX_Pad_OpenController(device, slot);
+		return;
 	}
 }
 
@@ -153,6 +211,8 @@ void PsyX_Pad_InitPad(int slot, u_char* padData)
 		pad->analog[1] = 128;
 		pad->analog[2] = 128;
 		pad->analog[3] = 128;
+
+		PsyX_Pad_OpenConnectedController(slot);
 	}
 }
 

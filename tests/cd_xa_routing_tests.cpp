@@ -537,6 +537,13 @@ void testMachineXaDecoderSpuQueueAndSnapshot() {
               machine->cdrom().currentLba() == 1U &&
               (machine->cdrom().captureState().interrupt_flags & 0x07U) == 0U,
           "Machine XA sink did not decode the first sector into SPU CD PCM");
+  const auto first_xa = machine->xaSectorAdmissionDiagnostics();
+  require(first_xa.has_received_sector && first_xa.received == 1U &&
+              first_xa.first_received_lba == 0U &&
+              first_xa.last_received_lba == 0U &&
+              first_xa.first_received_file == 7U &&
+              first_xa.first_received_channel == 1U,
+          "Machine XA diagnostics did not identify the first disc sector");
 
   auto checkpoint = std::make_unique<sf::psx::PsxMachineState>();
   *checkpoint = machine->captureState();
@@ -575,6 +582,12 @@ void testMachineXaDecoderSpuQueueAndSnapshot() {
               machine->spu().queuedCdFrames() != 0U &&
               machine->captureState().xa_decoder != decoder_before_admission,
           "Drained XA FIFO did not admit the following complete sector");
+  const auto final_xa = machine->xaSectorAdmissionDiagnostics();
+  require(final_xa.received == 4U && final_xa.first_received_lba == 0U &&
+              final_xa.last_received_lba == 2U &&
+              final_xa.last_received_file == 7U &&
+              final_xa.last_received_channel == 1U,
+          "Machine XA diagnostics lost its monotonic sector span across restore");
 }
 
 } // namespace

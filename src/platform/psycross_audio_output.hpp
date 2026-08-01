@@ -102,6 +102,10 @@ private:
   std::atomic<std::uint64_t> callback_frames_read_{};
   std::atomic<std::uint64_t> callback_silence_frames_{};
   std::atomic<std::uint64_t> callback_underruns_{};
+  std::atomic<std::uint64_t> callback_requests_{};
+  std::atomic<std::size_t> callback_maximum_request_frames_{};
+  std::atomic<std::size_t> callback_minimum_ring_frames_{
+      maximum_stream_frames};
   std::atomic<bool> callback_starved_{};
   std::uint64_t submitted_frames_{};
   std::uint64_t uploaded_frames_{};
@@ -109,6 +113,7 @@ private:
   std::uint64_t source_starts_{};
   std::uint64_t source_underruns_{};
   std::uint64_t source_resets_{};
+  std::uint64_t fifo_recoveries_{};
   std::uint64_t reported_callback_underruns_{};
   bool underrun_latched_{};
   AudioOutputStartPolicy start_policy_{2U};

@@ -218,6 +218,13 @@ if(SF_ENABLE_PSYCROSS)
             "${CMAKE_CURRENT_BINARY_DIR}/syphon_filter.rc")
     endif()
     target_link_libraries(syphon_filter PRIVATE sf::psycross_backend)
+    if(MSVC)
+        # The scene viewer owns several large emulation/presentation objects.
+        # They are heap-backed, but third-party Windows entry/decoder paths
+        # still need more than the linker default during movie-to-scene
+        # teardown and nested retail callbacks.
+        target_link_options(syphon_filter PRIVATE /STACK:8388608)
+    endif()
     if(WIN32)
         target_link_libraries(syphon_filter PRIVATE user32 comdlg32 gdiplus)
     endif()

@@ -496,7 +496,9 @@ bool LegacyGameplayVm::acknowledgeCdRomInterrupt(
   return (machine_.cdrom().captureState().interrupt_flags & 0x07U) == 0U;
 }
 
-bool LegacyGameplayVm::dispatchCdRomReadyCallback() {
+bool LegacyGameplayVm::dispatchCdRomReadyCallback(
+    LegacyGameplayVmResult *callback_result,
+    std::uint32_t callback_stack_address) {
   constexpr std::uint8_t data_ready_interrupt = 1U;
   constexpr std::uint8_t command_complete_interrupt = 2U;
 
@@ -576,16 +578,18 @@ bool LegacyGameplayVm::dispatchCdRomReadyCallback() {
   // as a child of the interrupted game function. Keep its stack frames out of
   // the suspended thread's locals just as the root-counter callback service
   // does.
-  constexpr std::uint32_t callback_stack_address = 0x807f0000U;
   const auto interrupted_state = runtime_.state();
   runtime_.setRegister(29U, callback_stack_address);
   runtime_.setRegister(30U, callback_stack_address);
-  const auto callback_result = invokeFrameCall(
+  const auto invocation_result = invokeFrameCall(
       callback,
       std::array{static_cast<std::uint32_t>(interrupt), result_address},
       5'000'000U);
+  if (callback_result != nullptr) {
+    *callback_result = invocation_result;
+  }
   runtime_.restoreCpuState(interrupted_state);
-  return callback_result.completed();
+  return invocation_result.completed();
 }
 
 void LegacyGameplayVm::bindPsxCdReadyCallback(
@@ -605,8 +609,10 @@ void LegacyGameplayVm::bindPsxCdCompletionCallback(
   cd_completion_callback_is_pointer_ = callback_is_pointer;
 }
 
-bool LegacyGameplayVm::servicePsxCdReadyCallback() {
-  return dispatchCdRomReadyCallback();
+bool LegacyGameplayVm::servicePsxCdReadyCallback(
+    LegacyGameplayVmResult *callback_result,
+    std::uint32_t callback_stack_address) {
+  return dispatchCdRomReadyCallback(callback_result, callback_stack_address);
 }
 
 bool LegacyGameplayVm::servicePsxCallbackSlot(

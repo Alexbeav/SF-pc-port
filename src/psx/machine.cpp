@@ -111,6 +111,7 @@ void PsxMachine::reset() noexcept {
   cdrom_.reset();
   spu_.reset();
   xa_decoder_.reset();
+  xa_sector_admission_diagnostics_ = {};
   timers_.reset();
   gpu_gp0_words_.clear();
   gpu_gp1_words_.clear();
@@ -468,22 +469,52 @@ bool PsxMachine::restoreState(const PsxMachineState &state) noexcept {
 void PsxMachine::consumeXaSector(
     std::span<const std::byte, CdRomMedia::raw_sector_size> sector,
     bool muted) noexcept {
+  auto &diagnostics = xa_sector_admission_diagnostics_;
+  ++diagnostics.received;
+  // CdRomController advances current_lba immediately after reading the raw
+  // sector and before handing it to the XA sink.
+  const auto sector_lba = cdrom_.currentLba() == 0U
+                              ? 0U
+                              : cdrom_.currentLba() - 1U;
+  const auto file = std::to_integer<std::uint8_t>(sector[16U]);
+  const auto channel = std::to_integer<std::uint8_t>(sector[17U]);
+  if (!diagnostics.has_received_sector) {
+    diagnostics.has_received_sector = true;
+    diagnostics.first_received_lba = sector_lba;
+    diagnostics.first_received_file = file;
+    diagnostics.first_received_channel = channel;
+  }
+  diagnostics.last_received_lba = sector_lba;
+  diagnostics.last_received_file = file;
+  diagnostics.last_received_channel = channel;
+  xa_sector_admission_diagnostics_.maximum_queued_frames_before_admission =
+      std::max(
+          xa_sector_admission_diagnostics_
+              .maximum_queued_frames_before_admission,
+          spu_.queuedCdFrames());
   // DuckStation/hardware-compatible whole-sector admission. Decoding a sector
   // while the previous one is still buffered mutates XA predictor and
   // interpolation history even though its PCM cannot be consumed; that is a
   // direct source of recurring clicks and broken speech/music continuity.
   constexpr std::size_t xa_fifo_low_watermark = 10U;
   if (spu_.queuedCdFrames() > xa_fifo_low_watermark) {
+    ++xa_sector_admission_diagnostics_.rejected_busy;
     return;
   }
   std::array<SpuPcmFrame, XaAudioDecoder::maximum_output_frames> pcm{};
   const auto decoded = xa_decoder_.decodeSector(sector, pcm);
-  if (!decoded.succeeded() || muted) {
+  if (!decoded.succeeded()) {
+    ++xa_sector_admission_diagnostics_.rejected_decode;
     return;
   }
-  static_cast<void>(
-      spu_.pushCdAudio(std::span<const SpuPcmFrame>{pcm}.first(
-          decoded.frames_written)));
+  if (muted) {
+    ++xa_sector_admission_diagnostics_.muted;
+    return;
+  }
+  const auto admitted = spu_.pushCdAudio(
+      std::span<const SpuPcmFrame>{pcm}.first(decoded.frames_written));
+  ++xa_sector_admission_diagnostics_.admitted;
+  xa_sector_admission_diagnostics_.admitted_frames += admitted;
 }
 
 void PsxMachine::resetXaStream() noexcept {

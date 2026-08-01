@@ -111,6 +111,7 @@ enum class Sf2GuestTimelineEventKind : std::uint8_t {
   scene_speech_stop,
   xa_stream_start,
   xa_stream_stop,
+  scene_speech_callback,
 };
 
 struct Sf2GuestTimelineEvent {
@@ -118,6 +119,26 @@ struct Sf2GuestTimelineEvent {
   std::uint64_t guest_frame{};
   std::uint32_t system_clock{};
   std::array<std::uint32_t, 4U> arguments{};
+  // Clock-neutral audio state captured at the same guest instruction as the
+  // event. This makes delayed/stale XA playback distinguishable from an
+  // incorrect retail cue request in deterministic probes.
+  std::uint32_t cd_lba{};
+  std::uint32_t spu_cd_frames{};
+  std::uint64_t xa_sectors_received{};
+  std::uint64_t xa_sectors_admitted{};
+  std::uint8_t cd_reading{};
+  std::uint8_t cd_muted{};
+  std::uint8_t cd_adpcm_muted{};
+  std::uint8_t xa_stream_set{};
+  std::uint8_t xa_file{};
+  std::uint8_t xa_channel{};
+  // Inputs to CHANCE_PINNED's retail selector-103 follow-up predicate. Keep
+  // them on every timeline event so a wrong authored branch can be separated
+  // from delayed host playback without mutating guest state.
+  std::uint32_t mission_progress_visible_bits{};
+  std::uint32_t player_packed_state_pointer{};
+  std::uint32_t player_packed_state_bit51_word{};
+  bool player_packed_state_bit51{};
 };
 
 enum class Sf2GuestUiTextEventKind : std::uint8_t {
@@ -189,6 +210,10 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint8_t player_target_health_percent{};
   std::uint32_t player_target_flags{};
   bool player_target_active{};
+  std::uint32_t mission_progress_visible_bits{};
+  std::uint32_t player_packed_state_pointer{};
+  std::uint32_t player_packed_state_bit51_word{};
+  bool player_packed_state_bit51{};
   std::uint32_t objective_completion_bits{};
   bool objective_state_valid{};
   std::uint64_t objective_completion_events{};
@@ -318,10 +343,17 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t menu_vram_snapshots{};
   std::uint64_t menu_vram_restores{};
   std::uint64_t spu_mixed_frames{};
+  std::size_t spu_pcm_frames{};
+  std::uint64_t spu_dropped_pcm_frames{};
   std::uint64_t spu_key_on_writes{};
   std::uint64_t spu_key_off_writes{};
   std::uint32_t spu_last_key_on_mask{};
   std::uint32_t spu_last_key_off_mask{};
+  std::uint32_t spu_active_voice_mask{};
+  std::uint32_t spu_endx{};
+  std::array<std::uint8_t, 24U> spu_voice_block_flags{};
+  std::array<std::uint32_t, 24U> spu_voice_block_addresses{};
+  std::array<std::uint32_t, 24U> spu_voice_repeat_addresses{};
   std::size_t active_spu_voices{};
   std::uint16_t spu_control{};
   std::uint16_t spu_status{};
@@ -338,6 +370,20 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint8_t xa_stream_set{};
   std::uint8_t xa_file{};
   std::uint8_t xa_channel{};
+  std::uint64_t xa_sectors_received{};
+  std::uint64_t xa_sectors_admitted{};
+  std::uint64_t xa_sectors_rejected_busy{};
+  std::uint64_t xa_sectors_rejected_decode{};
+  std::uint64_t xa_sectors_muted{};
+  std::uint64_t xa_frames_admitted{};
+  std::size_t xa_maximum_queued_frames{};
+  std::uint8_t xa_has_received_sector{};
+  std::uint32_t xa_first_received_lba{};
+  std::uint32_t xa_last_received_lba{};
+  std::uint8_t xa_first_received_file{};
+  std::uint8_t xa_first_received_channel{};
+  std::uint8_t xa_last_received_file{};
+  std::uint8_t xa_last_received_channel{};
   std::uint64_t script_archive_loads{};
   std::uint16_t script_program_count{};
   std::uint32_t script_level_program{};
@@ -380,6 +426,16 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t rejected_sound_voice_updates{};
   std::uint32_t last_rejected_sound_voice{};
   std::uint32_t last_rejected_sound_voice_caller{};
+  // Retail libsound state around the deferred command flush. Offsets are
+  // gp+7B8/7C0/7C4/800/804/808/80C/810 respectively.
+  std::array<std::uint32_t, 8U> sound_service_globals{};
+  std::uint32_t sound_sequence_pointer{};
+  std::uint32_t sound_sequence_cursor{};
+  std::uint32_t sound_sequence_countdown{};
+  std::uint32_t sound_sequence_step{};
+  std::uint16_t sound_sequence_tempo{};
+  std::uint16_t sound_sequence_loop_count{};
+  std::uint8_t sound_sequence_flags{};
   std::array<std::uint32_t, 11U> interrupt_callbacks{};
   std::array<std::uint32_t, 5U> xa_globals{};
   std::uint32_t xa_status_source{};
@@ -387,8 +443,9 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t xa_cue_plays{};
   std::uint64_t xa_stream_starts{};
   std::uint64_t xa_stream_stops{};
+  bool xa_relative_extent_active{};
   std::uint64_t timeline_event_count{};
-  std::array<Sf2GuestTimelineEvent, 64U> timeline_events{};
+  std::array<Sf2GuestTimelineEvent, 128U> timeline_events{};
   std::uint64_t ui_text_event_count{};
   std::array<Sf2GuestUiTextEvent, 64U> ui_text_events{};
   std::uint64_t async_file_services{};

@@ -23,6 +23,7 @@
 #include "sf/game/sf2_runtime.hpp"
 #include "sf/game/title.hpp"
 #include "sf/psx/function_map.hpp"
+#include "sf/psx/xa_decoder.hpp"
 
 #include <algorithm>
 #include <array>
@@ -93,6 +94,7 @@ void printUsage() {
       << "  sf_tool map-object-handlers <game.cue> <output.csv>\n"
       << "  sf_tool map-string-references <game.cue> <output.csv>\n"
       << "  sf_tool map-xa-streams <game.cue> <output.csv>\n"
+      << "  sf_tool extract-xa-cue <game.cue> <cue-index> <output.wav>\n"
       << "  sf_tool probe-legacy-vm <game.cue>\n"
       << "  sf_tool probe-executable-entry <game.cue> [instruction-budget]\n"
       << "  sf_tool probe-sf2-guest-bootstrap <game.cue> "
@@ -103,6 +105,8 @@ void printUsage() {
          "[neutral|forward|combat|crouch|quickstate|quickobjective|"
          "crouchback|objective|objective-dialogue|weapons|pause|complete|completeflow|movies|ui|uiobjective] "
          "[resource-index-0-based] [scripted-movie-ordinal-0-based]\n"
+      << "  sf_tool probe-sf2-product-runtime <game.cue> <maximum-frames> "
+         "replay <resource-index-0-based> <input.sf2pad>\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -121,9 +125,9 @@ std::uint32_t parseFrameCount(const char *text) {
   const auto *const value_end = value.data() + value.size();
   const auto [end, error] = std::from_chars(value.data(), value_end, count);
   if (error != std::errc{} || end != value_end || count == 0U ||
-      count > 10'000U) {
+      count > 100'000U) {
     throw sf::core::Error{sf::core::ErrorCode::invalid_format,
-                          "Legacy frame count must be in the range 1..10000"};
+                          "Legacy frame count must be in the range 1..100000"};
   }
   return count;
 }
@@ -154,6 +158,19 @@ std::uint32_t parseSf2MovieOrdinal(const char *text) {
         "SF2 scripted movie ordinal must be in the range 0..7"};
   }
   return ordinal;
+}
+
+std::uint32_t parseXaCueIndex(const char *text) {
+  const std::string_view value{text};
+  std::uint32_t cue{};
+  const auto *const value_end = value.data() + value.size();
+  const auto [end, error] =
+      std::from_chars(value.data(), value_end, cue);
+  if (error != std::errc{} || end != value_end || cue > 2047U) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "XA cue index must be in the range 0..2047"};
+  }
+  return cue;
 }
 
 int inspect(const char *path) {
@@ -829,6 +846,143 @@ int mapXaStreams(const char *cue_path, const char *output_path) {
   }
   std::cout << "Mapped " << streams.size() << " XA streams from " << path
             << " across " << sector_count << " sectors\n";
+  return 0;
+}
+
+int extractXaCue(const char *cue_path, std::uint32_t cue,
+                 const char *output_path) {
+  auto disc = openDisc(cue_path);
+  if (!disc.game() || disc.game()->layout.streaming_audio_path.empty() ||
+      !disc.image().hasRawSectors()) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "XA cue extraction requires a recognized raw-sector game disc"};
+  }
+  const auto path = std::string{disc.game()->layout.streaming_audio_path};
+  const auto entry = disc.image().find(path);
+  if (entry.is_directory) {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                          "Streaming-audio path is a directory"};
+  }
+  const auto sector_count = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(entry.size) +
+       sf::disc::Iso9660Image::logical_sector_size - 1U) /
+      sf::disc::Iso9660Image::logical_sector_size);
+  constexpr auto channels_per_group = std::uint32_t{15U};
+  const auto target_group = cue / channels_per_group;
+  const auto target_channel = static_cast<std::uint8_t>(
+      cue % channels_per_group);
+
+  auto output = std::ofstream{std::filesystem::path{output_path},
+                              std::ios::binary | std::ios::trunc};
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Could not create XA cue WAV"};
+  }
+  const auto write_u16 = [&output](std::uint16_t value) {
+    const std::array bytes{
+        static_cast<char>(value & 0xffU),
+        static_cast<char>((value >> 8U) & 0xffU),
+    };
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  };
+  const auto write_u32 = [&output](std::uint32_t value) {
+    const std::array bytes{
+        static_cast<char>(value & 0xffU),
+        static_cast<char>((value >> 8U) & 0xffU),
+        static_cast<char>((value >> 16U) & 0xffU),
+        static_cast<char>((value >> 24U) & 0xffU),
+    };
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  };
+  output.write("RIFF", 4);
+  write_u32(0U);
+  output.write("WAVEfmt ", 8);
+  write_u32(16U);
+  write_u16(1U);
+  write_u16(2U);
+  write_u32(sf::psx::XaAudioDecoder::output_sample_rate_hz);
+  constexpr auto frame_bytes = std::uint16_t{4U};
+  write_u32(sf::psx::XaAudioDecoder::output_sample_rate_hz * frame_bytes);
+  write_u16(frame_bytes);
+  write_u16(16U);
+  output.write("data", 4);
+  write_u32(0U);
+
+  auto decoder = sf::psx::XaAudioDecoder{};
+  std::array<std::byte, sf::psx::XaAudioDecoder::raw_sector_size> sector{};
+  std::array<sf::psx::SpuPcmFrame,
+             sf::psx::XaAudioDecoder::maximum_output_frames>
+      pcm{};
+  auto clip = std::uint32_t{};
+  auto decoded_sectors = std::uint32_t{};
+  auto decoded_frames = std::uint64_t{};
+  auto found = false;
+  for (auto index = std::uint32_t{}; index < sector_count; ++index) {
+    if (!disc.image().copyRawSector(entry.extent_lba + index, sector)) {
+      throw sf::core::Error{sf::core::ErrorCode::io,
+                            "Could not read an XA cue sector"};
+    }
+    constexpr auto subheader = std::size_t{16U};
+    const auto file = std::to_integer<std::uint8_t>(sector[subheader]);
+    const auto channel =
+        std::to_integer<std::uint8_t>(sector[subheader + 1U]);
+    const auto submode =
+        std::to_integer<std::uint8_t>(sector[subheader + 2U]);
+    const auto repeated = sector[subheader] == sector[subheader + 4U] &&
+                          sector[subheader + 1U] == sector[subheader + 5U] &&
+                          sector[subheader + 2U] == sector[subheader + 6U] &&
+                          sector[subheader + 3U] == sector[subheader + 7U];
+    constexpr auto audio_form2 = std::uint8_t{0x24U};
+    constexpr auto eof = std::uint8_t{0x80U};
+    if (!repeated || file != 1U || channel != target_channel ||
+        (submode & audio_form2) != audio_form2) {
+      continue;
+    }
+    if (clip == target_group) {
+      found = true;
+      const auto decoded = decoder.decodeSector(sector, pcm);
+      if (!decoded.succeeded()) {
+        throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                              "Could not decode the selected XA cue"};
+      }
+      output.write(reinterpret_cast<const char *>(pcm.data()),
+                   static_cast<std::streamsize>(
+                       decoded.frames_written * sizeof(pcm.front())));
+      ++decoded_sectors;
+      decoded_frames += decoded.frames_written;
+    }
+    if ((submode & eof) != 0U) {
+      if (clip == target_group) {
+        break;
+      }
+      ++clip;
+      decoder.reset();
+    }
+  }
+  if (!found || decoded_frames == 0U ||
+      decoded_frames >
+          std::numeric_limits<std::uint32_t>::max() / frame_bytes) {
+    output.close();
+    std::filesystem::remove(std::filesystem::path{output_path});
+    throw sf::core::Error{sf::core::ErrorCode::not_found,
+                          "XA cue is not present on this disc"};
+  }
+  const auto data_bytes =
+      static_cast<std::uint32_t>(decoded_frames * frame_bytes);
+  output.seekp(4, std::ios::beg);
+  write_u32(36U + data_bytes);
+  output.seekp(40, std::ios::beg);
+  write_u32(data_bytes);
+  output.close();
+  if (!output) {
+    throw sf::core::Error{sf::core::ErrorCode::io,
+                          "Could not finalize XA cue WAV"};
+  }
+  std::cout << "Extracted XA cue " << cue << " (group=" << target_group
+            << " channel=" << static_cast<unsigned int>(target_channel)
+            << ") from " << decoded_sectors << " sectors / "
+            << decoded_frames << " frames to " << output_path << '\n';
   return 0;
 }
 
@@ -6485,7 +6639,54 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool retail_completion_flow,
                            bool compact_movie_trace,
                            std::uint32_t mission_index,
-                           std::uint32_t scripted_movie_ordinal) {
+                           std::uint32_t scripted_movie_ordinal,
+                           const std::optional<std::filesystem::path>
+                               &input_replay_path) {
+  auto input_replay = std::vector<sf::game::LegacyHostPadState>{};
+  if (input_replay_path) {
+    auto replay = std::ifstream{*input_replay_path};
+    auto magic = std::string{};
+    auto recorded_mission = std::uint32_t{};
+    if (!(replay >> magic >> recorded_mission) || magic != "SF2PAD1" ||
+        recorded_mission != mission_index) {
+      std::cerr << "SF2 product replay rejected: path="
+                << input_replay_path->string() << " mission="
+                << recorded_mission << " expected=" << mission_index << '\n';
+      return 1;
+    }
+    for (;;) {
+      auto buttons_value = unsigned int{};
+      auto face_value = unsigned int{};
+      auto explicit_value = unsigned int{};
+      auto left_x = unsigned int{};
+      auto left_y = unsigned int{};
+      auto right_x = unsigned int{};
+      auto right_y = unsigned int{};
+      if (!(replay >> buttons_value >> face_value >> explicit_value >> left_x >>
+            left_y >> right_x >> right_y)) {
+        break;
+      }
+      input_replay.push_back(sf::game::LegacyHostPadState{
+          .buttons = static_cast<std::uint16_t>(buttons_value),
+          .face_axis_buttons = static_cast<std::uint16_t>(face_value),
+          .use_explicit_face_axis_buttons = explicit_value != 0U,
+          .left_x = static_cast<std::uint8_t>(left_x),
+          .left_y = static_cast<std::uint8_t>(left_y),
+          .right_x = static_cast<std::uint8_t>(right_x),
+          .right_y = static_cast<std::uint8_t>(right_y),
+      });
+    }
+    if (input_replay.empty()) {
+      std::cerr << "SF2 product replay contains no pad samples: path="
+                << input_replay_path->string() << '\n';
+      return 1;
+    }
+    frames = std::min(frames,
+                      static_cast<std::uint32_t>(input_replay.size()));
+    std::cout << "SF2 product replay: path=" << input_replay_path->string()
+              << " samples=" << input_replay.size()
+              << " updates=" << frames << '\n';
+  }
   sf::game::Sf2GuestMissionRuntime runtime{
       std::filesystem::path{cue_path}, mission_index};
   if (!runtime.ready()) {
@@ -6506,20 +6707,51 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   auto pcm_frames = std::uint64_t{};
   auto nonzero_pcm_frames = std::uint64_t{};
   auto peak_pcm_sample = std::uint16_t{};
+  struct AudioWindow {
+    std::uint32_t end_frame{};
+    std::uint32_t system_clock{};
+    std::uint64_t pcm_frames{};
+    std::uint64_t nonzero_frames{};
+    std::uint64_t absolute_sum{};
+    std::uint16_t peak{};
+    std::size_t active_voices{};
+    std::uint64_t key_on_writes{};
+    std::uint64_t key_off_writes{};
+    std::uint64_t xa_sectors{};
+    std::uint32_t active_mask{};
+    std::uint32_t endx{};
+    std::uint32_t sequence_cursor{};
+    std::uint32_t sequence_countdown{};
+    std::uint32_t sequence_step{};
+    std::uint16_t sequence_tempo{};
+    std::uint8_t sequence_flags{};
+  };
+  std::vector<AudioWindow> audio_windows;
+  auto window_pcm_frames = std::uint64_t{};
+  auto window_nonzero_pcm_frames = std::uint64_t{};
+  auto window_pcm_absolute_sum = std::uint64_t{};
+  auto window_pcm_peak = std::uint16_t{};
   const auto inspect_pcm = [&](std::size_t count) {
     for (const auto &sample : std::span{pcm}.first(count)) {
       const auto left = static_cast<std::int32_t>(sample.left);
       const auto right = static_cast<std::int32_t>(sample.right);
       if (left != 0 || right != 0) {
         ++nonzero_pcm_frames;
+        ++window_nonzero_pcm_frames;
       }
       const auto magnitude = [](std::int32_t value) {
         return static_cast<std::uint16_t>(
             std::min<std::int32_t>(std::abs(value), 32767));
       };
+      const auto left_magnitude = magnitude(left);
+      const auto right_magnitude = magnitude(right);
       peak_pcm_sample =
-          std::max({peak_pcm_sample, magnitude(left), magnitude(right)});
+          std::max({peak_pcm_sample, left_magnitude, right_magnitude});
+      window_pcm_peak =
+          std::max({window_pcm_peak, left_magnitude, right_magnitude});
+      window_pcm_absolute_sum += left_magnitude + right_magnitude;
     }
+    window_pcm_frames += count;
   };
   auto first_restore_frame = std::uint32_t{};
   auto mission_completion_observed = false;
@@ -6941,6 +7173,13 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       }
       pad = quick_state_replay_pads[replay_index];
     }
+    if (!input_replay.empty()) {
+      pad = input_replay[frame];
+      // Repository replays are captured with diagnostic health pinning. Keep
+      // the command-line probe faithful to the product replay path so combat
+      // cannot terminate the transcript before its recorded endpoint.
+      static_cast<void>(runtime.setPlayerHealthForProbe(150U));
+    }
     runtime.setHostPadState(pad);
     if (!runtime.advanceHostUpdate()) {
       if (runtime.missionCompleteRequested()) {
@@ -6966,8 +7205,13 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         }
         std::cerr << std::dec << " fault=" << runtime.faultDetail() << '\n';
       }
-      std::cerr << "SF2 product runtime stopped at frame " << frame << ": "
-                << runtime.faultDetail() << '\n';
+      const auto stopped = runtime.diagnostics();
+      std::cerr << "SF2 product runtime stopped at frame " << frame
+                << ": xa=" << stopped.xa_stream_starts << "/"
+                << stopped.xa_stream_stops << "/mount:"
+                << (stopped.xa_relative_extent_active ? 1U : 0U) << " cd="
+                << stopped.cd_lba << "/" << stopped.cd_reading
+                << " fault=" << runtime.faultDetail() << '\n';
       return 7;
     }
     if (runtime.missionCompleteRequested()) {
@@ -6988,6 +7232,33 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       inspect_pcm(count);
     }
     const auto frame_diagnostics = runtime.diagnostics();
+    constexpr std::uint32_t audio_window_updates = 120U;
+    if ((frame + 1U) % audio_window_updates == 0U ||
+        frame + 1U == frames) {
+      audio_windows.push_back(AudioWindow{
+          frame + 1U,
+          frame_diagnostics.system_clock,
+          window_pcm_frames,
+          window_nonzero_pcm_frames,
+          window_pcm_absolute_sum,
+          window_pcm_peak,
+          frame_diagnostics.active_spu_voices,
+          frame_diagnostics.spu_key_on_writes,
+          frame_diagnostics.spu_key_off_writes,
+          frame_diagnostics.xa_sectors_admitted,
+          frame_diagnostics.spu_active_voice_mask,
+          frame_diagnostics.spu_endx,
+          frame_diagnostics.sound_sequence_cursor,
+          frame_diagnostics.sound_sequence_countdown,
+          frame_diagnostics.sound_sequence_step,
+          frame_diagnostics.sound_sequence_tempo,
+          frame_diagnostics.sound_sequence_flags,
+      });
+      window_pcm_frames = 0U;
+      window_nonzero_pcm_frames = 0U;
+      window_pcm_absolute_sum = 0U;
+      window_pcm_peak = 0U;
+    }
     if (frame_diagnostics.application_state != last_application_state) {
       last_application_state = frame_diagnostics.application_state;
       application_state_transitions.emplace_back(frame + 1U,
@@ -7486,7 +7757,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                               packet.gp0_words.end());
   }
   const auto input_mode =
-      weapon_cycle   ? "weapons"
+      !input_replay.empty() ? "replay"
+      : weapon_cycle   ? "weapons"
       : pause_flow   ? "pause"
       : retail_completion_flow ? "completeflow"
       : mission_complete_probe ? "complete"
@@ -7808,6 +8080,57 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << static_cast<unsigned int>(diagnostics.xa_stream_set) << "/"
             << static_cast<unsigned int>(diagnostics.xa_file) << "/"
             << static_cast<unsigned int>(diagnostics.xa_channel)
+            << "/sectors=" << diagnostics.xa_sectors_received << "/"
+            << diagnostics.xa_sectors_admitted << "/busy:"
+            << diagnostics.xa_sectors_rejected_busy << "/decode:"
+            << diagnostics.xa_sectors_rejected_decode << "/muted:"
+            << diagnostics.xa_sectors_muted << "/frames:"
+            << diagnostics.xa_frames_admitted << "/maxq:"
+            << diagnostics.xa_maximum_queued_frames << "/span:"
+            << static_cast<unsigned int>(diagnostics.xa_has_received_sector)
+            << ':' << diagnostics.xa_first_received_lba << ':'
+            << static_cast<unsigned int>(diagnostics.xa_first_received_file)
+            << ':'
+            << static_cast<unsigned int>(diagnostics.xa_first_received_channel)
+            << '-' << diagnostics.xa_last_received_lba << ':'
+            << static_cast<unsigned int>(diagnostics.xa_last_received_file)
+            << ':'
+            << static_cast<unsigned int>(diagnostics.xa_last_received_channel)
+            << " windows=";
+  for (const auto &window : audio_windows) {
+    const auto mean =
+        window.pcm_frames == 0U
+            ? 0U
+            : window.absolute_sum / (window.pcm_frames * 2U);
+    std::cout << window.end_frame << "." << window.system_clock << ":"
+              << window.pcm_frames << "/" << window.nonzero_frames << "/"
+              << mean << "/" << window.peak << "/v"
+              << window.active_voices << "/k" << window.key_on_writes << "/"
+              << window.key_off_writes << "/x" << window.xa_sectors
+              << "/m" << std::hex << std::uppercase << window.active_mask
+              << "/e" << window.endx << "/seq:" << window.sequence_cursor
+              << "/" << window.sequence_countdown << "/"
+              << window.sequence_step << "/"
+              << static_cast<unsigned int>(window.sequence_tempo) << "/"
+              << static_cast<unsigned int>(window.sequence_flags)
+              << std::dec << ",";
+  }
+  std::cout << " ended-voices=";
+  for (auto voice = std::size_t{};
+       voice < diagnostics.spu_voice_block_flags.size(); ++voice) {
+    const auto bit = static_cast<std::uint32_t>(1U << voice);
+    if ((diagnostics.spu_endx & bit) == 0U ||
+        (diagnostics.spu_active_voice_mask & bit) != 0U) {
+      continue;
+    }
+    std::cout << voice << ":" << std::hex << std::uppercase
+              << static_cast<unsigned int>(
+                     diagnostics.spu_voice_block_flags[voice])
+              << "/" << diagnostics.spu_voice_block_addresses[voice] << "/"
+              << diagnostics.spu_voice_repeat_addresses[voice] << std::dec
+              << ",";
+  }
+  std::cout
             << " first-xa-frame=" << first_xa_frame
             << " max-cd-lba=" << maximum_cd_lba
             << "/" << maximum_relative_cd_lba
@@ -7849,8 +8172,12 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << static_cast<unsigned int>(diagnostics.scene_speech_stage) << "/"
             << static_cast<unsigned int>(diagnostics.scene_speech_io_ready)
             << ":" << diagnostics.spatial_sound_starts << "/"
-            << diagnostics.scene_sound_cue_plays << ":callbacks="
+            << diagnostics.scene_sound_cue_plays << ":sound-service="
             << std::hex << std::uppercase;
+  for (const auto value : diagnostics.sound_service_globals) {
+    std::cout << value << "/";
+  }
+  std::cout << ":callbacks=";
   for (const auto callback : diagnostics.interrupt_callbacks) {
     std::cout << callback << "/";
   }
@@ -7884,7 +8211,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.xa_status_result << std::dec << "/"
             << diagnostics.xa_cue_plays << "/"
             << diagnostics.xa_stream_starts << "/"
-            << diagnostics.xa_stream_stops
+            << diagnostics.xa_stream_stops << "/mount:"
+            << (diagnostics.xa_relative_extent_active ? 1U : 0U)
             << " completion-flow=" << diagnostics.campaign_advance_calls
             << "/" << diagnostics.movie_request_calls << "/"
             << diagnostics.movie_playback_init_calls << "/title="
@@ -7946,7 +8274,23 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     for (const auto argument : event.arguments) {
       std::cout << argument << "/";
     }
-    std::cout << std::dec << "),";
+    std::cout << std::dec << ";cd=" << event.cd_lba << "/"
+              << event.spu_cd_frames << "/"
+              << static_cast<unsigned int>(event.cd_reading) << "/"
+              << static_cast<unsigned int>(event.cd_muted) << "/"
+              << static_cast<unsigned int>(event.cd_adpcm_muted)
+              << ";xa="
+              << static_cast<unsigned int>(event.xa_stream_set) << "/"
+              << static_cast<unsigned int>(event.xa_file) << "/"
+              << static_cast<unsigned int>(event.xa_channel) << "/"
+              << event.xa_sectors_received << "/"
+              << event.xa_sectors_admitted << ";branch="
+              << std::hex << std::uppercase
+              << event.mission_progress_visible_bits << "/"
+              << event.player_packed_state_pointer << "/"
+              << event.player_packed_state_bit51_word << "/"
+              << std::dec << (event.player_packed_state_bit51 ? 1U : 0U)
+              << "),";
   }
   std::cout
             << " async-file=" << diagnostics.async_file_services << "/"
@@ -12348,6 +12692,9 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view{argv[1]} == "map-xa-streams") {
       return mapXaStreams(argv[2], argv[3]);
     }
+    if (argc == 5 && std::string_view{argv[1]} == "extract-xa-cue") {
+      return extractXaCue(argv[2], parseXaCueIndex(argv[3]), argv[4]);
+    }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-vm") {
       return probeLegacyVm(argv[2]);
     }
@@ -12389,7 +12736,7 @@ int main(int argc, char **argv) {
         std::string_view{argv[1]} == "probe-sf2-product-runtime") {
       const auto mode = argc >= 5 ? std::string_view{argv[4]}
                                   : std::string_view{};
-      if (argc == 7 && mode != "movies") {
+      if (argc == 7 && mode != "movies" && mode != "replay") {
         printUsage();
         return 1;
       }
@@ -12400,6 +12747,7 @@ int main(int argc, char **argv) {
           mode != "weapons" && mode != "pause" && mode != "complete" &&
           mode != "completeflow" &&
           mode != "movies" &&
+          mode != "replay" &&
           mode != "ui" &&
           mode != "uiobjective" &&
           mode != "quickstate" && mode != "quickobjective") {
@@ -12420,7 +12768,10 @@ int main(int argc, char **argv) {
           mode == "completeflow",
           mode == "movies",
           argc >= 6 ? parseSf2MissionIndex(argv[5]) : 2U,
-          argc == 7 ? parseSf2MovieOrdinal(argv[6]) : 0U);
+          argc == 7 && mode == "movies" ? parseSf2MovieOrdinal(argv[6]) : 0U,
+          argc == 7 && mode == "replay"
+              ? std::optional<std::filesystem::path>{argv[6]}
+              : std::nullopt);
     }
     if (argc == 3 && std::string_view{argv[1]} == "probe-legacy-cd") {
       return probeLegacyCd(argv[2]);

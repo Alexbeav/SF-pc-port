@@ -13987,9 +13987,15 @@ SceneViewerResult runSf2GuestScene(
   // DMA without retaining a second framebuffer. Seed PsyCross with the same
   // parsed retail VLF/VRAM pages used by the native scene shell; GP0 tpage,
   // CLUT and UV values then address their authored mission residency.
-  TextureStreamer textures{mission};
-  textures.ensure(native_residency);
-  HudTextureAtlas hud_textures{mission};
+  // TextureStreamer retains PS1 VRAM-sized scratch/state buffers. Keeping it
+  // and the HUD atlas in this already-large gameplay loop's stack frame left
+  // almost no headroom beneath Windows' default 1 MiB thread stack. Movie and
+  // driver callbacks could then trip __chkstk before gameplay even became
+  // observable. Their lifetime is still scoped to the scene, but their large
+  // storage belongs on the heap.
+  auto textures = std::make_unique<TextureStreamer>(mission);
+  textures->ensure(native_residency);
+  auto hud_textures = std::make_unique<HudTextureAtlas>(mission);
   game::GameplayHud guest_hud;
   guest_hud.inventory().resetUnarmed();
   // SF2 publishes 735 native-rate PCM frames per 60 Hz host update. A single
@@ -14010,6 +14016,14 @@ SceneViewerResult runSf2GuestScene(
   auto simulation_accumulator = 0.0;
   auto previous_counter = SDL_GetPerformanceCounter();
   const auto frequency = SDL_GetPerformanceFrequency();
+  const auto periodic_audio_diagnostics = psyCrossAudioDiagnosticsEnabled();
+  auto next_audio_diagnostic_counter = previous_counter + frequency;
+  auto audio_diagnostic_sequence = std::uint64_t{};
+  auto audio_pcm_frames_pumped = std::uint64_t{};
+  auto audio_pcm_blocks_pumped = std::uint64_t{};
+  auto audio_diagnostic_sample_frames = std::uint64_t{};
+  auto audio_diagnostic_absolute_sum = std::uint64_t{};
+  auto audio_diagnostic_peak = std::uint32_t{};
   auto pause_was_down = false;
   auto quick_save_was_down = false;
   auto quick_load_was_down = false;
@@ -14387,8 +14401,8 @@ SceneViewerResult runSf2GuestScene(
           static_cast<void>(native_residency.synchronizeGuestRoom(
               restored.guest_current_room));
         }
-        textures.invalidate();
-        textures.ensure(native_residency);
+        textures->invalidate();
+        textures->ensure(native_residency);
         texture_room = native_residency.currentRoom();
         texture_bank = static_cast<unsigned int>(
             native_residency.textureBankAt(
@@ -14396,7 +14410,7 @@ SceneViewerResult runSf2GuestScene(
                 static_cast<double>(restored.player_z)));
         pending_texture_room = 0xffffU;
         pending_texture_room_frames = 0U;
-        hud_textures.invalidate();
+        hud_textures->invalidate();
         PsyX_Log_Info(
             "SF2 quick state loaded: frame=%llu clock=%u "
             "player=(%d,%d,%d) room=%u\n",
@@ -14696,7 +14710,13 @@ SceneViewerResult runSf2GuestScene(
     }
     host_pad.buttons =
         static_cast<std::uint16_t>(host_pad.buttons | controller_held);
-    host_pad.face_axis_buttons = controller_held;
+    // SF2's processed PAD record also has derived horizontal/vertical fields
+    // for pressure-capable face inputs. Feeding ordinary SDL face buttons into
+    // both representations makes Cross crouch + walk backward and Circle roll
+    // + turn right (with the mirrored Square/Triangle conflicts as well).
+    // Preserve the physical buttons losslessly, but keep those unrelated axes
+    // neutral; actual movement/look comes from the two analog sticks below.
+    host_pad.face_axis_buttons = 0U;
     host_pad.use_explicit_face_axis_buttons = true;
     const auto analog_active = [](std::uint8_t value) {
       return std::abs(static_cast<int>(value) - 128) > 20;
@@ -14816,7 +14836,24 @@ SceneViewerResult runSf2GuestScene(
       // whole batch so the bounded gameplay FIFO never mistakes ordinary
       // host catch-up for runaway guest audio production.
       while (const auto count = runtime.takePcm(pcm)) {
+        for (const auto &sample :
+             std::span<const psx::SpuPcmFrame>{pcm}.first(count)) {
+          const auto left = sample.left < 0
+                                ? static_cast<std::uint32_t>(
+                                      -static_cast<std::int32_t>(sample.left))
+                                : static_cast<std::uint32_t>(sample.left);
+          const auto right = sample.right < 0
+                                 ? static_cast<std::uint32_t>(
+                                       -static_cast<std::int32_t>(sample.right))
+                                 : static_cast<std::uint32_t>(sample.right);
+          audio_diagnostic_absolute_sum += left + right;
+          audio_diagnostic_peak =
+              std::max(audio_diagnostic_peak, std::max(left, right));
+        }
+        audio_diagnostic_sample_frames += count;
         audio.queue(std::span<const psx::SpuPcmFrame>{pcm}.first(count));
+        audio_pcm_frames_pumped += count;
+        ++audio_pcm_blocks_pumped;
       }
       simulation_accumulator =
           std::max(0.0, simulation_accumulator - simulation_step);
@@ -14855,6 +14892,77 @@ SceneViewerResult runSf2GuestScene(
       }
     }
     audio.update();
+    if (periodic_audio_diagnostics && frequency != 0U &&
+        counter >= next_audio_diagnostic_counter) {
+      ++audio_diagnostic_sequence;
+      audio.logDiagnostics("sf2-periodic");
+      const auto guest = runtime.diagnostics();
+      PsyX_Log_Info(
+          "[AudioDiag][sf2-guest] sequence=%llu clock=%u "
+          "mixed=%llu pcm_queued=%zu pcm_dropped=%llu cd_queued=%zu "
+          "voices=%zu spucnt=0x%04x spustat=0x%04x cd_read=%u "
+          "cd_lba=%u cd_mute=%u adpcm_mute=%u xa_set=%u file=%u "
+          "channel=%u sectors=%llu/%llu/busy:%llu/decode:%llu/"
+          "muted:%llu frames=%llu maxq=%zu xa_span=%u:%u:%u:%u-%u:%u:%u "
+          "sound_tick=%u sound_hooks=0x%08x/0x%08x sound_flags=%u/%u "
+          "sequence=0x%08x/0x%08x/%u/%u/%u/0x%02x "
+          "host_frames=%llu "
+          "host_blocks=%llu pcm_window=%llu/mean:%llu/peak:%u "
+          "accumulator_ms=%.3f\n",
+          static_cast<unsigned long long>(audio_diagnostic_sequence),
+          guest.system_clock,
+          static_cast<unsigned long long>(guest.spu_mixed_frames),
+          guest.spu_pcm_frames,
+          static_cast<unsigned long long>(guest.spu_dropped_pcm_frames),
+          guest.spu_cd_frames, guest.active_spu_voices,
+          static_cast<unsigned int>(guest.spu_control),
+          static_cast<unsigned int>(guest.spu_status),
+          static_cast<unsigned int>(guest.cd_reading), guest.cd_lba,
+          static_cast<unsigned int>(guest.cd_muted),
+          static_cast<unsigned int>(guest.cd_adpcm_muted),
+          static_cast<unsigned int>(guest.xa_stream_set),
+          static_cast<unsigned int>(guest.xa_file),
+          static_cast<unsigned int>(guest.xa_channel),
+          static_cast<unsigned long long>(guest.xa_sectors_received),
+          static_cast<unsigned long long>(guest.xa_sectors_admitted),
+          static_cast<unsigned long long>(guest.xa_sectors_rejected_busy),
+          static_cast<unsigned long long>(guest.xa_sectors_rejected_decode),
+          static_cast<unsigned long long>(guest.xa_sectors_muted),
+          static_cast<unsigned long long>(guest.xa_frames_admitted),
+          guest.xa_maximum_queued_frames,
+          static_cast<unsigned int>(guest.xa_has_received_sector),
+          guest.xa_first_received_lba,
+          static_cast<unsigned int>(guest.xa_first_received_file),
+          static_cast<unsigned int>(guest.xa_first_received_channel),
+          guest.xa_last_received_lba,
+          static_cast<unsigned int>(guest.xa_last_received_file),
+          static_cast<unsigned int>(guest.xa_last_received_channel),
+          guest.sound_service_globals[3U],
+          guest.sound_service_globals[4U],
+          guest.sound_service_globals[5U],
+          guest.sound_service_globals[6U],
+          guest.sound_service_globals[7U],
+          guest.sound_sequence_pointer,
+          guest.sound_sequence_cursor,
+          guest.sound_sequence_countdown,
+          guest.sound_sequence_step,
+          static_cast<unsigned int>(guest.sound_sequence_tempo),
+          static_cast<unsigned int>(guest.sound_sequence_flags),
+          static_cast<unsigned long long>(audio_pcm_frames_pumped),
+          static_cast<unsigned long long>(audio_pcm_blocks_pumped),
+          static_cast<unsigned long long>(audio_diagnostic_sample_frames),
+          static_cast<unsigned long long>(
+              audio_diagnostic_sample_frames == 0U
+                  ? 0U
+                  : audio_diagnostic_absolute_sum /
+                        (audio_diagnostic_sample_frames * 2U)),
+          audio_diagnostic_peak,
+          simulation_accumulator * 1000.0);
+      audio_diagnostic_sample_frames = 0U;
+      audio_diagnostic_absolute_sum = 0U;
+      audio_diagnostic_peak = 0U;
+      next_audio_diagnostic_counter = counter + frequency;
+    }
     if (const auto &frame = runtime.presentationFrame()) {
       const auto diagnostics = runtime.diagnostics();
       for (auto index = std::size_t{}; index < ram_dump_clocks.size();
@@ -15182,7 +15290,7 @@ SceneViewerResult runSf2GuestScene(
             pending_texture_room != texture_room &&
             native_residency.synchronizeGuestRoom(
                 pending_texture_room)) {
-          textures.ensure(native_residency);
+          textures->ensure(native_residency);
           texture_room = native_residency.currentRoom();
           texture_bank = static_cast<unsigned int>(
               native_residency.textureBankAt(
@@ -15516,8 +15624,8 @@ SceneViewerResult runSf2GuestScene(
         // every draw. It can overwrite the native HUD residency without
         // changing the HUD's logical weapon/font state, so invalidate that
         // cache and restore the small overlay atlas after the guest frame.
-        hud_textures.invalidateGuestWritablePalette();
-        hud_textures.restoreGameplay(
+        hud_textures->invalidateGuestWritablePalette();
+        hud_textures->restoreGameplay(
             guest_hud, raw.aim,
             std::span<const game::LegacyDroppedItemBridgeState>{},
             std::span<const game::GameplayProjectile>{});
@@ -15526,7 +15634,7 @@ SceneViewerResult runSf2GuestScene(
         // therefore draw once without guessing whether this was a sparse UI
         // submission.
         if (!disable_native_hud) {
-          drawSf2GuestHud(hud_textures, guest_hud, diagnostics, false,
+          drawSf2GuestHud(*hud_textures, guest_hud, diagnostics, false,
                           std::string_view{}, std::string_view{},
                           guest_ui_overlay);
         }
@@ -15643,6 +15751,10 @@ SceneViewerResult runSf2GuestScene(
 
 } // namespace
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4702)
+#endif
 SceneViewerResult PsyCrossSceneViewer::run(
     const game::MissionPackage &mission, PADRAW &pad,
     std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
@@ -17141,5 +17253,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
   }
   return SceneViewerResult{previous_buttons, SceneExitReason::exit_application};
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 } // namespace sf::platform::detail

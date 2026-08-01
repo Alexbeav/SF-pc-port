@@ -63,10 +63,12 @@ playthroughs remain the release gate.
    timer, actor dots/threat cones, TARGET/DANGER, health/armor, weapon art,
    objective/pickup/general text, and cutscene/checkpoint reveal timing render
    from the authored GPU packets. Pause/map presentation is also stable.
-3. **Mission 1 opening fidelity — complete.** The exact `2_1.STR` opening is
-   mapped, and moving Colorado Mountains' loading-confirmation pulse from PAD
-   poll 8 to poll 1 prevents that input edge from skipping the early parachute
-   choreography. Its 1,800-update neutral route reaches stable gameplay.
+3. **Mission 1 opening fidelity — candidate fix awaiting playtest.** The exact
+   `2_1.STR` opening is mapped. Colorado Mountains' loading dispatcher formerly
+   forced the decoded Cross-press register and skipped the early parachute
+   choreography; it now uses retail's adjacent loading-ready byte while leaving
+   PAD neutral. Its headless bootstrap reaches stable gameplay, but the complete
+   in-engine opening still needs interactive confirmation.
 4. **All-mission validation** — complete all 21 missions while auditing
    objectives, conversations, failure conditions, bosses, special mechanics,
    checkpoints, mission-specific audio/resources, and end-of-level transitions.

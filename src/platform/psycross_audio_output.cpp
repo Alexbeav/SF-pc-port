@@ -232,30 +232,41 @@ void PsyCrossAudioOutput::queue(std::span<const psx::SpuPcmFrame> frames) {
   }
 
   submitted_frames_ += frames.size();
-
-  if (buffer_callback_ != nullptr) {
-    compactStaging();
-    const auto staged_count = staged_frames_.size() - staged_offset_;
-    if (frames.size() > maximum_staged_frames -
-                            std::min(staged_count, maximum_staged_frames)) {
+  compactStaging();
+  const auto staged_count = staged_frames_.size() - staged_offset_;
+  auto accepted_frames = frames;
+  if (frames.size() > maximum_staged_frames -
+                          std::min(staged_count, maximum_staged_frames)) {
+    if (stream_kind_ != PsyCrossAudioStreamKind::continuous) {
       throw core::Error{core::ErrorCode::io,
                         "Gameplay audio timeline exceeded its FIFO bound"};
     }
-    staged_frames_.insert(staged_frames_.end(), frames.begin(), frames.end());
+    // A realtime gameplay sink cannot preserve seconds of stale PCM and stay
+    // synchronized. Stop the callback/queue generation, discard its backlog,
+    // and retain the newest bounded tail. reset() synchronizes the OpenAL
+    // callback before clearing the SPSC ring, and the ordinary startup fade
+    // masks the resulting discontinuity.
+    ++fifo_recoveries_;
+    PsyX_Log_Warning(
+        "[AudioDiag][fifo-recovery] role=%s sequence=%llu staged=%zu "
+        "incoming=%zu bound=%zu; stale timeline discarded\n",
+        diagnostic_name_.c_str(),
+        static_cast<unsigned long long>(fifo_recoveries_), staged_count,
+        frames.size(), maximum_staged_frames);
+    reset("fifo-bound-recovery");
+    if (accepted_frames.size() > maximum_staged_frames) {
+      accepted_frames =
+          accepted_frames.last(maximum_staged_frames);
+    }
+  }
+  staged_frames_.insert(staged_frames_.end(), accepted_frames.begin(),
+                        accepted_frames.end());
+  if (buffer_callback_ != nullptr) {
     fillCallbackRing();
     applyGainStep();
     startIfNeeded();
     return;
   }
-
-  compactStaging();
-  const auto staged_count = staged_frames_.size() - staged_offset_;
-  if (frames.size() > maximum_staged_frames -
-                          std::min(staged_count, maximum_staged_frames)) {
-    throw core::Error{core::ErrorCode::io,
-                      "Gameplay audio timeline exceeded its FIFO bound"};
-  }
-  staged_frames_.insert(staged_frames_.end(), frames.begin(), frames.end());
   collectProcessed();
   uploadReadyBuffers(false);
   applyGainStep();
@@ -389,6 +400,22 @@ ALsizei PsyCrossAudioOutput::fillStream(ALvoid *samples,
   if (requested == 0U) {
     return byte_count;
   }
+  callback_requests_.fetch_add(1U, std::memory_order_relaxed);
+  auto maximum_request =
+      callback_maximum_request_frames_.load(std::memory_order_relaxed);
+  while (maximum_request < requested &&
+         !callback_maximum_request_frames_.compare_exchange_weak(
+             maximum_request, requested, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
+  const auto available_before = stream_frames_.size();
+  auto minimum_ring =
+      callback_minimum_ring_frames_.load(std::memory_order_relaxed);
+  while (minimum_ring > available_before &&
+         !callback_minimum_ring_frames_.compare_exchange_weak(
+             minimum_ring, available_before, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
   auto destination = std::span<psx::SpuPcmFrame>{
       static_cast<psx::SpuPcmFrame *>(samples), requested};
   // The startup prebuffer belongs in startIfNeeded(), before the source first
@@ -398,6 +425,16 @@ ALsizei PsyCrossAudioOutput::fillStream(ALvoid *samples,
   // grows behind the picture. Resume from the next available timeline sample
   // instead and smooth only the discontinuity at the silence boundary.
   const auto recovering = callback_starved_.load(std::memory_order_relaxed);
+  const auto recovery_threshold = std::min(
+      stream_frames_.capacity(), minimum_start_frames_ + requested);
+  if (recovering && available_before < recovery_threshold) {
+    // Do not consume every sub-callback refill immediately. Rebuild one
+    // device-update cushion first, otherwise equal producer/consumer rates
+    // can never escape a starvation loop and emit a pop on every callback.
+    callback_silence_frames_.fetch_add(requested,
+                                       std::memory_order_relaxed);
+    return byte_count;
+  }
   const auto supplied = stream_frames_.pop(destination);
   callback_frames_read_.fetch_add(supplied, std::memory_order_relaxed);
 
@@ -488,8 +525,10 @@ void PsyCrossAudioOutput::logDiagnostics(
       "prebuffer=%u gain=%.3f target_gain=%u pitch=%.3f submitted=%llu "
       "uploaded=%llu producer_staged=%zu recycled=%llu starts=%llu "
       "underruns=%llu "
-      "resets=%llu callback_read=%llu callback_silence=%llu "
-      "callback_starvations=%llu\n",
+      "resets=%llu fifo_recoveries=%llu callback_read=%llu "
+      "callback_silence=%llu "
+      "callback_starvations=%llu callback_requests=%llu "
+      "callback_max_request=%zu callback_min_ring=%zu\n",
       diagnostic_name_.c_str(), static_cast<int>(context.size()),
       context.data(), error == AL_NO_ERROR ? 1U : 0U, static_cast<int>(error),
       buffer_callback_ != nullptr ? "callback" : "queued",
@@ -507,12 +546,17 @@ void PsyCrossAudioOutput::logDiagnostics(
       static_cast<unsigned long long>(source_starts_),
       static_cast<unsigned long long>(source_underruns_),
       static_cast<unsigned long long>(source_resets_),
+      static_cast<unsigned long long>(fifo_recoveries_),
       static_cast<unsigned long long>(
           callback_frames_read_.load(std::memory_order_relaxed)),
       static_cast<unsigned long long>(
           callback_silence_frames_.load(std::memory_order_relaxed)),
       static_cast<unsigned long long>(
-          callback_underruns_.load(std::memory_order_relaxed)));
+          callback_underruns_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+          callback_requests_.load(std::memory_order_relaxed)),
+      callback_maximum_request_frames_.load(std::memory_order_relaxed),
+      callback_minimum_ring_frames_.load(std::memory_order_relaxed));
 }
 
 void PsyCrossAudioOutput::reset(std::string_view reason) noexcept {

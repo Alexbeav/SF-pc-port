@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
@@ -156,6 +157,10 @@ public:
     }
 
     void reset() noexcept {
+        if (reset_) {
+            return;
+        }
+        reset_ = true;
         alSourceStop(source_);
         ALint queued = 0;
         alGetSourcei(source_, AL_BUFFERS_QUEUED, &queued);
@@ -311,6 +316,7 @@ private:
     int sample_rate_{};
     bool start_requested_{};
     bool input_finished_{};
+    bool reset_{};
     platform::AudioOutputStartPolicy start_policy_{3U};
 };
 
@@ -584,6 +590,8 @@ bool waitVideoFrame(
         audio.update();
         presentMovieFrame(video_texture);
         if (allow_skip && (pressed & skip_buttons) != 0) {
+            PsyX_Log_Info("Standalone movie skip edge: buttons=0x%04X\n",
+                          static_cast<unsigned int>(pressed));
             return false;
         }
     } while (clock.elapsedSeconds() < end_time_seconds);
@@ -732,11 +740,29 @@ bool playMovieData(
     MovieVideoTexture video_texture{active_video_mode};
     MoviePlaybackClock clock;
     bool has_frame = false;
+    auto automatic_skip_frame = std::optional<std::uint64_t>{};
+    if (const auto *value = SDL_getenv("SF_MOVIE_AUTO_SKIP_FRAME");
+        value != nullptr && *value != '\0') {
+        char *end{};
+        const auto parsed = std::strtoull(value, &end, 10);
+        if (end != value && end != nullptr && *end == '\0') {
+            automatic_skip_frame = parsed;
+        }
+    }
+    auto decoded_video_frames = std::uint64_t{};
 
     while (stream.hasVideoFrame()) {
         last_frame = stream.takeVideoFrame();
         stream.fill(decoded_ahead_video_frames, audio);
         has_frame = true;
+        if (allow_skip && automatic_skip_frame &&
+            decoded_video_frames++ >= *automatic_skip_frame) {
+            PsyX_Log_Info(
+                "Standalone movie diagnostic auto-skip: frame=%llu\n",
+                static_cast<unsigned long long>(decoded_video_frames - 1U));
+            audio.reset();
+            return false;
+        }
         if (!waitVideoFrame(
                 last_frame,
                 video_texture,

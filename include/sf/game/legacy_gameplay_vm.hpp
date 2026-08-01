@@ -992,7 +992,9 @@ public:
   void bindPsxCdCompletionCallback(std::uint32_t callback_address,
                                    std::uint32_t result_address,
                                    bool callback_is_pointer) noexcept;
-  [[nodiscard]] bool servicePsxCdReadyCallback();
+  [[nodiscard]] bool servicePsxCdReadyCallback(
+      LegacyGameplayVmResult *callback_result = nullptr,
+      std::uint32_t callback_stack_address = 0x807f0000U);
   // Dispatches one callback registered by the retail interrupt/event tables
   // without advancing emulated hardware time. The interrupted CPU context is
   // restored after the callback returns, matching an interrupt boundary.
@@ -1260,7 +1262,9 @@ private:
   waitForCdRomInterrupt(std::uint8_t expected_interrupt) noexcept;
   [[nodiscard]] bool
   acknowledgeCdRomInterrupt(std::uint8_t expected_interrupt) noexcept;
-  [[nodiscard]] bool dispatchCdRomReadyCallback();
+  [[nodiscard]] bool dispatchCdRomReadyCallback(
+      LegacyGameplayVmResult *callback_result = nullptr,
+      std::uint32_t callback_stack_address = 0x807f0000U);
   [[nodiscard]] LegacyHostCall *findHostCall(std::uint32_t address) noexcept;
   [[nodiscard]] const LegacyHostCall *
   findHostCall(std::uint32_t address) const noexcept;

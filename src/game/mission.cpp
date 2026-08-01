@@ -73,7 +73,7 @@ constexpr std::array sf2_missions{
     MissionDefinition{3U, "I-70 Mountain Bridge", "BRIDGE", "BRIDGE.OVL",
                       "5_1.STR", "5_2.STR", 3},
     MissionDefinition{4U, "McKenzie Airbase Exterior", "AIRBASEX",
-                      "AIRBASEX.OVL", "6_1.STR", "6_3.STR", 4},
+                      "AIRBASEX.OVL", "6_1.STR", "", 4},
     MissionDefinition{5U, "Colorado Train Ride", "TRAIN", "TRAIN.OVL",
                       "7_1.STR", "7_2.STR", 5},
     MissionDefinition{6U, "Colorado Train Race", "TRAIN2", "TRAIN2.OVL",

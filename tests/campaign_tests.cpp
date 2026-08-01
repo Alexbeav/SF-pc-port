@@ -197,7 +197,7 @@ void testRetailSavePromptAndTransientCampaign() {
       "",
   };
   constexpr std::array<std::string_view, 21U> sf2_endings{
-      "2_3.STR",  "3_4.STR", "",         "5_2.STR",  "6_3.STR",
+      "2_3.STR",  "3_4.STR", "",         "5_2.STR",  "",
       "7_2.STR",  "8_2.STR", "9_2.STR",  "",         "",
       "",         "13_2.STR", "14_2.STR", "15_3.STR", "",
       "17_3.STR", "18_2.STR", "19_2.STR", "20_3.STR", "21_2.STR",
