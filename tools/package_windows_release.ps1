@@ -149,6 +149,15 @@ not expose this experimental SF2 path. Do not select an SF2 image there.
 CURRENT SCOPE
 =============
 
+IMPORTANT AUDIO / CUTSCENE WARNING
+==================================
+
+- Mission 3 dialogue is not correctly sequenced. Voice lines can trigger at
+  the wrong locations and unrelated dialogue may play. Continue testing, but
+  do not use this build as a dialogue-fidelity reference.
+- Mission 1's in-engine parachute opening currently plays for only about one
+  second before skipping and can also play an incorrect voice line.
+
 - All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
   input, with no renderer containment or collision-residency gaps. Missions 3,
@@ -174,8 +183,8 @@ CURRENT SCOPE
   broader interactive coverage.
 - Mission 1's in-engine parachute opening is prematurely skipped. Other tested
   mission openings play normally.
-- A Mission 3 conversation can run very late and eventually emit unrelated
-  Mission 2 dialogue; skip it with C if progression stalls.
+- Mission 3 dialogue timing and selection remain under active investigation;
+  skip a stalled conversation with C when possible.
 - Quick states are in-session only and do not persist after process exit.
 
 Controls use the existing PC bindings. Mouse aiming works in first person;
@@ -230,6 +239,10 @@ runtime and presents the guest GPU/SPU output through PsyCross. All 21 missions
 can be launched directly, the complete deterministic validation matrix passes,
 and connected campaign/save/movie handoffs are implemented. This remains a
 playtesting build rather than a finished PC port.
+
+Known warning: Mission 3 dialogue can trigger at incorrect locations and play
+unrelated voice lines. Mission 1's in-engine opening still skips early and can
+play an incorrect voice line. These are acknowledged Alpha 6 defects.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.

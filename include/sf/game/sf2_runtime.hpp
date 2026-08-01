@@ -592,6 +592,9 @@ public:
                               std::uint32_t selector) noexcept;
   [[nodiscard]] bool
   activateScriptProgramForProbe(std::string_view name) noexcept;
+  [[nodiscard]] bool
+  startSceneSpeechForProbe(std::uint16_t cue) noexcept;
+  [[nodiscard]] bool stopSceneSpeechForProbe() noexcept;
   [[nodiscard]] bool setPlayerPositionForProbe(
       std::int32_t x, std::int32_t y, std::int32_t z) noexcept;
   [[nodiscard]] bool

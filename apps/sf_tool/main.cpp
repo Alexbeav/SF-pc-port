@@ -107,6 +107,7 @@ void printUsage() {
          "[resource-index-0-based] [scripted-movie-ordinal-0-based]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> <maximum-frames> "
          "replay <resource-index-0-based> <input.sf2pad>\n"
+      << "  sf_tool probe-sf2-apc-dialogue <disc-1.cue> [settle-frames]\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -6629,6 +6630,116 @@ int probeSf2GuestBootstrap(const char *cue_path, std::uint64_t budget,
   return 0;
 }
 
+int probeSf2ApcDialogue(const char *cue_path, std::uint32_t settle_frames) {
+  constexpr std::uint32_t mission_index = 2U;
+  constexpr std::uint32_t timeout = 360U;
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, mission_index};
+  if (!runtime.ready()) {
+    std::cerr << "SF2 APC dialogue runtime failed: "
+              << runtime.faultDetail() << '\n';
+    return 7;
+  }
+  runtime.setHostPadState({});
+  const auto advance = [&runtime](std::uint32_t count) {
+    std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+    for (auto frame = 0U; frame < count; ++frame) {
+      if (!runtime.advanceHostUpdate()) {
+        return false;
+      }
+      while (runtime.takePcm(pcm) != 0U) {
+      }
+    }
+    return true;
+  };
+  if (!advance(settle_frames) ||
+      !runtime.activateScriptProgramForProbe("APC_TUNNEL")) {
+    std::cerr << "SF2 APC dialogue could not prepare APC_TUNNEL: "
+              << runtime.faultDetail() << '\n';
+    return 10;
+  }
+  const auto baseline = runtime.diagnostics();
+  if (!runtime.startSceneSpeechForProbe(6U)) {
+    std::cerr << "SF2 APC dialogue could not execute cue 6\n";
+    return 10;
+  }
+  auto cue6 = runtime.diagnostics();
+  for (auto frame = 0U;
+       frame < timeout &&
+       (cue6.scene_speech_starts == baseline.scene_speech_starts ||
+        cue6.xa_stream_starts == baseline.xa_stream_starts ||
+        cue6.xa_file != 1U || cue6.xa_channel != 6U);
+       ++frame) {
+    if (!advance(1U)) {
+      return 7;
+    }
+    cue6 = runtime.diagnostics();
+  }
+  if (cue6.scene_speech_starts != baseline.scene_speech_starts + 1U ||
+      cue6.last_scene_speech_arguments[0U] != 6U ||
+      cue6.xa_stream_starts <= baseline.xa_stream_starts ||
+      !cue6.xa_relative_extent_active || cue6.xa_file != 1U ||
+      cue6.xa_channel != 6U) {
+    std::cerr << "SF2 APC dialogue did not enter cue 6\n";
+    return 10;
+  }
+  if (!runtime.stopSceneSpeechForProbe()) {
+    std::cerr << "SF2 APC dialogue could not stop cue 6\n";
+    return 10;
+  }
+  auto stopped = runtime.diagnostics();
+  for (auto frame = 0U;
+       frame < timeout &&
+       (stopped.scene_speech_stops <= cue6.scene_speech_stops ||
+        stopped.xa_stream_stops <= cue6.xa_stream_stops ||
+        stopped.xa_relative_extent_active);
+       ++frame) {
+    if (!advance(1U)) {
+      return 7;
+    }
+    stopped = runtime.diagnostics();
+  }
+  if (stopped.scene_speech_stops <= cue6.scene_speech_stops ||
+      stopped.xa_stream_stops <= cue6.xa_stream_stops ||
+      stopped.xa_relative_extent_active || stopped.xa_stream_set != 0U) {
+    std::cerr << "SF2 APC dialogue did not stop cue 6\n";
+    return 10;
+  }
+  if (!runtime.startSceneSpeechForProbe(89U)) {
+    std::cerr << "SF2 APC dialogue could not start cue 89\n";
+    return 10;
+  }
+  auto boundary = runtime.diagnostics();
+  auto cue89_filter_seen =
+      boundary.xa_stream_set != 0U && boundary.xa_file == 1U &&
+      boundary.xa_channel == 14U;
+  for (auto frame = 0U;
+       frame < timeout &&
+       (boundary.xa_stream_starts <= stopped.xa_stream_starts ||
+        boundary.xa_relative_extent_active || boundary.xa_stream_set != 0U);
+       ++frame) {
+    if (!advance(1U)) {
+      return 7;
+    }
+    boundary = runtime.diagnostics();
+    cue89_filter_seen =
+        cue89_filter_seen ||
+        (boundary.xa_stream_set != 0U && boundary.xa_file == 1U &&
+         boundary.xa_channel == 14U);
+  }
+  if (boundary.scene_speech_starts != stopped.scene_speech_starts + 1U ||
+      boundary.last_scene_speech_arguments[0U] != 89U ||
+      boundary.xa_stream_starts <= stopped.xa_stream_starts ||
+      !cue89_filter_seen || boundary.xa_relative_extent_active ||
+      boundary.xa_stream_set != 0U) {
+    std::cerr << "SF2 APC dialogue cue-89 EOF did not restore the FOG\n";
+    return 10;
+  }
+  std::cout << "SF2 APC dialogue action lifecycle passed: cue=6 filter=1/6 "
+               "cue=89 filter=1/14 mount=0\n";
+  return 0;
+}
+
 int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool forward, bool combat, bool crouch,
                            bool crouch_back,
@@ -12731,6 +12842,11 @@ int main(int argc, char **argv) {
       return probeSf2GuestBootstrap(argv[2], budget,
                                     std::string_view{argv[1]} ==
                                         "probe-sf2-mission-transition");
+    }
+    if ((argc == 3 || argc == 4) &&
+        std::string_view{argv[1]} == "probe-sf2-apc-dialogue") {
+      return probeSf2ApcDialogue(
+          argv[2], argc == 4 ? parseFrameCount(argv[3]) : 1'500U);
     }
     if ((argc >= 3 && argc <= 7) &&
         std::string_view{argv[1]} == "probe-sf2-product-runtime") {

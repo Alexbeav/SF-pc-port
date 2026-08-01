@@ -771,6 +771,23 @@ public:
         invokeNested(0x800b39e4U, activation_arguments);
     return activation.completed() || activation.stoppedAtHostBoundary();
   }
+  [[nodiscard]] bool
+  startSceneSpeechForProbe(std::uint16_t cue) noexcept {
+    if (!ready_ || faulted_) {
+      return false;
+    }
+    const std::array arguments{static_cast<std::uint32_t>(cue)};
+    const auto started = invokeNested(0x800b246cU, arguments);
+    return started.completed() || started.stoppedAtHostBoundary();
+  }
+  [[nodiscard]] bool stopSceneSpeechForProbe() noexcept {
+    if (!ready_ || faulted_) {
+      return false;
+    }
+    const std::array arguments{0U};
+    const auto stopped = invokeNested(0x800b26a0U, arguments);
+    return stopped.completed() || stopped.stoppedAtHostBoundary();
+  }
   [[nodiscard]] bool setPlayerPositionForProbe(
       std::int32_t x, std::int32_t y, std::int32_t z) noexcept {
     std::uint32_t instance{};
@@ -3463,6 +3480,7 @@ private:
 
   void setXaRelativeExtentActive(bool active) noexcept {
     xa_relative_extent_active_ = active;
+    xa_stream_observed_active_ = false;
     if (active) {
       cdrom_media_.mapRelativeExtent(xa_relative_extent_base_,
                                      xa_relative_extent_sector_count_);
@@ -4765,6 +4783,17 @@ private:
         }
       }
     }
+    if (xa_relative_extent_active_) {
+      const auto audio = vm_.audioDiagnostics();
+      if (audio.xa_stream_set != 0U) {
+        xa_stream_observed_active_ = true;
+      } else if (xa_stream_observed_active_) {
+        // One-sector EOF markers can retire without calling XaStream_Stop.
+        // Restore relative reads to the mission FOG after any observed XA
+        // stream naturally clears, matching the explicit stop return hook.
+        setXaRelativeExtentActive(false);
+      }
+    }
     return true;
   }
 
@@ -5347,6 +5376,7 @@ private:
   std::uint32_t xa_relative_extent_base_{};
   std::uint32_t xa_relative_extent_sector_count_{};
   bool xa_relative_extent_active_{};
+  bool xa_stream_observed_active_{};
   std::uint32_t mission_index_{};
   std::uint16_t runtime_selection_{};
   std::string fog_path_;
@@ -5619,6 +5649,15 @@ bool Sf2GuestMissionRuntime::dispatchScriptEventForProbe(
 bool Sf2GuestMissionRuntime::activateScriptProgramForProbe(
     std::string_view name) noexcept {
   return impl_->activateScriptProgramForProbe(name);
+}
+
+bool Sf2GuestMissionRuntime::startSceneSpeechForProbe(
+    std::uint16_t cue) noexcept {
+  return impl_->startSceneSpeechForProbe(cue);
+}
+
+bool Sf2GuestMissionRuntime::stopSceneSpeechForProbe() noexcept {
+  return impl_->stopSceneSpeechForProbe();
 }
 
 bool Sf2GuestMissionRuntime::setPlayerPositionForProbe(
