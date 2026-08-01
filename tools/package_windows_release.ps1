@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.6",
+    [string]$Version = "0.1.0-sf2-guest-alpha.7",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -159,6 +159,10 @@ AUDIO / CUTSCENE STATUS
   reload also resumes with synchronized effects.
 - Mission 7 has been completed interactively with continuous music and
   synchronized effects; its full host-audio diagnostic run remains healthy.
+- Mission 5 is not currently a valid playthrough target: its opening areas can
+  omit guards, Homan and the truck can remain stationary, and prolonged play
+  can develop UI/full-screen flickering. This is a known authored-runtime bug,
+  not missing data in the tester's disc image.
 
 - All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
@@ -237,8 +241,9 @@ and connected campaign/save/movie handoffs are implemented. This remains a
 playtesting build rather than a finished PC port.
 
 Mission 1's opening, Mission 3 dialogue, post-checkpoint audio and Mission 7
-music now pass interactive checks. AIRBASEX's natural scripted movie
-transition remains the explicit playtest target.
+music now pass interactive checks. Mission 5/AIRBASEX currently fails to
+initialize or advance parts of its authored actor/script state and may later
+flicker; it is an explicit known issue in this build.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.
