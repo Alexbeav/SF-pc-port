@@ -26,6 +26,8 @@ struct Sf3GuestRuntimeProfile {
   std::uint32_t render_submission_return;
   std::uint32_t cd_completion_callback;
   std::uint32_t spu_dma_completion_callback;
+  std::uint32_t cd_setloc_state;
+  std::uint32_t cd_mode_state;
   std::uint32_t interrupt_stack;
   std::uint32_t application_state;
   std::uint32_t application_state_depth;
@@ -61,6 +63,10 @@ sf3UsaGuestRuntimeProfile() noexcept {
       .render_submission_return = 0x800f458cU,
       .cd_completion_callback = 0x800f9dd8U,
       .spu_dma_completion_callback = 0x800ff728U,
+      // CdControl command 2 mirrors four bytes at 0x80106774; command 0x0e
+      // stores the active mode in the immediately following byte.
+      .cd_setloc_state = 0x8011fea8U,
+      .cd_mode_state = 0x8011feacU,
       // Keep interrupt frames below the executable. TITLE.HOG spans physical
       // 0x001e31fc..0x001f09fb and invalidates the earlier 0x807ef000 mirror.
       .interrupt_stack = 0x8000b000U,

@@ -3370,10 +3370,15 @@ int probeExecutableEntry(const char *cue_path, std::uint64_t budget) {
       const auto is_sf2 =
           disc.game()->id == sf::game::GameId::syphon_filter_2;
       const auto sf2_profile = sf::game::sf2UsaGuestRuntimeProfile();
+      const auto is_sf3 =
+          disc.game()->id == sf::game::GameId::syphon_filter_3;
+      const auto sf3_profile = sf::game::sf3UsaGuestRuntimeProfile();
       vm.bindPsxCdControlCall(
           layout.cd_control_address,
-          is_sf2 ? sf2_profile.cd_setloc_state : 0U,
-          is_sf2 ? sf2_profile.cd_mode_state : 0U);
+          is_sf2 ? sf2_profile.cd_setloc_state
+                 : is_sf3 ? sf3_profile.cd_setloc_state : 0U,
+          is_sf2 ? sf2_profile.cd_mode_state
+                 : is_sf3 ? sf3_profile.cd_mode_state : 0U);
     }
     vm.bindPsxCdReadyCallback(
         layout.cd_ready_callback_address, layout.cd_ready_result_address,
@@ -3601,7 +3606,9 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
         layout.cd_response_pointer, layout.cd_completion_state);
   }
   if (layout.cd_control_address != 0U) {
-    vm.bindPsxCdControlCall(layout.cd_control_address);
+    vm.bindPsxCdControlCall(layout.cd_control_address,
+                            guest_profile.cd_setloc_state,
+                            guest_profile.cd_mode_state);
   }
   vm.bindPsxCdReadyCallback(
       layout.cd_ready_callback_address, layout.cd_ready_result_address,
@@ -3624,15 +3631,23 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
   std::uint32_t sf3_sound_event_callback{};
   std::uint64_t game_main_entries{};
   std::uint64_t application_loop_entries{};
+  std::map<std::array<std::uint32_t, 4U>, std::uint64_t>
+      application_state_pushes;
+  std::map<std::array<std::uint32_t, 3U>, std::uint64_t>
+      application_state_pops;
   std::uint64_t cd_ready_callback_entries{};
   std::uint64_t cd_completion_callback_entries{};
   std::uint64_t title_frame_entries{};
   std::uint64_t gpu_submission_entries{};
+  std::map<std::uint32_t, std::uint64_t> display_submissions_by_state;
   std::uint64_t valid_presentation_frames{};
   std::uint64_t title_pad_samples{};
   std::uint64_t title_ready_pad_samples{};
   std::uint64_t title_start_samples{};
   std::uint64_t title_cross_samples{};
+  std::uint64_t state8_pad_samples{};
+  std::uint64_t state8_cross_samples{};
+  std::uint64_t gameplay_pad_samples{};
   std::uint64_t title_mode0_pad_samples{};
   std::uint64_t title_mode0_interactive_samples{};
   std::uint64_t title_mode1_pad_samples{};
@@ -3979,6 +3994,70 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
             context.setReturnValue(0U);
           });
     }
+    // State 8 is the retail Mission 1 loading/briefing shell. Let it render
+    // and settle, then acknowledge it through the same processed-pad record
+    // consumed at 0x8002a4b8; the state itself owns teardown and pop.
+    vm.bindHostCall(
+        0x8002a4acU,
+        [&](sf::game::LegacyHostCallContext &context) {
+          std::uint32_t application_state{};
+          if (!context.read32(guest_profile.application_state,
+                              application_state) ||
+              application_state != 8U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          ++state8_pad_samples;
+          const auto cross_pressed = state8_pad_samples == 120U;
+          std::uint32_t record{};
+          if (!context.read32(context.registerValue(29U) + 0x14U, record) ||
+              record == 0U || !context.write8(record, 0U) ||
+              !context.write16(record + 4U,
+                               cross_pressed ? 0x0040U : 0U)) {
+            context.rejectHostCall();
+            return;
+          }
+          state8_cross_samples += cross_pressed ? 1U : 0U;
+          context.continueGuestInstruction();
+        });
+    // FUN_80050d48 requests PAD record zero through FUN_80022a60 and reads
+    // the returned 60-byte processed record immediately after this return.
+    // Publish a neutral host pad only while retail gameplay owns state 0;
+    // otherwise stale frontend buttons can be interpreted as Start and push
+    // the retail pause application state 7.
+    vm.bindHostCall(
+        0x80050da8U,
+        [&](sf::game::LegacyHostCallContext &context) {
+          std::uint32_t application_state{};
+          if (!context.read32(guest_profile.application_state,
+                              application_state) ||
+              application_state != 0U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          std::uint32_t record{};
+          if (!context.read32(context.registerValue(29U) + 0x20U, record) ||
+              record == 0U || !context.write8(record, 0U) ||
+              !context.write8(record + 1U, 7U) ||
+              !context.write8(record + 2U, 1U) ||
+              !context.write8(record + 3U, 0U) ||
+              !context.write16(record + 4U, 0U) ||
+              !context.write8(record + 6U, 0x80U) ||
+              !context.write8(record + 7U, 0x80U) ||
+              !context.write8(record + 8U, 0x80U) ||
+              !context.write8(record + 9U, 0x80U)) {
+            context.rejectHostCall();
+            return;
+          }
+          for (auto offset = 0x0aU; offset < 0x3cU; ++offset) {
+            if (!context.write8(record + offset, 0U)) {
+              context.rejectHostCall();
+              return;
+            }
+          }
+          ++gameplay_pad_samples;
+          context.continueGuestInstruction();
+        });
     vm.bindHostCall(
         guest_profile.title_pad_poll_return,
         [&](sf::game::LegacyHostCallContext &context) {
@@ -4169,6 +4248,29 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
         }
         application_loop_entries +=
             pc == guest_profile.state_loop_entry ? 1U : 0U;
+        if (pc == guest_profile.application_state_push_entry) {
+          std::uint32_t application_state{};
+          std::uint32_t application_depth{};
+          if (vm.runtime().read32(guest_profile.application_state,
+                                  application_state) &&
+              vm.runtime().read32(guest_profile.application_state_depth,
+                                  application_depth)) {
+            ++application_state_pushes[{state.gpr[4U], state.gpr[31U],
+                                        application_state,
+                                        application_depth}];
+          }
+        }
+        if (pc == guest_profile.application_state_pop_entry) {
+          std::uint32_t application_state{};
+          std::uint32_t application_depth{};
+          if (vm.runtime().read32(guest_profile.application_state,
+                                  application_state) &&
+              vm.runtime().read32(guest_profile.application_state_depth,
+                                  application_depth)) {
+            ++application_state_pops[
+                {state.gpr[31U], application_state, application_depth}];
+          }
+        }
         title_frame_entries +=
             pc == guest_profile.title_state_frame_entry ? 1U : 0U;
         if (pc == guest_profile.title_state_frame_entry) {
@@ -4316,6 +4418,7 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
           std::uint32_t application_state{};
           static_cast<void>(vm.runtime().read32(guest_profile.application_state,
                                                 application_state));
+          ++display_submissions_by_state[application_state];
           auto captured = sf::game::captureSf3PresentationFrame(
               vm.runtime().ram(), state.gpr[5U], application_state,
               gpu_submission_entries, title_frame_entries);
@@ -4599,6 +4702,8 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
   static_cast<void>(vm.runtime().read16(0x1f801110U, timer1_counter));
   static_cast<void>(vm.runtime().read16(0x1f801114U, timer1_mode));
   const auto cdrom = vm.machine().cdrom().captureState();
+  const auto audio = vm.audioDiagnostics();
+  const auto xa_admission = vm.machine().xaSectorAdmissionDiagnostics();
   const auto spu_dma_madr = vm.machine().dma().madr(sf::psx::DmaChannel::spu);
   const auto spu_dma_bcr = vm.machine().dma().bcr(sf::psx::DmaChannel::spu);
   const auto spu_dma_chcr = vm.machine().dma().chcr(sf::psx::DmaChannel::spu);
@@ -4644,6 +4749,20 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
             << " spu-dma=0x" << spu_dma_madr << ",0x" << spu_dma_bcr << ",0x"
             << spu_dma_chcr << std::dec << " spu-dma-callbacks="
             << spu_dma_callback_count << '\n';
+  std::cout << "SF3 bootstrap XA: lba=" << audio.cd_lba
+            << " reading=" << static_cast<unsigned int>(audio.cd_reading)
+            << " mode=0x" << std::hex << std::uppercase
+            << static_cast<unsigned int>(audio.cd_mode) << std::dec
+            << " stream=" << static_cast<unsigned int>(audio.xa_stream_set)
+            << '/' << static_cast<unsigned int>(audio.xa_file) << '/'
+            << static_cast<unsigned int>(audio.xa_channel)
+            << " cd-frames=" << audio.spu_cd_frames
+            << " received=" << xa_admission.received
+            << " admitted=" << xa_admission.admitted
+            << " rejected=" << xa_admission.rejected_busy << '/'
+            << xa_admission.rejected_decode << " muted="
+            << xa_admission.muted << " span=" << xa_admission.first_received_lba
+            << ".." << xa_admission.last_received_lba << '\n';
   std::cout << "SF3 bootstrap retail boundaries: game-main="
             << game_main_entries << " application-loop="
             << application_loop_entries << " cd-ready-callbacks="
@@ -4667,6 +4786,23 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
             << " sampled-path=";
   for (std::size_t index = 0U; index < application_state_path.size(); ++index) {
     std::cout << (index == 0U ? "" : "->") << application_state_path[index];
+  }
+  std::cout << '\n';
+  std::cout << "SF3 bootstrap application pushes:" << '\n';
+  for (const auto &[push, count] : application_state_pushes) {
+    std::cout << "  state=" << push[0U] << " ra=0x" << std::hex
+              << std::uppercase << push[1U] << std::dec << " from="
+              << push[2U] << '/' << push[3U] << " count=" << count << '\n';
+  }
+  std::cout << "SF3 bootstrap application pops:" << '\n';
+  for (const auto &[pop, count] : application_state_pops) {
+    std::cout << "  ra=0x" << std::hex << std::uppercase << pop[0U]
+              << std::dec << " from=" << pop[1U] << '/' << pop[2U]
+              << " count=" << count << '\n';
+  }
+  std::cout << "SF3 bootstrap display submissions by state:";
+  for (const auto &[state, count] : display_submissions_by_state) {
+    std::cout << ' ' << state << ':' << count;
   }
   std::cout << '\n';
   std::cout << "SF3 bootstrap processed PAD calls: count=";
@@ -4694,7 +4830,10 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
               << " start-samples=" << title_start_samples
               << " title2-pad-samples=" << title2_pad_samples
               << " menu-pad-samples=" << menu_pad_samples
-              << " cross-samples=" << title_cross_samples << '\n';
+              << " cross-samples=" << title_cross_samples
+              << " state8-pad/cross=" << state8_pad_samples << '/'
+              << state8_cross_samples
+              << " gameplay-neutral=" << gameplay_pad_samples << '\n';
     std::cout << "SF3 title-shell PAD modes:";
     for (const auto &[mode, count] : title_pad_modes) {
       const auto descriptor = 0x80157434U + mode * 32U;
@@ -5024,11 +5163,26 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
       std::ranges::any_of(tokyo_member_reads, [](const auto &read) {
         return read.name == "SLF.RFF";
       });
+  const auto state0_displays = display_submissions_by_state.find(0U);
+  const auto reached_gameplay_boundary =
+      reached_tokyo_boundary && final_application_state == 0U &&
+      final_application_depth == 1U && state8_cross_samples == 1U &&
+      gameplay_pad_samples != 0U &&
+      state0_displays != display_submissions_by_state.end() &&
+      state0_displays->second != 0U && xa_admission.admitted != 0U &&
+      application_state_pops.contains(
+          std::array<std::uint32_t, 3U>{0x8002a67cU, 8U, 2U}) &&
+      !std::ranges::any_of(application_state_pushes, [](const auto &entry) {
+        return entry.first[0U] == 7U;
+      });
   const auto reached_title_boundary =
       final_application_state == 4U && final_application_depth == 2U;
   const auto expected_boundary =
-      drive_title_shell && budget >= 100'000'000U ? reached_tokyo_boundary
-                                                  : reached_title_boundary;
+      drive_title_shell && budget >= 150'000'000U
+          ? reached_gameplay_boundary
+      : drive_title_shell && budget >= 100'000'000U
+          ? reached_tokyo_boundary
+          : reached_title_boundary;
   if (budget >= 5'000'000U &&
       (game_main_entries == 0U || application_loop_entries == 0U ||
        !expected_boundary || poll_word_value != 0U ||
@@ -5036,7 +5190,9 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
        gpu_submission_entries == 0U ||
        (budget >= 100'000'000U && valid_presentation_frames == 0U))) {
     std::cerr << "SF3 bootstrap did not reach the verified "
-              << (drive_title_shell && budget >= 100'000'000U
+              << (drive_title_shell && budget >= 150'000'000U
+                      ? "Mission 1 gameplay"
+                  : drive_title_shell && budget >= 100'000'000U
                       ? "Mission 1 transition"
                       : "TITLE regression")
               << " boundary\n";

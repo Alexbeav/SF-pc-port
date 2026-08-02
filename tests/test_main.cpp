@@ -240,6 +240,8 @@ void testRuntimeProfiles() {
               sf3_guest.render_submission_return == 0x800f458cU &&
               sf3_guest.cd_completion_callback == 0x800f9dd8U &&
               sf3_guest.spu_dma_completion_callback == 0x800ff728U &&
+              sf3_guest.cd_setloc_state == 0x8011fea8U &&
+              sf3_guest.cd_mode_state == 0x8011feacU &&
               sf3_guest.interrupt_stack == 0x8000b000U &&
               sf3_guest.application_state == 0x80121b88U &&
               sf3_guest.application_state_depth == 0x80121b84U &&

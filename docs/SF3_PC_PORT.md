@@ -110,8 +110,11 @@ The current deterministic probe has crossed the archive portion of this gate:
 retail parses the TOKYO catalog and loads `SLF.RFF`, `TOKYO.DAT`,
 `GENERIC.OVL`, `VLF.RFF`, `DLF.RFF`, `WLDEMD.HOG`, `TOKYO.SS`, and the
 `NPC.HOG` catalog through immutable host file transport. It reaches the retail
-Mission 1 PAD caller and captures a 640-packet, 625-draw frame. Product runtime
-selection and interactive validation remain pending.
+Mission 1 PAD caller, dismisses application state 8 through its processed PAD
+record, and remains in the retail state-0 gameplay loop under neutral input.
+A 150,000,000-operation gate captures 201 state-0 display submissions, admits
+the opening XA sectors and reports no CPU fault. Product runtime selection and
+interactive validation remain pending.
 
 ### S4 — runtime systems
 
