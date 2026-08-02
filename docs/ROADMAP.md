@@ -34,6 +34,22 @@
 
 ## Syphon Filter 2 product roadmap
 
+SF2 work is now split into two parallel branches with an explicit ownership
+boundary:
+
+- `research/sf2-full-bringup` owns retail correctness: campaign logic,
+  scripting, saves, mission/FMVs, checkpoint behavior, audio sequencing,
+  crashes and faithful 4:3 presentation.
+- `feature/sf2-modern-presentation` owns optional host presentation:
+  resolution scaling, widescreen composition, interpolation, PGXP-style
+  precision, filtering, modern camera options and launcher/settings exposure.
+
+The modern branch consumes core fixes by merging the correctness branch. A
+gameplay defect found while modernizing must first be fixed and verified on the
+correctness branch; modern code must not replace retail gameplay logic. See
+[`SF2_MODERN_PRESENTATION.md`](SF2_MODERN_PRESENTATION.md) for the branch
+contract and validation matrix.
+
 The SF2 guest runtime has reached live gameplay in all 21 campaign mission
 packages on both retail discs. Mission 3 has been completed interactively from
 its authored opening through the save menu and following cinematic. Mission

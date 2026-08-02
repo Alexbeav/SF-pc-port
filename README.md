@@ -14,6 +14,15 @@ policy.
 The fork is not affiliated with or endorsed by Madxbio97, Sony Interactive
 Entertainment, Bend Studio or any other rights holder.
 
+## SF2 Modern presentation workstream
+
+This worktree is the presentation-only sequel stream on branch
+`feature/sf2-modern-presentation`, forked from SF2 Guest Runtime Alpha 10.
+Retail-correct gameplay remains owned by `research/sf2-full-bringup` in the
+sibling `I:\Projects\sf-pc-port` worktree. Read
+[SF2 Modern Presentation](docs/SF2_MODERN_PRESENTATION.md) before changing the
+guest runtime, renderer, camera, HUD, timing, or launcher.
+
 ## Status
 
 The current branch is the sanitized upstream baseline. It intentionally has no
