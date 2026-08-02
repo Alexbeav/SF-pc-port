@@ -971,7 +971,8 @@ public:
     host_call_observer_ = std::move(observer);
   }
   void bindPsxBiosRandomCalls();
-  void bindPsxBiosCoreVector(bool expose_kernel_tables = false);
+  void bindPsxBiosCoreVector(bool expose_kernel_tables = false,
+                             bool attach_blank_memory_card = false);
   void bindPsxLibcStringCalls();
   void bindPsxVideoTimingCall();
   void bindPsxVideoTimingCall(std::uint32_t vsync_address,
@@ -1002,6 +1003,14 @@ public:
   servicePsxCallbackSlot(std::uint32_t callback_slot_address,
                          std::uint32_t callback_stack_address = 0U,
                          LegacyGameplayVmResult *callback_result = nullptr);
+  // Invoke a verified retail interrupt/event callback while preserving the
+  // suspended guest CPU context. Platform schedulers use this when the BIOS
+  // event descriptor supplies the callback directly rather than through a
+  // guest-visible slot.
+  [[nodiscard]] bool
+  servicePsxCallback(std::uint32_t callback_address,
+                     std::uint32_t callback_stack_address = 0U,
+                     LegacyGameplayVmResult *callback_result = nullptr);
   void bindPsxCriticalSectionCalls();
   void bindPsxGpuSubmissionCall();
   void bindSyphonFilterUsaV11VirtualCdCalls(
@@ -1253,7 +1262,9 @@ private:
   [[nodiscard]] bool
   issueCdRomCommand(std::uint8_t command,
                     std::span<const std::uint8_t> parameters,
-                    bool wait_for_completion = false) noexcept;
+                    bool wait_for_completion = false,
+                    std::span<std::byte> response = {},
+                    std::size_t *response_size = nullptr) noexcept;
   [[nodiscard]] bool transferCdRomSectors(std::uint32_t sector,
                                           std::uint32_t sector_count,
                                           std::uint32_t destination,

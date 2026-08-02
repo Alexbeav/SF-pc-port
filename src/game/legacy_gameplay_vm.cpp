@@ -561,7 +561,7 @@ bool LegacyGameplayVm::dispatchCdRomReadyCallback(
         (cd_pending_command_state_address_ != 0U &&
          !runtime_.write16(cd_pending_command_state_address_, 0U)) ||
         (cd_completion_state_address_ != 0U &&
-         !runtime_.write8(cd_completion_state_address_, 5U))) {
+         !runtime_.write8(cd_completion_state_address_, interrupt))) {
       return false;
     }
   }
@@ -623,7 +623,13 @@ bool LegacyGameplayVm::servicePsxCallbackSlot(
   if (!runtime_.read32(callback_slot_address, callback)) {
     return false;
   }
-  if (callback == 0U) {
+  return servicePsxCallback(callback, callback_stack_address, callback_result);
+}
+
+bool LegacyGameplayVm::servicePsxCallback(
+    std::uint32_t callback_address, std::uint32_t callback_stack_address,
+    LegacyGameplayVmResult *callback_result) {
+  if (callback_address == 0U) {
     return true;
   }
 
@@ -632,7 +638,7 @@ bool LegacyGameplayVm::servicePsxCallbackSlot(
     runtime_.setRegister(29U, callback_stack_address);
     runtime_.setRegister(30U, callback_stack_address);
   }
-  const auto result = invokeFrameCall(callback, {}, 5'000'000U);
+  const auto result = invokeFrameCall(callback_address, {}, 5'000'000U);
   runtime_.restoreCpuState(interrupted_state);
   if (callback_result != nullptr) {
     *callback_result = result;
@@ -653,7 +659,8 @@ void LegacyGameplayVm::recoverCdRomTransfer() noexcept {
 
 bool LegacyGameplayVm::issueCdRomCommand(
     std::uint8_t command, std::span<const std::uint8_t> parameters,
-    bool wait_for_completion) noexcept {
+    bool wait_for_completion, std::span<std::byte> response,
+    std::size_t *response_size) noexcept {
   constexpr std::uint32_t cdrom_base = 0x1f801800U;
   if (parameters.size() > psx::CdRomState::fifo_capacity ||
       (machine_.cdrom().captureState().interrupt_flags & 0x07U) != 0U ||
@@ -668,7 +675,21 @@ bool LegacyGameplayVm::issueCdRomCommand(
     }
   }
   if (!runtime_.write8(cdrom_base + 1U, command) ||
-      !waitForCdRomInterrupt(3U) || !acknowledgeCdRomInterrupt(3U)) {
+      !waitForCdRomInterrupt(3U)) {
+    return false;
+  }
+  const auto acknowledged = machine_.cdrom().captureState();
+  const auto response_count = std::min(
+      response.size(), static_cast<std::size_t>(acknowledged.response_count -
+                                                acknowledged.response_position));
+  if (response_size != nullptr) {
+    *response_size = response_count;
+  }
+  for (auto index = std::size_t{}; index < response_count; ++index) {
+    response[index] = static_cast<std::byte>(
+        acknowledged.response[acknowledged.response_position + index]);
+  }
+  if (!acknowledgeCdRomInterrupt(3U)) {
     return false;
   }
   return !wait_for_completion ||
@@ -895,7 +916,8 @@ void LegacyGameplayVm::bindPsxBiosRandomCalls() {
   });
 }
 
-void LegacyGameplayVm::bindPsxBiosCoreVector(bool expose_kernel_tables) {
+void LegacyGameplayVm::bindPsxBiosCoreVector(bool expose_kernel_tables,
+                                             bool attach_blank_memory_card) {
   constexpr std::uint32_t bios_a0_vector = 0x000000a0U;
   constexpr std::uint32_t bios_b0_vector = 0x000000b0U;
   constexpr std::uint32_t bios_c0_vector = 0x000000c0U;
@@ -920,12 +942,62 @@ void LegacyGameplayVm::bindPsxBiosCoreVector(bool expose_kernel_tables) {
   constexpr std::uint32_t initialize_card_driver_call = 0x70U;
   constexpr std::uint32_t remove_cdrom_driver_call = 0x72U;
   constexpr std::uint32_t memory_card_info_call = 0xabU;
-  bindHostCall(bios_a0_vector, [](LegacyHostCallContext &context) {
+  constexpr std::uint32_t memory_card_load_call = 0xacU;
+  auto memory_card = std::make_shared<std::vector<std::byte>>();
+  if (attach_blank_memory_card) {
+    constexpr std::size_t card_size = 128U * 1024U;
+    constexpr std::size_t sector_size = 128U;
+    memory_card->assign(card_size, std::byte{0xff});
+    const auto format_sector = [&](std::size_t sector, std::byte fill) {
+      auto frame = std::span{*memory_card}.subspan(sector * sector_size,
+                                                   sector_size);
+      std::ranges::fill(frame, fill);
+      return frame;
+    };
+    const auto write_checksum = [](std::span<std::byte> frame) {
+      auto checksum = std::uint8_t{};
+      for (std::size_t index = 0U; index < 0x7fU; ++index) {
+        checksum ^= std::to_integer<std::uint8_t>(frame[index]);
+      }
+      frame[0x7fU] = static_cast<std::byte>(checksum);
+    };
+    auto header = format_sector(0U, std::byte{});
+    header[0U] = std::byte{'M'};
+    header[1U] = std::byte{'C'};
+    write_checksum(header);
+    for (std::size_t sector = 1U; sector < 16U; ++sector) {
+      auto frame = format_sector(sector, std::byte{});
+      frame[0U] = std::byte{0xa0};
+      frame[8U] = std::byte{0xff};
+      frame[9U] = std::byte{0xff};
+      write_checksum(frame);
+    }
+    for (std::size_t sector = 16U; sector < 36U; ++sector) {
+      auto frame = format_sector(sector, std::byte{});
+      frame[0U] = std::byte{0xff};
+      frame[1U] = std::byte{0xff};
+      frame[2U] = std::byte{0xff};
+      frame[3U] = std::byte{0xff};
+      frame[8U] = std::byte{0xff};
+      frame[9U] = std::byte{0xff};
+      write_checksum(frame);
+    }
+    for (std::size_t sector = 36U; sector < 63U; ++sector) {
+      static_cast<void>(format_sector(sector, std::byte{}));
+    }
+    std::ranges::copy(header, memory_card->begin() + 63U * sector_size);
+  }
+  bindHostCall(bios_a0_vector,
+               [attach_blank_memory_card](LegacyHostCallContext &context) {
     constexpr std::uint32_t random_seed_address = 0xa0009010U;
     const auto call = context.registerValue(9U);
+    if (call == memory_card_info_call || call == memory_card_load_call) {
+      context.setReturnValue(attach_blank_memory_card ? 1U : 0U);
+      return;
+    }
     if (call == initialize_heap_call || call == printf_call ||
         call == flush_cache_call || call == initialize_card_driver_call ||
-        call == remove_cdrom_driver_call || call == memory_card_info_call) {
+        call == remove_cdrom_driver_call) {
       context.setReturnValue(0U);
       return;
     }
@@ -1160,7 +1232,9 @@ void LegacyGameplayVm::bindPsxBiosCoreVector(bool expose_kernel_tables) {
     context.rejectHostCall();
   });
   bindHostCall(
-      bios_b0_vector, [expose_kernel_tables](LegacyHostCallContext &context) {
+      bios_b0_vector,
+      [expose_kernel_tables, attach_blank_memory_card,
+       memory_card](LegacyHostCallContext &context) {
         constexpr std::uint32_t deliver_event_call = 0x07U;
         constexpr std::uint32_t open_event_call = 0x08U;
         constexpr std::uint32_t close_event_call = 0x09U;
@@ -1174,6 +1248,11 @@ void LegacyGameplayVm::bindPsxBiosCoreVector(bool expose_kernel_tables) {
         constexpr std::uint32_t init_card_call = 0x4aU;
         constexpr std::uint32_t start_card_call = 0x4bU;
         constexpr std::uint32_t stop_card_call = 0x4cU;
+        constexpr std::uint32_t card_write_call = 0x4eU;
+        constexpr std::uint32_t card_read_call = 0x4fU;
+        constexpr std::uint32_t new_card_call = 0x50U;
+        constexpr std::uint32_t card_status_call = 0x5cU;
+        constexpr std::uint32_t card_wait_call = 0x5dU;
         constexpr std::uint32_t get_c0_table_call = 0x56U;
         constexpr std::uint32_t get_b0_table_call = 0x57U;
         constexpr std::uint32_t change_clear_pad_call = 0x5bU;
@@ -1243,8 +1322,36 @@ void LegacyGameplayVm::bindPsxBiosCoreVector(bool expose_kernel_tables) {
           return;
         }
         if (call == puts_call || call == init_card_call ||
-            call == start_card_call || call == stop_card_call) {
+            call == start_card_call || call == stop_card_call ||
+            call == new_card_call) {
           context.setReturnValue(0U);
+          return;
+        }
+        if (call == card_status_call || call == card_wait_call) {
+          context.setReturnValue(attach_blank_memory_card ? 1U : 0x11U);
+          return;
+        }
+        if (call == card_write_call || call == card_read_call) {
+          if (attach_blank_memory_card) {
+            constexpr std::uint32_t sector_size = 128U;
+            const auto sector = context.argument(1);
+            const auto buffer = context.argument(2);
+            if (sector >= memory_card->size() / sector_size) {
+              context.setReturnValue(0U);
+              return;
+            }
+            auto frame = std::span{*memory_card}.subspan(
+                static_cast<std::size_t>(sector) * sector_size,
+                sector_size);
+            const auto transferred = call == card_read_call
+                                         ? context.writeBytes(buffer, frame)
+                                         : context.readBytes(buffer, frame);
+            if (!transferred) {
+              context.rejectHostCall();
+              return;
+            }
+          }
+          context.setReturnValue(1U);
           return;
         }
         if (call == change_clear_pad_call) {
@@ -1570,7 +1677,7 @@ void LegacyGameplayVm::bindPsxCdPendingCommandCall(
         }
         if (!context.write8(cdrom_base, 0U) ||
             !context.write16(state_address, 0U) ||
-            !context.write8(completion_state_address, 5U)) {
+            !context.write8(completion_state_address, interrupt_flags)) {
           context.rejectHostCall();
           return;
         }
@@ -1646,10 +1753,18 @@ void LegacyGameplayVm::bindPsxCdControlCall(
       context.rejectHostCall();
       return;
     }
+    std::array<std::byte, psx::CdRomState::fifo_capacity> response{};
+    auto response_size = std::size_t{};
     const auto succeeded = issueCdRomCommand(
         command,
         std::span<const std::uint8_t>{parameters}.first(parameter_count),
-        false);
+        false, response, &response_size);
+    if (succeeded && context.argument(2) != 0U &&
+        !context.writeBytes(context.argument(2),
+                            std::span{response}.first(response_size))) {
+      context.rejectHostCall();
+      return;
+    }
     // The HLE consumes the command-acknowledge IRQ internally. Preserve the
     // PsyQ async state that CdSync polls for the later completion IRQ.
     const auto has_async_completion =
@@ -1658,8 +1773,9 @@ void LegacyGameplayVm::bindPsxCdControlCall(
     if (cd_pending_command_state_address_ != 0U &&
         (!context.write16(cd_pending_command_state_address_,
                           has_async_completion ? command : 0U) ||
-         (has_async_completion && cd_completion_state_address_ != 0U &&
-          !context.write8(cd_completion_state_address_, 0U)))) {
+         (cd_completion_state_address_ != 0U &&
+          !context.write8(cd_completion_state_address_,
+                          has_async_completion ? 0U : 2U)))) {
       context.rejectHostCall();
       return;
     }

@@ -2333,7 +2333,7 @@ void testLegacyGameplayVmBoundary() {
                              direct_completion_active_response) &&
           vm.runtime().read8(cd_completion_response,
                              observed_completion_response) &&
-          direct_completion_pending == 0U && direct_completion_state == 5U &&
+          direct_completion_pending == 0U && direct_completion_state == 2U &&
           direct_completion_active_response == 0x02U &&
           observed_completion_response == 0x02U &&
           (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U &&
@@ -2373,6 +2373,15 @@ void testLegacyGameplayVmBoundary() {
           vm.runtime().read8(cd_mode_state, mirrored_mode) &&
           mirrored_mode == 0x80U && vm.machine().cdrom().mode() == 0x80U,
       "Host-bound CdControl did not preserve PsyQ Setloc/Setmode state");
+  constexpr std::uint32_t cd_control_response = 0x801254a8U;
+  const std::array getstat_arguments{0x01U, 0U, cd_control_response};
+  std::uint8_t getstat_response{};
+  require(vm.runtime().write8(cd_control_response, 0xffU) &&
+              vm.invoke(async_cd_control_entry, getstat_arguments, 1U)
+                  .completed() &&
+              vm.runtime().read8(cd_control_response, getstat_response) &&
+              getstat_response != 0xffU,
+          "Host-bound CdControl did not publish its command response");
   const std::array seek_arguments{0x15U, 0U, 0U};
   const auto seek_started =
       vm.invoke(async_cd_control_entry, seek_arguments, 1U);
@@ -2404,7 +2413,7 @@ void testLegacyGameplayVmBoundary() {
           vm.runtime().read8(cd_completion_state, completion_state) &&
           vm.runtime().read8(cd_active_response, active_response) &&
           vm.runtime().read8(cd_completion_response, completion_response) &&
-          pending_seek == 0U && completion_state == 5U &&
+          pending_seek == 0U && completion_state == 2U &&
           active_response == 2U && completion_response == 2U &&
           (vm.machine().cdrom().captureState().interrupt_flags & 0x07U) == 0U,
       "Async CD completion did not synchronize PsyQ's paired result buffers");
@@ -4842,6 +4851,46 @@ void testLegacyGameplayVmBoundary() {
               vm.runtime().copyBytes(memcpy_arguments[0], bios_copy) &&
               bios_copy == bios_source,
           "BIOS vector memcpy HLE mismatch");
+
+  sf::game::LegacyGameplayVm card_vm{executable};
+  card_vm.bindPsxBiosCoreVector(false, true);
+  card_vm.runtime().setRegister(9U, 0xabU);
+  const auto card_info = card_vm.invoke(0x000000a0U, {}, 1U);
+  constexpr std::uint32_t card_buffer = 0x80010a00U;
+  card_vm.runtime().setRegister(9U, 0x4fU);
+  const std::array card_header_arguments{0U, 0U, card_buffer};
+  const auto card_header_read =
+      card_vm.invoke(0x000000b0U, card_header_arguments, 1U);
+  std::array<std::byte, 128U> card_header{};
+  require(card_info.completed() && card_info.return_value == 1U &&
+              card_header_read.completed() &&
+              card_header_read.return_value == 1U &&
+              card_vm.runtime().copyBytes(card_buffer, card_header) &&
+              card_header[0U] == std::byte{'M'} &&
+              card_header[1U] == std::byte{'C'},
+          "Optional blank memory-card BIOS backend header mismatch");
+  std::array<std::byte, 128U> card_pattern{};
+  for (auto index = std::size_t{}; index < card_pattern.size(); ++index) {
+    card_pattern[index] = static_cast<std::byte>(index ^ 0x5aU);
+  }
+  require(card_vm.runtime().loadBytes(card_buffer, card_pattern),
+          "Could not seed blank memory-card write buffer");
+  card_vm.runtime().setRegister(9U, 0x4eU);
+  const std::array card_sector_arguments{0U, 42U, card_buffer};
+  const auto card_write =
+      card_vm.invoke(0x000000b0U, card_sector_arguments, 1U);
+  std::array<std::byte, 128U> cleared_card_buffer{};
+  require(card_vm.runtime().loadBytes(card_buffer, cleared_card_buffer),
+          "Could not clear blank memory-card read buffer");
+  card_vm.runtime().setRegister(9U, 0x4fU);
+  const auto card_read =
+      card_vm.invoke(0x000000b0U, card_sector_arguments, 1U);
+  std::array<std::byte, 128U> card_round_trip{};
+  require(card_write.completed() && card_write.return_value == 1U &&
+              card_read.completed() && card_read.return_value == 1U &&
+              card_vm.runtime().copyBytes(card_buffer, card_round_trip) &&
+              card_round_trip == card_pattern,
+          "Optional blank memory-card BIOS sector round trip mismatch");
 
   constexpr std::array left_string{
       std::byte{'H'}, std::byte{'W'}, std::byte{'A'},

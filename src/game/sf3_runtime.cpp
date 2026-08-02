@@ -1,4 +1,5 @@
 #include "sf/game/runtime_profile.hpp"
+#include "sf/game/sf3_runtime.hpp"
 
 namespace sf::game {
 
@@ -20,6 +21,16 @@ const GameRuntimeProfile &sf3RuntimeProfile() noexcept {
       .uses_sf1_environment_atlas = false,
   };
   return profile;
+}
+
+std::optional<Sf2PresentationFrame>
+captureSf3PresentationFrame(std::span<const std::byte> guest_ram,
+                            std::uint32_t ordering_table_root,
+                            std::uint32_t application_state,
+                            std::uint64_t sequence,
+                            std::uint64_t guest_frame) noexcept {
+  return captureSf2PresentationFrame(guest_ram, ordering_table_root,
+                                     application_state, sequence, guest_frame);
 }
 
 } // namespace sf::game

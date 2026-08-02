@@ -91,6 +91,12 @@ control transfer, not bypass it with native gameplay.
 - Reach title/menu state without native state reconstruction.
 - Select Mission 1 and observe retail teardown/loading/state-stack ownership.
 
+As of 2026-08-02, the deterministic headless probe completes this gate. The
+retail shell accepts Mission 1, follows application states `4 -> 6 -> 0`, and
+issues `\FOG\TOKYO.FOG;1` plus `\TOKYO\SLF.RFF;1`. S3 begins at the resulting
+mission archive/heap boundary; no native gameplay or presentation substitute
+is used.
+
 ### S3 — Mission 1 vertical slice
 
 - Load `TOKYO.FOG`, its overlay and nested resources through retail callbacks.
@@ -189,7 +195,7 @@ ctest --preset windows-psycross-local-release
 $sf3 = "Z:\Emulators\PS1 Games\Syphon Filter 3 (USA).cue"
 .\build\windows-psycross\Release\sf_tool.exe inspect $sf3
 .\build\windows-psycross\Release\sf_tool.exe inspect-mission-archive $sf3 TOKYO
-.\build\windows-psycross\Release\sf_tool.exe probe-executable-entry $sf3 5000000
+.\build\windows-psycross\Release\sf_tool.exe probe-sf3-guest-bootstrap $sf3 5000000
 ```
 
 `inspect-disc-info` is currently SF2-specific because SF3 has no external

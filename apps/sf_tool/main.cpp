@@ -21,6 +21,7 @@
 #include "sf/game/localization.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/sf2_runtime.hpp"
+#include "sf/game/sf3_runtime.hpp"
 #include "sf/game/title.hpp"
 #include "sf/psx/function_map.hpp"
 #include "sf/psx/xa_decoder.hpp"
@@ -97,6 +98,10 @@ void printUsage() {
       << "  sf_tool extract-xa-cue <game.cue> <cue-index> <output.wav>\n"
       << "  sf_tool probe-legacy-vm <game.cue>\n"
       << "  sf_tool probe-executable-entry <game.cue> [instruction-budget]\n"
+      << "  sf_tool probe-sf3-guest-bootstrap <game.cue> "
+         "[instruction-budget]\n"
+      << "  sf_tool probe-sf3-title-shell <game.cue> "
+         "[instruction-budget]\n"
       << "  sf_tool probe-sf2-guest-bootstrap <game.cue> "
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-mission-transition <game.cue> "
@@ -3461,6 +3466,1465 @@ int probeExecutableEntry(const char *cue_path, std::uint64_t budget) {
             << cd_dma_madr << ",0x" << cd_dma_bcr << ",0x" << cd_dma_chcr
             << " spu-dma=0x" << spu_dma_madr << ",0x" << spu_dma_bcr << ",0x"
             << spu_dma_chcr << std::dec << '\n';
+  return 0;
+}
+
+struct Sf3BootstrapTraceEntry {
+  sf::psx::R3000State state{};
+  std::uint32_t pc{};
+  std::uint32_t instruction{};
+};
+
+struct Sf3BootstrapTransfer {
+  std::size_t trace_index{};
+  std::uint32_t target{};
+  std::optional<std::uint8_t> source_register;
+};
+
+std::optional<Sf3BootstrapTransfer> sf3BootstrapTransferTo(
+    std::span<const Sf3BootstrapTraceEntry> trace, std::uint32_t target) {
+  for (auto index = trace.size(); index-- > 0U;) {
+    const auto &entry = trace[index];
+    const auto opcode = static_cast<std::uint8_t>(entry.instruction >> 26U);
+    if (opcode == 0U) {
+      const auto function = static_cast<std::uint8_t>(entry.instruction & 63U);
+      if (function != 8U && function != 9U) {
+        continue;
+      }
+      const auto source =
+          static_cast<std::uint8_t>((entry.instruction >> 21U) & 31U);
+      if (entry.state.gpr[source] == target) {
+        return Sf3BootstrapTransfer{index, target, source};
+      }
+      continue;
+    }
+    if (opcode == 2U || opcode == 3U) {
+      const auto direct_target =
+          ((entry.pc + 4U) & 0xf0000000U) |
+          ((entry.instruction & 0x03ffffffU) << 2U);
+      if (direct_target == target) {
+        return Sf3BootstrapTransfer{index, target, std::nullopt};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::size_t> sf3BootstrapRegisterProducer(
+    std::span<const Sf3BootstrapTraceEntry> trace, std::size_t transfer_index,
+    std::uint8_t source_register, std::uint32_t source_value) {
+  if (transfer_index == 0U || source_register == 0U) {
+    return std::nullopt;
+  }
+  for (auto index = transfer_index; index-- > 1U;) {
+    if (trace[index].state.gpr[source_register] !=
+        trace[index - 1U].state.gpr[source_register]) {
+      // State at an observer boundary includes the preceding instruction's
+      // committed register effects. A delayed load may make this the
+      // instruction after the load; the surrounding trace keeps that delay
+      // slot visible rather than claiming a stronger data-flow result.
+      return index - 1U;
+    }
+  }
+  // A polling loop can retain the same return address across every observed
+  // iteration. Attribute $ra/$link from the actual link instruction even when
+  // its value therefore does not change inside the bounded final window.
+  for (auto index = transfer_index; index-- > 0U;) {
+    const auto &entry = trace[index];
+    const auto opcode = static_cast<std::uint8_t>(entry.instruction >> 26U);
+    if (opcode == 3U && source_register == 31U &&
+        entry.pc + 8U == source_value) {
+      return index;
+    }
+    if (opcode == 0U && (entry.instruction & 63U) == 9U) {
+      const auto destination =
+          static_cast<std::uint8_t>((entry.instruction >> 11U) & 31U);
+      if (destination == source_register && entry.pc + 8U == source_value) {
+        return index;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
+                           bool drive_title_shell = false) {
+  constexpr auto guest_profile = sf::game::sf3UsaGuestRuntimeProfile();
+  constexpr std::size_t trace_capacity = 64U;
+  constexpr std::uint64_t scheduler_slice_budget = 50'000U;
+  constexpr std::uint32_t bootstrap_poll_word = 0x8012214cU;
+
+  auto disc = openDisc(cue_path);
+  if (!disc.game() ||
+      disc.game()->id != sf::game::GameId::syphon_filter_3) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::unsupported,
+        "SF3 guest bootstrap probe requires Syphon Filter 3 USA"};
+  }
+
+  sf::game::LegacyGameplayVm vm{disc.executable()};
+  sf::game::DiscCdRomMedia cdrom_media{disc.image()};
+  vm.machine().setCdRomMedia(&cdrom_media);
+  constexpr bool attach_blank_memory_card = true;
+  vm.bindPsxBiosCoreVector(false, attach_blank_memory_card);
+  const auto &layout = disc.game()->executable_layout;
+  vm.bindPsxVideoTimingCall(layout.vsync_address,
+                            layout.retrace_counter_address);
+  if (layout.cd_pending_command_address != 0U) {
+    vm.bindPsxCdPendingCommandCall(
+        layout.cd_pending_command_address, layout.cd_pending_command_state,
+        layout.cd_response_pointer, layout.cd_completion_state);
+  }
+  if (layout.cd_control_address != 0U) {
+    vm.bindPsxCdControlCall(layout.cd_control_address);
+  }
+  vm.bindPsxCdReadyCallback(
+      layout.cd_ready_callback_address, layout.cd_ready_result_address,
+      layout.cd_ready_state_address, layout.cd_ready_callback_is_pointer);
+  vm.bindPsxCdCompletionCallback(guest_profile.cd_completion_callback,
+                                 layout.cd_ready_result_address, false);
+
+  std::array<Sf3BootstrapTraceEntry, trace_capacity> trace_ring{};
+  std::size_t trace_count{};
+  std::size_t trace_cursor{};
+  std::vector<sf::psx::R3000WriteWatchHit> poll_writes;
+  std::vector<Sf3BootstrapTraceEntry> poll_writer_context;
+  std::size_t poll_writer_future{};
+  std::vector<std::array<std::uint32_t, 6U>> bios_event_calls;
+  std::map<std::array<std::uint32_t, 4U>, std::uint64_t> cd_setloc_calls;
+  std::map<std::uint32_t, std::uint64_t> title_state11_cd_status;
+  std::map<std::array<std::uint32_t, 5U>, std::uint64_t>
+      title_state11_cd_response_states;
+  std::map<std::uint32_t, std::uint64_t> title_state11_cd_branch_visits;
+  std::uint32_t sf3_sound_event_callback{};
+  std::uint64_t game_main_entries{};
+  std::uint64_t application_loop_entries{};
+  std::uint64_t cd_ready_callback_entries{};
+  std::uint64_t cd_completion_callback_entries{};
+  std::uint64_t title_frame_entries{};
+  std::uint64_t gpu_submission_entries{};
+  std::uint64_t valid_presentation_frames{};
+  std::uint64_t title_pad_samples{};
+  std::uint64_t title_ready_pad_samples{};
+  std::uint64_t title_start_samples{};
+  std::uint64_t title_cross_samples{};
+  std::uint64_t title_mode0_pad_samples{};
+  std::uint64_t title_mode0_interactive_samples{};
+  std::uint64_t title_mode1_pad_samples{};
+  std::uint64_t title_mode1_interactive_samples{};
+  std::uint64_t title_mode1_dialog_samples{};
+  std::uint64_t title_mode1_continue_samples{};
+  bool title_mode1_dialog_active{};
+  std::map<std::array<std::uint32_t, 2U>, std::uint64_t>
+      title_mode1_dialog_states;
+  std::map<std::string, std::uint64_t> title_mode1_dialog_texts;
+  std::uint64_t title_mode10_pad_samples{};
+  std::uint64_t title2_pad_samples{};
+  std::uint64_t menu_pad_samples{};
+  std::uint64_t title_mode3_press_callbacks{};
+  std::uint64_t title_mode3_press_accepted{};
+  std::uint64_t title_mode0_accept_callbacks{};
+  std::vector<std::array<std::uint32_t, 2U>> title_mode0_accept_states;
+  std::vector<sf::psx::R3000WriteWatchHit> title_widget_writes;
+  std::map<std::array<std::uint32_t, 5U>, std::uint64_t>
+      title_async_poll_results;
+  std::map<std::uint32_t, std::uint64_t> title_async_entries;
+  std::map<std::array<std::uint32_t, 3U>, std::uint64_t>
+      task_callback_registrations;
+  std::map<std::uint32_t, std::uint64_t> async_operation_pushes;
+  std::map<std::array<std::uint32_t, 2U>, std::uint64_t>
+      async_operation_results;
+  std::map<std::array<std::uint32_t, 2U>, std::uint64_t>
+      async_operation_states;
+  bool memory_card_info_event_pending{};
+  std::uint32_t memory_card_high_event_callback{};
+  bool blank_card_initial_info_seen{};
+  bool memory_card_io_event_pending{};
+  std::uint64_t memory_card_info_calls{};
+  std::uint64_t memory_card_eject_events{};
+  std::map<std::array<std::uint32_t, 3U>, std::uint64_t>
+      memory_card_high_requests;
+  std::uint32_t title_heap_address{};
+  bool title_widget_trace_active{};
+  std::map<std::uint32_t, std::uint64_t> title_pad_modes;
+  std::vector<std::uint32_t> title_state_setter_path;
+  std::map<std::string, std::uint64_t> cd_search_paths;
+  std::set<std::uint32_t> cd_search_returns;
+  std::map<std::array<std::uint32_t, 2U>, std::uint64_t> cd_search_results;
+  std::map<std::array<std::uint32_t, 5U>, std::uint64_t> resident_read_calls;
+  std::uint64_t movie_decoder_handoffs{};
+  std::uint64_t movie_retail_completions{};
+  std::map<std::uint32_t, std::uint64_t> movie_loader_returns;
+  std::map<std::array<std::uint32_t, 7U>, std::uint64_t>
+      movie_playback_requests;
+  std::optional<std::uint32_t> active_movie_catalog_index;
+  std::uint64_t movie_background_yields{};
+  bool movie_presenter_pending{};
+  std::uint64_t movie_presenter_slices{};
+  std::uint32_t movie_presenter_completion{};
+  std::array<std::uint8_t, 32U> movie_catalog_prefix{};
+  bool movie_catalog_prefix_valid{};
+  const auto read_guest_cstring = [&](std::uint32_t address,
+                                      std::string &value) {
+    value.clear();
+    for (auto index = std::uint32_t{}; index < 256U; ++index) {
+      std::uint8_t byte{};
+      if (!vm.runtime().read8(address + index, byte)) {
+        return false;
+      }
+      if (byte == 0U) {
+        return true;
+      }
+      value.push_back(static_cast<char>(byte));
+    }
+    return false;
+  };
+  std::map<std::array<std::uint32_t, 4U>, std::uint64_t>
+      processed_pad_calls;
+  constexpr std::array title_state_candidates{
+      0x80157418U, 0x8015741cU, 0x80157420U, 0x80157424U,
+      0x80157434U, 0x80157640U, 0x80157648U};
+  std::array<std::vector<std::uint32_t>, title_state_candidates.size()>
+      title_state_candidate_paths;
+  std::vector<std::array<std::uint32_t, 7U>> title_accepted_states;
+  std::optional<sf::game::Sf2PresentationFrame> best_presentation_frame;
+  vm.setHostCallObserver(
+      [&](std::uint32_t pc, const sf::psx::R3000State &state) {
+        if (drive_title_shell && pc == 0x000000a0U &&
+            (state.gpr[9U] == 0xabU || state.gpr[9U] == 0xacU)) {
+          memory_card_info_event_pending = true;
+          if (attach_blank_memory_card) {
+            const auto card_info = state.gpr[9U] == 0xabU;
+            const auto initial_info =
+                card_info && state.gpr[31U] == 0x8014840cU &&
+                !blank_card_initial_info_seen;
+            memory_card_high_event_callback =
+                !card_info || initial_info ? 0x80149b4cU : 0x80149b10U;
+            blank_card_initial_info_seen |= initial_info;
+          } else {
+            memory_card_high_event_callback =
+                state.gpr[9U] == 0xabU && state.gpr[31U] == 0x801488c8U
+                    ? 0x80149b10U
+                    : 0x80149b4cU;
+          }
+          ++memory_card_high_requests[
+              {state.gpr[9U], state.gpr[31U],
+               memory_card_high_event_callback}];
+          ++memory_card_info_calls;
+        }
+        if (drive_title_shell && pc == 0x000000b0U &&
+            (state.gpr[9U] == 0x4eU || state.gpr[9U] == 0x4fU)) {
+          memory_card_io_event_pending = true;
+        }
+        if (pc == layout.cd_control_address && state.gpr[4U] == 0x02U &&
+            state.gpr[5U] != 0U) {
+          std::array<std::uint32_t, 4U> call{0U, 0U, 0U, state.gpr[31U]};
+          auto readable = true;
+          for (auto index = std::size_t{}; index < 3U; ++index) {
+            std::uint8_t value{};
+            readable = readable && vm.runtime().read8(
+                                       state.gpr[5U] +
+                                           static_cast<std::uint32_t>(index),
+                                       value);
+            call[index] = value;
+          }
+          if (readable) {
+            ++cd_setloc_calls[call];
+          }
+        }
+        if (pc == 0x000000b0U && state.gpr[9U] >= 0x07U &&
+            state.gpr[9U] <= 0x0dU) {
+          bios_event_calls.push_back({state.gpr[9U], state.gpr[4U],
+                                      state.gpr[5U], state.gpr[6U],
+                                      state.gpr[7U],
+                                      vm.machine().dma().dicr()});
+          if (state.gpr[9U] == 0x08U && state.gpr[4U] == 0xf2000002U &&
+              state.gpr[5U] == 0x02U && state.gpr[6U] == 0x1000U) {
+            sf3_sound_event_callback = state.gpr[7U];
+          }
+        }
+      });
+  if (drive_title_shell) {
+    vm.bindHostCall(
+        guest_profile.cd_search_file_entry,
+        [&](sf::game::LegacyHostCallContext &context) {
+          const auto destination = context.argument(0);
+          std::string path;
+          if (destination == 0U ||
+              !context.readCString(context.argument(1), path, 256U)) {
+            context.setReturnValue(0U);
+            return;
+          }
+          ++cd_search_paths[path];
+          std::ranges::replace(path, '\\', '/');
+          while (!path.empty() && path.front() == '/') {
+            path.erase(path.begin());
+          }
+          if (path.ends_with(";1")) {
+            path.resize(path.size() - 2U);
+          }
+          try {
+            const auto entry = disc.image().find(path);
+            if (entry.is_directory) {
+              context.setReturnValue(0U);
+              return;
+            }
+            constexpr std::uint32_t pregap_sectors = 150U;
+            constexpr std::uint32_t sectors_per_second = 75U;
+            const auto absolute_sector = entry.extent_lba + pregap_sectors;
+            const auto bcd = [](std::uint32_t value) {
+              return static_cast<std::byte>(((value / 10U) << 4U) |
+                                            (value % 10U));
+            };
+            std::array<std::byte, 24U> cdl_file{};
+            cdl_file[0U] = bcd(absolute_sector /
+                               (60U * sectors_per_second));
+            cdl_file[1U] = bcd((absolute_sector / sectors_per_second) % 60U);
+            cdl_file[2U] = bcd(absolute_sector % sectors_per_second);
+            for (auto index = std::size_t{}; index < sizeof(entry.size);
+                 ++index) {
+              cdl_file[4U + index] =
+                  static_cast<std::byte>(entry.size >> (index * 8U));
+            }
+            const auto name_size =
+                std::min(entry.name.size(), cdl_file.size() - 8U);
+            for (auto index = std::size_t{}; index < name_size; ++index) {
+              cdl_file[8U + index] =
+                  static_cast<std::byte>(entry.name[index]);
+            }
+            if (!context.writeBytes(destination, cdl_file)) {
+              context.setReturnValue(0U);
+              return;
+            }
+            ++cd_search_results[{context.returnAddress(), destination}];
+            context.setReturnValue(destination);
+          } catch (const sf::core::Error &) {
+            context.setReturnValue(0U);
+          }
+        });
+    constexpr bool bypass_retail_resident_reads = true;
+    if (bypass_retail_resident_reads) {
+      vm.bindHostCall(
+          guest_profile.resident_file_read_entry,
+          [&](sf::game::LegacyHostCallContext &context) {
+          const auto handle = context.argument(0);
+          const auto destination = context.argument(1);
+          const auto requested = context.argument(2);
+          const auto completion = context.argument(3);
+          ++resident_read_calls[{handle, destination, requested, completion,
+                                 context.returnAddress()}];
+          std::uint32_t handle_size{};
+          if (handle == 0U || destination == 0U ||
+              !context.read32(handle + 4U, handle_size)) {
+            context.continueGuestInstruction();
+            return;
+          }
+          const auto title_entry = disc.image().find("TITLE.HOG");
+          const auto movie_entry = disc.image().find("MOVIE1.HOG");
+          std::vector<std::byte> payload;
+          if (destination == 0x80150950U && requested == 0xe800U) {
+            payload.resize(requested);
+            const auto bytes = disc.image().readFile("BIN/TITLE2.OVL");
+            std::ranges::copy(bytes, payload.begin());
+          } else if (destination == 0x8015e978U &&
+                     requested == 0x12000U) {
+            payload.resize(requested);
+            const auto bytes = disc.image().readFile("BIN/INIT.OVL");
+            std::ranges::copy(bytes, payload.begin());
+          } else if (destination == 0x801afd0cU &&
+                     requested == 0x27800U) {
+            payload.resize(requested);
+            const auto bytes = disc.image().readFile("MPTITLE2.HOG");
+            std::ranges::copy(bytes, payload.begin());
+          } else if (handle_size == title_entry.size &&
+              requested >= title_entry.size) {
+            payload.resize(requested);
+            const auto bytes = disc.image().readFile("TITLE.HOG");
+            std::ranges::copy(bytes, payload.begin());
+          } else if (handle_size == movie_entry.size && requested == 0x800U) {
+            payload.resize(requested);
+            auto sector = std::span<std::byte, 0x800U>{payload};
+            if (!cdrom_media.readDataSector(movie_entry.extent_lba, sector)) {
+              context.setReturnValue(3U);
+              return;
+            }
+            for (auto index = std::size_t{};
+                 index < movie_catalog_prefix.size(); ++index) {
+              movie_catalog_prefix[index] =
+                  std::to_integer<std::uint8_t>(payload[index]);
+            }
+            movie_catalog_prefix_valid = true;
+          } else {
+            context.continueGuestInstruction();
+            return;
+          }
+          if (!context.writeBytes(destination, payload) ||
+              (completion != 0U && !context.write32(completion, 0U))) {
+            context.setReturnValue(3U);
+            return;
+          }
+          context.setReturnValue(0U);
+          });
+    }
+    constexpr bool bypass_retail_movie_playback = true;
+    if (bypass_retail_movie_playback) {
+      vm.bindHostCall(
+          guest_profile.movie_playback_update_entry,
+          [&](sf::game::LegacyHostCallContext &context) {
+            if (!movie_presenter_pending) {
+              context.continueGuestInstruction();
+              return;
+            }
+            context.setReturnValue(0U);
+          });
+    }
+    vm.bindHostCall(
+        guest_profile.title_pad_poll_return,
+        [&](sf::game::LegacyHostCallContext &context) {
+          std::uint32_t application_state{};
+          if (!context.read32(guest_profile.application_state,
+                              application_state) ||
+              application_state != 4U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          if (context.registerValue(5U) != 0U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          const auto title_mode = context.registerValue(19U);
+          ++title_pad_modes[title_mode];
+          if (title_mode == 0U) {
+            ++title_mode0_pad_samples;
+          } else if (title_mode == 1U) {
+            ++title_mode1_pad_samples;
+          } else if (title_mode == 10U) {
+            ++title_mode10_pad_samples;
+          }
+          ++title_pad_samples;
+          std::uint32_t title_substate{};
+          const auto ready = context.read32(guest_profile.title_substate,
+                                            title_substate) &&
+                             title_substate == 3U;
+          title_ready_pad_samples += ready ? 1U : 0U;
+          constexpr std::uint64_t start_press_begin = 15U;
+          constexpr std::uint64_t start_press_end = 15U;
+          std::uint32_t title_heap{};
+          std::uint32_t widget_state{};
+          const auto title_mode0_interactive =
+              title_mode == 0U &&
+              context.read32(0x8015e5f0U, title_heap) && title_heap != 0U &&
+              context.read32(title_heap + 0x9a7cU, widget_state) &&
+              widget_state == 4U;
+          title_mode0_interactive_samples +=
+              title_mode0_interactive ? 1U : 0U;
+          std::uint32_t mode1_gate{};
+          std::uint32_t mode1_callback{};
+          if (title_mode == 1U &&
+              context.read32(0x80157374U, mode1_gate) &&
+              context.read32(0x80157378U, mode1_callback)) {
+            ++title_mode1_dialog_states[{mode1_gate, mode1_callback}];
+            std::uint32_t dialog_text_address{};
+            std::string dialog_text;
+            if (context.read32(0x80157358U, dialog_text_address) &&
+                dialog_text_address != 0U &&
+                context.readCString(dialog_text_address, dialog_text, 512U)) {
+              ++title_mode1_dialog_texts[dialog_text];
+            }
+          }
+          const auto title_mode1_interactive =
+              title_mode == 1U && mode1_gate != 4U && mode1_callback != 0U;
+          title_mode1_interactive_samples +=
+              title_mode1_interactive ? 1U : 0U;
+          if (title_mode1_interactive) {
+            if (!title_mode1_dialog_active) {
+              title_mode1_dialog_samples = 0U;
+            }
+            title_mode1_dialog_active = true;
+            ++title_mode1_dialog_samples;
+          } else {
+            title_mode1_dialog_active = false;
+          }
+          const auto title_mode1_continue_ready =
+              title_mode == 1U && mode1_gate == 1U && mode1_callback == 0U &&
+              title_mode1_interactive_samples != 0U;
+          title_mode1_continue_samples +=
+              title_mode1_continue_ready ? 1U : 0U;
+          const auto cross_pressed =
+              title_ready_pad_samples == 3U ||
+              title_ready_pad_samples == 5U ||
+              title_ready_pad_samples == 7U ||
+              title_ready_pad_samples == 9U ||
+              (title_mode0_interactive &&
+               title_mode0_interactive_samples == 3U) ||
+              (title_mode1_interactive &&
+               title_mode1_dialog_samples == 7U) ||
+              (title_mode1_continue_ready &&
+               title_mode1_continue_samples == 3U) ||
+              (title_mode == 10U && title_mode10_pad_samples == 3U);
+          const auto down_pressed =
+              title_mode1_interactive && title_mode1_dialog_samples == 3U;
+          const auto buttons = static_cast<std::uint16_t>(
+              title_ready_pad_samples >= start_press_begin &&
+                      title_ready_pad_samples <= start_press_end
+                  ? 0x0800U
+              : cross_pressed
+                  ? 0x0040U
+              : down_pressed
+                  ? 0x4000U
+                  : 0U);
+          title_start_samples += buttons == 0x0800U ? 1U : 0U;
+          title_cross_samples += buttons == 0x0040U ? 1U : 0U;
+          std::uint32_t record{};
+          if (!context.read32(context.registerValue(29U) + 0x10U, record) ||
+              record == 0U || !context.write8(record, 0U) ||
+              !context.write16(record + 4U, buttons)) {
+            context.rejectHostCall();
+            return;
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        guest_profile.title2_pad_poll_return,
+        [&](sf::game::LegacyHostCallContext &context) {
+          std::uint32_t application_state{};
+          if (!context.read32(guest_profile.application_state,
+                              application_state) ||
+              application_state == 0U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          if (context.registerValue(5U) != 0U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          ++title2_pad_samples;
+          const auto cross_pressed = title2_pad_samples == 10U;
+          const auto buttons = static_cast<std::uint16_t>(
+              cross_pressed ? 0x0040U : 0U);
+          title_cross_samples += cross_pressed ? 1U : 0U;
+          std::uint32_t record{};
+          if (!context.read32(context.registerValue(29U) + 0x10U, record) ||
+              record == 0U || !context.write8(record, 0U) ||
+              !context.write16(record + 4U, buttons)) {
+            context.rejectHostCall();
+            return;
+          }
+          context.continueGuestInstruction();
+        });
+    vm.bindHostCall(
+        guest_profile.menu_pad_poll_return,
+        [&](sf::game::LegacyHostCallContext &context) {
+          std::uint32_t application_state{};
+          if (!context.read32(guest_profile.application_state,
+                              application_state) ||
+              application_state == 0U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          if (context.registerValue(5U) != 0U) {
+            context.continueGuestInstruction();
+            return;
+          }
+          ++menu_pad_samples;
+          const auto cross_pressed =
+              (menu_pad_samples >= 10U && menu_pad_samples <= 12U) ||
+              (menu_pad_samples >= 30U && menu_pad_samples <= 32U) ||
+              (menu_pad_samples >= 50U && menu_pad_samples <= 52U) ||
+              (menu_pad_samples >= 70U && menu_pad_samples <= 72U);
+          const auto buttons = static_cast<std::uint16_t>(
+              cross_pressed ? 0x0040U : 0U);
+          title_cross_samples += cross_pressed ? 1U : 0U;
+          std::uint32_t record{};
+          if (!context.read32(context.registerValue(29U) + 0x10U, record) ||
+              record == 0U || !context.write8(record, 0U) ||
+              !context.write16(record + 4U, buttons)) {
+            context.rejectHostCall();
+            return;
+          }
+          context.continueGuestInstruction();
+        });
+  }
+  vm.runtime().setWriteTrace(bootstrap_poll_word, bootstrap_poll_word + 3U);
+  vm.runtime().setExecutionObserver(
+      [&](const sf::psx::R3000State &state, std::uint32_t pc,
+          std::uint32_t instruction) {
+        game_main_entries += pc == guest_profile.game_main_entry ? 1U : 0U;
+        if (pc == 0x800f7a6cU) {
+          ++task_callback_registrations[
+              {state.gpr[2U], state.gpr[4U], state.gpr[5U]}];
+        }
+        if (pc == 0x80149a10U) {
+          ++async_operation_pushes[state.gpr[4U]];
+        }
+        if (pc == 0x80148374U || pc == 0x801486f0U) {
+          std::uint32_t operation_state{};
+          if (vm.runtime().read32(state.gpr[4U], operation_state)) {
+            ++async_operation_states[{pc, operation_state}];
+          }
+        }
+        if (pc == 0x80149ac8U) {
+          ++async_operation_results[{state.gpr[2U], state.gpr[4U]}];
+        }
+        application_loop_entries +=
+            pc == guest_profile.state_loop_entry ? 1U : 0U;
+        title_frame_entries +=
+            pc == guest_profile.title_state_frame_entry ? 1U : 0U;
+        if (pc == guest_profile.title_state_frame_entry) {
+          for (auto index = std::size_t{};
+               index < title_state_candidates.size(); ++index) {
+            std::uint32_t value{};
+            auto &path = title_state_candidate_paths[index];
+            if (vm.runtime().read32(title_state_candidates[index], value) &&
+                path.size() < 64U && (path.empty() || path.back() != value)) {
+              path.push_back(value);
+            }
+          }
+          std::uint32_t title_mode{};
+          std::uint32_t title_heap{};
+          if (drive_title_shell && !title_widget_trace_active &&
+              vm.runtime().read32(guest_profile.title_substate, title_mode) &&
+              title_mode == 0U &&
+              vm.runtime().read32(0x8015e5f0U, title_heap) &&
+              title_heap != 0U) {
+            title_heap_address = title_heap;
+            vm.runtime().setWriteTrace(title_heap + 0x9a7cU,
+                                       title_heap + 0x9a80U);
+            title_widget_trace_active = true;
+          }
+        }
+        if (!drive_title_shell && pc == guest_profile.cd_search_file_entry) {
+          std::string path;
+          if (read_guest_cstring(state.gpr[5U], path)) {
+            ++cd_search_paths[path];
+          }
+          cd_search_returns.insert(state.gpr[31U]);
+        }
+        if (cd_search_returns.contains(pc)) {
+          ++cd_search_results[{pc, state.gpr[2U]}];
+        }
+        if (pc == guest_profile.resident_file_read_entry) {
+          ++resident_read_calls[{state.gpr[4U], state.gpr[5U], state.gpr[6U],
+                                 state.gpr[7U], state.gpr[31U]}];
+        }
+        if (drive_title_shell &&
+            pc == guest_profile.movie_playback_init_entry &&
+            !movie_presenter_pending) {
+          std::uint32_t catalog_index = 0xffffffffU;
+          for (auto index = 0U; index < 27U; ++index) {
+            std::uint32_t begin{};
+            std::uint32_t end{};
+            if (vm.runtime().read32(0x8012ab98U + index * 4U, begin) &&
+                vm.runtime().read32(0x8012ac04U + index * 4U, end) &&
+                begin == state.gpr[4U] && end == state.gpr[5U]) {
+              catalog_index = index;
+              break;
+            }
+          }
+          std::uint32_t stack_argument{};
+          std::uint32_t completion{};
+          if (vm.runtime().read32(state.gpr[29U] + 0x10U, stack_argument) &&
+              vm.runtime().read32(state.gpr[29U] + 0x14U, completion)) {
+            ++movie_playback_requests[
+                {catalog_index, state.gpr[4U], state.gpr[5U], state.gpr[6U],
+                 state.gpr[7U], stack_argument, completion}];
+            active_movie_catalog_index = catalog_index;
+            movie_presenter_pending = true;
+            movie_presenter_slices = 0U;
+            movie_presenter_completion = completion;
+            ++movie_decoder_handoffs;
+          }
+        }
+        title_mode3_press_callbacks +=
+            pc == guest_profile.title_mode3_press_callback ? 1U : 0U;
+        if (pc == 0x8014921cU || pc == 0x801495a8U ||
+            pc == 0x801498ccU || pc == 0x80153abcU) {
+          ++title_async_entries[pc];
+        }
+        if (pc == 0x800a6cb0U) {
+          ++title_state11_cd_status[state.gpr[2U]];
+        }
+        if (pc == 0x800a6cc8U) {
+          std::uint8_t response{};
+          std::uint8_t flags{};
+          std::uint8_t transition{};
+          static_cast<void>(vm.runtime().read8(state.gpr[28U] + 0xdc0U,
+                                               response));
+          static_cast<void>(vm.runtime().read8(state.gpr[28U] + 0xdb8U,
+                                               flags));
+          static_cast<void>(
+              vm.runtime().read8(0x80122358U, transition));
+          ++title_state11_cd_response_states[
+              {state.gpr[2U], state.gpr[28U], response, flags, transition}];
+        }
+        if (pc == 0x800a6d68U || pc == 0x800a6d8cU ||
+            pc == 0x800a6df0U) {
+          ++title_state11_cd_branch_visits[pc];
+        }
+        if (pc == 0x80153ad4U) {
+          std::uint32_t event_type{};
+          std::uint32_t event_value{};
+          std::uint32_t queue_state{};
+          std::uint32_t queue_ready{};
+          static_cast<void>(
+              vm.runtime().read32(state.gpr[29U] + 0x10U, event_type));
+          static_cast<void>(
+              vm.runtime().read32(state.gpr[29U] + 0x14U, event_value));
+          static_cast<void>(vm.runtime().read32(0x8014bf70U, queue_state));
+          static_cast<void>(vm.runtime().read32(0x8014bf78U, queue_ready));
+          ++title_async_poll_results[
+              {state.gpr[2U], event_type, event_value, queue_state,
+               queue_ready}];
+        }
+        if (pc == 0x801541d8U) {
+          ++title_mode0_accept_callbacks;
+          std::uint32_t selection{};
+          std::uint32_t title_heap{};
+          std::uint32_t widget_state{};
+          if (vm.runtime().read32(0x80157424U, selection) &&
+              vm.runtime().read32(0x8015e5f0U, title_heap) &&
+              vm.runtime().read32(title_heap + 0x9a7cU, widget_state)) {
+            title_mode0_accept_states.push_back({selection, widget_state});
+          }
+        }
+        title_mode3_press_accepted += pc == 0x8015455cU ? 1U : 0U;
+        if (pc == 0x8015455cU && title_accepted_states.size() < 8U) {
+          std::array<std::uint32_t, 7U> snapshot{};
+          for (auto index = std::size_t{}; index < snapshot.size(); ++index) {
+            static_cast<void>(vm.runtime().read32(title_state_candidates[index],
+                                                  snapshot[index]));
+          }
+          title_accepted_states.push_back(snapshot);
+        }
+        if (pc == guest_profile.title_state_setter &&
+            (title_state_setter_path.empty() ||
+             title_state_setter_path.back() != state.gpr[4U])) {
+          title_state_setter_path.push_back(state.gpr[4U]);
+        }
+        if (pc == guest_profile.processed_pad_entry) {
+          ++processed_pad_calls[{state.gpr[31U], state.gpr[4U],
+                                 state.gpr[5U], state.gpr[29U]}];
+        }
+        gpu_submission_entries +=
+            pc == guest_profile.gpu_submission_entry ? 1U : 0U;
+        if (pc == guest_profile.gpu_submission_entry &&
+            state.gpr[31U] == guest_profile.render_submission_return) {
+          std::uint32_t application_state{};
+          static_cast<void>(vm.runtime().read32(guest_profile.application_state,
+                                                application_state));
+          auto captured = sf::game::captureSf3PresentationFrame(
+              vm.runtime().ram(), state.gpr[5U], application_state,
+              gpu_submission_entries, title_frame_entries);
+          if (captured) {
+            ++valid_presentation_frames;
+            if (!best_presentation_frame ||
+                std::tuple{captured->draw_command_count,
+                           captured->gpu_command_count,
+                           captured->gp0_word_count} >
+                    std::tuple{best_presentation_frame->draw_command_count,
+                               best_presentation_frame->gpu_command_count,
+                               best_presentation_frame->gp0_word_count}) {
+              best_presentation_frame = std::move(captured);
+            }
+          }
+        }
+        cd_ready_callback_entries +=
+            pc == layout.cd_ready_callback_address ? 1U : 0U;
+        cd_completion_callback_entries +=
+            pc == guest_profile.cd_completion_callback ? 1U : 0U;
+        if (const auto &hit = vm.runtime().writeTraceHit(); hit.width != 0U) {
+          if (title_widget_trace_active) {
+            title_widget_writes.push_back(hit);
+            vm.runtime().clearWriteTraceHit();
+          } else {
+          poll_writes.push_back(hit);
+          vm.runtime().clearWriteTraceHit();
+          poll_writer_context.clear();
+          const auto context_count = std::min(trace_count, std::size_t{48U});
+          const auto context_begin =
+              (trace_cursor + trace_capacity - context_count) % trace_capacity;
+          for (std::size_t index = 0U; index < context_count; ++index) {
+            poll_writer_context.push_back(
+                trace_ring[(context_begin + index) % trace_capacity]);
+          }
+          poll_writer_future = 12U;
+          }
+        }
+        trace_ring[trace_cursor] = {state, pc, instruction};
+        trace_cursor = (trace_cursor + 1U) % trace_capacity;
+        trace_count = std::min(trace_count + 1U, trace_capacity);
+        if (poll_writer_future != 0U) {
+          poll_writer_context.push_back({state, pc, instruction});
+          --poll_writer_future;
+        }
+      });
+
+  auto remaining = budget;
+  std::uint64_t total_instructions{};
+  std::uint64_t total_host_calls{};
+  std::uint64_t spu_dma_callback_count{};
+  std::uint64_t task_scheduler_ticks{};
+  std::uint64_t task_scheduler_calls{};
+  bool cd_callback_failed{};
+  std::vector<std::uint32_t> application_state_path;
+  const auto sample_application_state = [&]() {
+    std::uint32_t state{};
+    if (vm.runtime().read32(guest_profile.application_state, state) &&
+        (application_state_path.empty() ||
+         application_state_path.back() != state)) {
+      application_state_path.push_back(state);
+    }
+  };
+  sample_application_state();
+  constexpr std::uint32_t movie_return_trampoline = 0x8000c000U;
+  constexpr std::uint64_t task_scheduler_period =
+      sf::psx::CdRomController::cpu_clock_hz /
+      sf::game::LegacyGameplayVm::updates_per_second;
+  vm.bindHostCall(movie_return_trampoline,
+                  [](sf::game::LegacyHostCallContext &context) {
+                    context.continueGuestInstruction();
+                  });
+  auto result = vm.resumeCurrentPcClockNeutral(
+      std::min(remaining, scheduler_slice_budget));
+  for (;;) {
+    total_instructions += result.execution.instructions;
+    total_host_calls += result.host_calls;
+    sample_application_state();
+    const auto consumed = std::min(remaining, scheduler_slice_budget);
+    remaining -= consumed;
+    if (result.yieldedAfterHostCall() &&
+        result.yielded_host_call == guest_profile.movie_playback_init_entry &&
+        remaining != 0U) {
+      // The yielded HLE return has restored MOVIE.OVL's frame, exposing
+      // MovieLoader's own saved RA at the same +0x24 slot used by SF2's
+      // structurally matched loader.
+      std::uint32_t movie_loader_return{};
+      if (!vm.runtime().read32(vm.runtime().state().gpr[29U] + 0x24U,
+                               movie_loader_return)) {
+        result.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        break;
+      }
+      ++movie_loader_returns[movie_loader_return];
+      const auto loader = vm.runCurrentPcUntilHostBoundaryClockNeutral(
+          movie_loader_return,
+          std::min<std::uint64_t>(remaining, 5'000'000U));
+      total_instructions += loader.execution.instructions;
+      total_host_calls += loader.host_calls;
+      sample_application_state();
+      if (!loader.stoppedAtHostBoundary()) {
+        result = loader;
+        break;
+      }
+
+      const auto continuation = vm.runtime().state();
+      if (!vm.runtime().write8(0x8014af10U, 0U)) {
+        result.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        break;
+      }
+      sf::game::LegacyGameplayVmResult completion;
+      if (movie_presenter_completion == 0U ||
+          !vm.runtime().beginCall(movie_presenter_completion, {})) {
+        completion.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        completion.execution.pc = movie_presenter_completion;
+      } else {
+        vm.runtime().setRegister(31U, movie_return_trampoline);
+        completion = vm.runCurrentPcUntilHostBoundaryClockNeutral(
+            movie_return_trampoline,
+            std::min<std::uint64_t>(remaining, 5'000'000U));
+      }
+      total_instructions += completion.execution.instructions;
+      total_host_calls += completion.host_calls;
+      vm.runtime().restoreCpuState(continuation);
+      if (!completion.completed() && !completion.stoppedAtHostBoundary()) {
+        result = completion;
+        break;
+      }
+      movie_presenter_pending = false;
+      movie_presenter_slices = 0U;
+      ++movie_retail_completions;
+      sample_application_state();
+      // Native playback would yield to the host for many retraces. Ensure the
+      // immediate headless completion still gives retail's event/timer path
+      // one ordinary scheduler slice before MovieLoader's caller resumes.
+      vm.machine().advanceHardwareTicks(consumed);
+      std::uint32_t movie_retrace_counter{};
+      if (!vm.runtime().read32(layout.retrace_counter_address,
+                               movie_retrace_counter) ||
+          !vm.runtime().write32(layout.retrace_counter_address,
+                                movie_retrace_counter + 1U)) {
+        result.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        break;
+      }
+      sf::game::LegacyGameplayVmResult movie_cd_callback_result;
+      if (!vm.servicePsxCdReadyCallback(&movie_cd_callback_result,
+                                        guest_profile.interrupt_stack)) {
+        result = movie_cd_callback_result;
+        cd_callback_failed = true;
+        remaining = 0U;
+        break;
+      }
+      result = vm.resumeCurrentPcClockNeutral(
+          std::min(remaining, scheduler_slice_budget));
+      continue;
+    }
+    if (result.execution.reason !=
+            sf::psx::R3000StopReason::instruction_budget ||
+        remaining == 0U) {
+      break;
+    }
+    std::uint32_t live_poll_word{};
+    if (result.execution.pc >= 0x8016ea04U &&
+        result.execution.pc <= 0x8016ea10U &&
+        vm.runtime().read32(bootstrap_poll_word, live_poll_word) &&
+        live_poll_word != 0U &&
+        vm.machine().dma().scheduledToken(sf::psx::DmaChannel::spu) == 0U) {
+      sf::game::LegacyGameplayVmResult callback_result;
+      if (!vm.servicePsxCallback(guest_profile.spu_dma_completion_callback,
+                                 guest_profile.interrupt_stack,
+                                 &callback_result)) {
+        throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                              "SF3 SPU DMA event callback failed"};
+      }
+      ++spu_dma_callback_count;
+    }
+    vm.machine().advanceHardwareTicks(consumed);
+    std::uint32_t retrace_counter{};
+    if (!vm.runtime().read32(layout.retrace_counter_address,
+                             retrace_counter) ||
+        !vm.runtime().write32(layout.retrace_counter_address,
+                              retrace_counter + 1U)) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "Could not advance SF3 VBlank counter"};
+    }
+    sf::game::LegacyGameplayVmResult cd_callback_result;
+    if (!vm.servicePsxCdReadyCallback(&cd_callback_result,
+                                      guest_profile.interrupt_stack)) {
+      result = cd_callback_result;
+      cd_callback_failed = true;
+      remaining = 0U;
+      break;
+    }
+    task_scheduler_ticks += consumed;
+    while (drive_title_shell &&
+           task_scheduler_ticks >= task_scheduler_period) {
+      task_scheduler_ticks -= task_scheduler_period;
+      sf::game::LegacyGameplayVmResult callback_result;
+      if (!vm.servicePsxCallback(guest_profile.task_scheduler_tick_entry,
+                                 guest_profile.interrupt_stack,
+                                 &callback_result)) {
+        result = callback_result;
+        remaining = 0U;
+        break;
+      }
+      ++task_scheduler_calls;
+      if (memory_card_info_event_pending) {
+        // The probe supplies a deterministic formatted card. Complete the
+        // asynchronous BIOS request through the exact retail done callback.
+        sf::game::LegacyGameplayVmResult card_event_result;
+        if (!vm.servicePsxCallback(memory_card_high_event_callback,
+                                   guest_profile.interrupt_stack,
+                                   &card_event_result)) {
+          result = card_event_result;
+          remaining = 0U;
+          break;
+        }
+        memory_card_info_event_pending = false;
+        ++memory_card_eject_events;
+      }
+      if (memory_card_io_event_pending) {
+        const auto lower_card_event_callback =
+            attach_blank_memory_card ? 0x80149b60U : 0x80149b9cU;
+        sf::game::LegacyGameplayVmResult card_event_result;
+        if (!vm.servicePsxCallback(lower_card_event_callback,
+                                   guest_profile.interrupt_stack,
+                                   &card_event_result)) {
+          result = card_event_result;
+          remaining = 0U;
+          break;
+        }
+        memory_card_io_event_pending = false;
+        ++memory_card_eject_events;
+      }
+    }
+    if (remaining == 0U) {
+      break;
+    }
+    if (movie_presenter_pending && ++movie_presenter_slices >= 300U) {
+      const auto continuation = vm.runtime().state();
+      sf::game::LegacyGameplayVmResult completion;
+      if (!vm.runtime().write8(0x8014af10U, 0U) ||
+          movie_presenter_completion == 0U ||
+          !vm.runtime().beginCall(movie_presenter_completion, {})) {
+        completion.execution.reason = sf::psx::R3000StopReason::memory_fault;
+        completion.execution.pc = movie_presenter_completion;
+      } else {
+        vm.runtime().setRegister(31U, movie_return_trampoline);
+        completion = vm.runCurrentPcUntilHostBoundaryClockNeutral(
+            movie_return_trampoline,
+            std::min<std::uint64_t>(remaining, 5'000'000U));
+      }
+      total_instructions += completion.execution.instructions;
+      total_host_calls += completion.host_calls;
+      vm.runtime().restoreCpuState(continuation);
+      if (!completion.completed() && !completion.stoppedAtHostBoundary()) {
+        result = completion;
+        break;
+      }
+      movie_presenter_pending = false;
+      movie_presenter_slices = 0U;
+      ++movie_retail_completions;
+      sample_application_state();
+    }
+    result = vm.resumeCurrentPcClockNeutral(
+        std::min(remaining, scheduler_slice_budget));
+  }
+  if (const auto &hit = vm.runtime().writeTraceHit(); hit.width != 0U) {
+    poll_writes.push_back(hit);
+    vm.runtime().clearWriteTraceHit();
+  }
+  vm.runtime().setExecutionObserver({});
+
+  std::vector<Sf3BootstrapTraceEntry> trace;
+  trace.reserve(trace_count);
+  const auto trace_begin =
+      trace_count == trace_capacity ? trace_cursor : std::size_t{};
+  for (std::size_t index = 0U; index < trace_count; ++index) {
+    trace.push_back(trace_ring[(trace_begin + index) % trace_capacity]);
+  }
+
+  std::uint16_t timer1_counter{};
+  std::uint16_t timer1_mode{};
+  static_cast<void>(vm.runtime().read16(0x1f801110U, timer1_counter));
+  static_cast<void>(vm.runtime().read16(0x1f801114U, timer1_mode));
+  const auto cdrom = vm.machine().cdrom().captureState();
+  const auto spu_dma_madr = vm.machine().dma().madr(sf::psx::DmaChannel::spu);
+  const auto spu_dma_bcr = vm.machine().dma().bcr(sf::psx::DmaChannel::spu);
+  const auto spu_dma_chcr = vm.machine().dma().chcr(sf::psx::DmaChannel::spu);
+  std::uint32_t poll_word_value{};
+  static_cast<void>(vm.runtime().read32(bootstrap_poll_word, poll_word_value));
+  std::uint32_t final_application_state{};
+  std::uint32_t final_application_depth{};
+  std::uint8_t final_application_transition{};
+  static_cast<void>(
+      vm.runtime().read32(guest_profile.application_state,
+                          final_application_state));
+  static_cast<void>(vm.runtime().read32(guest_profile.application_state_depth,
+                                        final_application_depth));
+  static_cast<void>(vm.runtime().read8(guest_profile.application_transition,
+                                       final_application_transition));
+  const auto stop_entry = std::find_if(
+      trace.rbegin(), trace.rend(), [&](const Sf3BootstrapTraceEntry &entry) {
+        return entry.pc == result.execution.pc;
+      });
+  const auto stop_instruction =
+      stop_entry != trace.rend() ? stop_entry->instruction
+                                : result.execution.instruction;
+
+  std::cout << "SF3 guest bootstrap: start=0x" << std::hex << std::uppercase
+            << disc.executable().header().initial_pc << " stop=0x"
+            << result.execution.pc << std::dec
+            << " reason=" << sf::psx::toString(result.execution.reason)
+            << " instructions=" << total_instructions
+            << " host-calls=" << total_host_calls << " stop-instruction=0x"
+            << std::hex << stop_instruction << " bad-vaddr=0x"
+            << vm.runtime().state().cop0_bad_vaddr << " v0=0x"
+            << vm.runtime().state().gpr[2U] << " v1=0x"
+            << vm.runtime().state().gpr[3U] << " ra=0x"
+            << vm.runtime().state().gpr[31U] << " sp=0x"
+            << vm.runtime().state().gpr[29U] << " a0=0x"
+            << vm.runtime().state().gpr[4U] << " a1=0x"
+            << vm.runtime().state().gpr[5U] << " a2=0x"
+            << vm.runtime().state().gpr[6U] << " a3=0x"
+            << vm.runtime().state().gpr[7U] << " timer1=0x" << timer1_counter
+            << " timer1-mode=0x" << timer1_mode << " cd-if=0x"
+            << static_cast<unsigned int>(cdrom.interrupt_flags) << " cd-ie=0x"
+            << static_cast<unsigned int>(cdrom.interrupt_enable)
+            << " spu-dma=0x" << spu_dma_madr << ",0x" << spu_dma_bcr << ",0x"
+            << spu_dma_chcr << std::dec << " spu-dma-callbacks="
+            << spu_dma_callback_count << '\n';
+  std::cout << "SF3 bootstrap retail boundaries: game-main="
+            << game_main_entries << " application-loop="
+            << application_loop_entries << " cd-ready-callbacks="
+            << cd_ready_callback_entries << " cd-completion-callbacks="
+            << cd_completion_callback_entries << " title-frames="
+            << title_frame_entries << " gpu-submissions="
+            << gpu_submission_entries << " presentation-frames="
+            << valid_presentation_frames;
+  if (best_presentation_frame) {
+    std::cout << " best-presentation=0x" << std::hex << std::uppercase
+              << best_presentation_frame->ordering_table_root << std::dec
+              << "/" << best_presentation_frame->packets.size() << "/"
+              << best_presentation_frame->gp0_word_count << "/"
+              << best_presentation_frame->draw_command_count;
+  }
+  std::cout << '\n';
+  std::cout << "SF3 bootstrap application state: current="
+            << final_application_state << " depth=" << final_application_depth
+            << " transition="
+            << static_cast<unsigned int>(final_application_transition)
+            << " sampled-path=";
+  for (std::size_t index = 0U; index < application_state_path.size(); ++index) {
+    std::cout << (index == 0U ? "" : "->") << application_state_path[index];
+  }
+  std::cout << '\n';
+  std::cout << "SF3 bootstrap processed PAD calls: count=";
+  auto processed_pad_call_count = std::uint64_t{};
+  for (const auto &[call, count] : processed_pad_calls) {
+    static_cast<void>(call);
+    processed_pad_call_count += count;
+  }
+  std::cout << processed_pad_call_count << " variants="
+            << processed_pad_calls.size() << '\n';
+  for (const auto &[call, count] : processed_pad_calls) {
+    std::cout << "  ra=0x" << std::hex << std::uppercase << call[0U]
+              << " a0=0x" << call[1U] << " a1=0x" << call[2U]
+              << " sp=0x" << call[3U] << std::dec << " count=" << count
+              << '\n';
+  }
+  if (drive_title_shell) {
+    std::cout << "SF3 title-shell input: pad-samples=" << title_pad_samples
+              << " ready-samples=" << title_ready_pad_samples
+              << " mode0-interactive-samples="
+              << title_mode0_interactive_samples
+              << " mode1-samples=" << title_mode1_pad_samples
+              << "/interactive=" << title_mode1_interactive_samples
+              << " mode10-samples=" << title_mode10_pad_samples
+              << " start-samples=" << title_start_samples
+              << " title2-pad-samples=" << title2_pad_samples
+              << " menu-pad-samples=" << menu_pad_samples
+              << " cross-samples=" << title_cross_samples << '\n';
+    std::cout << "SF3 title-shell PAD modes:";
+    for (const auto &[mode, count] : title_pad_modes) {
+      const auto descriptor = 0x80157434U + mode * 32U;
+      std::uint32_t press_callback{};
+      std::uint32_t direction_callback{};
+      static_cast<void>(vm.runtime().read32(descriptor + 8U,
+                                            press_callback));
+      static_cast<void>(vm.runtime().read32(descriptor + 12U,
+                                            direction_callback));
+      std::cout << " " << mode << ':' << count << "@0x" << std::hex
+                << std::uppercase << descriptor << "/0x" << press_callback
+                << "/0x" << direction_callback << std::dec;
+    }
+    std::cout << '\n';
+    for (const auto &[dialog_text, count] : title_mode1_dialog_texts) {
+      std::cout << "  dialog-text=" << std::quoted(dialog_text)
+                << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell mode1 dialog states:";
+    for (const auto &[dialog, count] : title_mode1_dialog_states) {
+      std::cout << " gate=" << dialog[0U] << "/callback=0x" << std::hex
+                << std::uppercase << dialog[1U] << std::dec << ':' << count;
+    }
+    std::cout << '\n';
+    for (const auto &snapshot : title_accepted_states) {
+      std::cout << "  accepted-state=";
+      for (auto index = std::size_t{}; index < snapshot.size(); ++index) {
+        std::cout << (index == 0U ? "" : "/") << snapshot[index];
+      }
+      std::cout << '\n';
+    }
+    std::cout << "SF3 title-shell callbacks: mode3-press="
+              << title_mode3_press_callbacks << "/accepted="
+              << title_mode3_press_accepted << " mode0-accept="
+              << title_mode0_accept_callbacks << " state-setter=";
+    for (auto index = std::size_t{}; index < title_state_setter_path.size();
+         ++index) {
+      std::cout << (index == 0U ? "" : "->")
+                << title_state_setter_path[index];
+    }
+    std::cout << '\n';
+    std::cout << "SF3 title-shell mode0 accept selections:";
+    for (const auto &state : title_mode0_accept_states) {
+      std::cout << ' ' << state[0U] << '/' << state[1U];
+    }
+    std::cout << '\n';
+    std::cout << "SF3 title-shell widget trace: heap=0x" << std::hex
+              << std::uppercase << title_heap_address << std::dec
+              << " writes=" << title_widget_writes.size() << '\n';
+    for (const auto &hit : title_widget_writes) {
+      std::cout << "  pc=0x" << std::hex << std::uppercase << hit.pc
+                << " address=0x" << hit.address << " value=0x" << hit.value
+                << " instruction=0x" << hit.instruction << std::dec
+                << " width=" << static_cast<unsigned int>(hit.width) << '\n';
+    }
+    std::cout << "SF3 title-shell async entries:";
+    for (const auto &[entry, count] : title_async_entries) {
+      std::cout << " 0x" << std::hex << std::uppercase << entry << std::dec
+                << ':' << count;
+    }
+    std::cout << '\n';
+    std::cout << "SF3 title-shell async poll results:" << '\n';
+    for (const auto &[poll_result, count] : title_async_poll_results) {
+      std::cout << "  v0=" << static_cast<std::int32_t>(poll_result[0U])
+                << " event=" << poll_result[1U] << '/' << poll_result[2U]
+                << " queue=" << poll_result[3U] << '/' << poll_result[4U]
+                << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell task callback registrations:" << '\n';
+    for (const auto &[registration, count] : task_callback_registrations) {
+      std::cout << "  method=0x" << std::hex << std::uppercase
+                << registration[0U] << " slot=" << std::dec
+                << registration[1U] << " callback=0x" << std::hex
+                << registration[2U] << std::dec << " count=" << count
+                << '\n';
+    }
+    std::cout << "SF3 title-shell async operation pushes:";
+    for (const auto &[callback, count] : async_operation_pushes) {
+      std::cout << " 0x" << std::hex << std::uppercase << callback
+                << std::dec << ':' << count;
+    }
+    std::cout << '\n';
+    std::cout << "SF3 title-shell async operation results:";
+    for (const auto &[operation_result, count] : async_operation_results) {
+      std::cout << " callback=0x" << std::hex << std::uppercase
+                << operation_result[1U] << std::dec
+                << "/result=" << operation_result[0U] << ':' << count;
+    }
+    std::cout << '\n';
+    std::cout << "SF3 title-shell async operation states:";
+    for (const auto &[operation_state, count] : async_operation_states) {
+      std::cout << " 0x" << std::hex << std::uppercase
+                << operation_state[0U] << std::dec << '/'
+                << operation_state[1U] << ':' << count;
+    }
+    std::cout << '\n';
+    std::uint32_t task_slot4{};
+    std::uint32_t task_slot7{};
+    static_cast<void>(vm.runtime().read32(guest_profile.task_callback_table +
+                                              4U * 4U,
+                                          task_slot4));
+    static_cast<void>(vm.runtime().read32(guest_profile.task_callback_table +
+                                              7U * 4U,
+                                          task_slot7));
+    std::cout << "SF3 title-shell candidate task slots: 4=0x" << std::hex
+              << std::uppercase << task_slot4 << " 7=0x" << task_slot7
+              << std::dec << " scheduler-calls=" << task_scheduler_calls
+              << '\n';
+    std::cout << "SF3 title-shell memory-card no-media events: requests="
+              << memory_card_info_calls
+              << " delivered=" << memory_card_eject_events << '\n';
+    for (const auto &[request, count] : memory_card_high_requests) {
+      std::cout << "  card-call=0x" << std::hex << std::uppercase
+                << request[0U] << " ra=0x" << request[1U]
+                << " callback=0x" << request[2U] << std::dec
+                << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell CD Setloc targets: variants="
+              << cd_setloc_calls.size() << '\n';
+    std::cout << "SF3 title-shell state11 CD status:";
+    for (const auto &[status, count] : title_state11_cd_status) {
+      std::cout << ' ' << status << ':' << count;
+    }
+    std::cout << '\n';
+    for (const auto &[values, count] : title_state11_cd_response_states) {
+      std::cout << "  state11-cd response-v0=0x" << std::hex
+                << std::uppercase << values[0U] << " gp=0x" << values[1U]
+                << " response=0x" << values[2U] << " flags=0x"
+                << values[3U] << " transition=0x" << values[4U] << std::dec
+                << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell state11 CD branch visits:";
+    for (const auto &[pc, count] : title_state11_cd_branch_visits) {
+      std::cout << " 0x" << std::hex << std::uppercase << pc << std::dec
+                << ':' << count;
+    }
+    std::cout << '\n';
+    for (const auto &[call, count] : cd_setloc_calls) {
+      std::cout << "  msf=" << std::hex << std::uppercase << call[0U] << '/'
+                << call[1U] << '/' << call[2U] << " ra=0x" << call[3U]
+                << std::dec << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell CdSearchFile paths: variants="
+              << cd_search_paths.size() << '\n';
+    for (const auto &[path, count] : cd_search_paths) {
+      std::cout << "  path=" << std::quoted(path) << " count=" << count
+                << '\n';
+    }
+    std::cout << "SF3 title-shell CdSearchFile results: variants="
+              << cd_search_results.size() << '\n';
+    for (const auto &[search_result, count] : cd_search_results) {
+      std::cout << "  return=0x" << std::hex << std::uppercase
+                << search_result[0U] << " v0=0x" << search_result[1U]
+                << std::dec << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell resident reads: variants="
+              << resident_read_calls.size() << '\n';
+    for (const auto &[call, count] : resident_read_calls) {
+      std::cout << "  handle=0x" << std::hex << std::uppercase << call[0U]
+                << " destination=0x" << call[1U] << " size=0x" << call[2U]
+                << " completion=0x" << call[3U] << " ra=0x" << call[4U]
+                << std::dec << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell movie decoder handoffs="
+              << movie_decoder_handoffs << " retail-completions="
+              << movie_retail_completions << " background-yields="
+              << movie_background_yields << '\n';
+    for (const auto &[address, count] : movie_loader_returns) {
+      std::cout << "  loader-return=0x" << std::hex << std::uppercase
+                << address << std::dec << " count=" << count << '\n';
+    }
+    for (const auto &[request, count] : movie_playback_requests) {
+      std::cout << "  movie-index=" << request[0U] << " begin=0x" << std::hex
+                << std::uppercase << request[1U] << " end=0x" << request[2U]
+                << " a2=0x" << request[3U] << " a3=0x" << request[4U]
+                << " stack10=0x" << request[5U] << " callback=0x"
+                << request[6U]
+                << std::dec << " count=" << count << '\n';
+    }
+    if (movie_catalog_prefix_valid) {
+      std::cout << "SF3 title-shell movie catalog prefix:";
+      for (const auto value : movie_catalog_prefix) {
+        std::cout << ' ' << std::hex << std::uppercase
+                  << static_cast<unsigned int>(value);
+      }
+      std::cout << std::dec << '\n';
+    }
+  }
+  std::cout << "SF3 TITLE candidate paths:";
+  for (auto index = std::size_t{}; index < title_state_candidates.size();
+       ++index) {
+    std::cout << " 0x" << std::hex << std::uppercase
+              << title_state_candidates[index] << std::dec << '=';
+    const auto &path = title_state_candidate_paths[index];
+    for (auto value_index = std::size_t{}; value_index < path.size();
+         ++value_index) {
+      std::cout << (value_index == 0U ? "" : "->") << path[value_index];
+    }
+  }
+  std::cout << '\n';
+
+  const auto transfer = sf3BootstrapTransferTo(trace, result.execution.pc);
+  if (transfer) {
+    const auto &entry = trace[transfer->trace_index];
+    std::cout << "SF3 bootstrap target transfer: pc=0x" << std::hex
+              << std::uppercase << entry.pc << " instruction=0x"
+              << entry.instruction << " target=0x" << transfer->target;
+    if (transfer->source_register) {
+      const auto source = *transfer->source_register;
+      std::cout << " source-register=$" << std::dec
+                << static_cast<unsigned int>(source) << " source-value=0x"
+                << std::hex << entry.state.gpr[source];
+      const auto producer = sf3BootstrapRegisterProducer(
+          trace, transfer->trace_index, source, entry.state.gpr[source]);
+      if (producer) {
+        std::cout << " observed-producer-pc=0x" << trace[*producer].pc
+                  << " observed-producer-instruction=0x"
+                  << trace[*producer].instruction;
+      } else {
+        std::cout << " observed-producer=outside-window";
+      }
+    } else {
+      std::cout << " source=direct";
+    }
+    std::cout << std::dec << '\n';
+  } else {
+    std::cout << "SF3 bootstrap target transfer: not present in final window\n";
+  }
+
+  for (const auto &entry : trace) {
+    if (entry.instruction == 0x8f820814U) {
+      std::cout << "SF3 bootstrap polled word: instruction-pc=0x" << std::hex
+                << std::uppercase << entry.pc << " gp=0x"
+                << entry.state.gpr[28U] << " address=0x"
+                << entry.state.gpr[28U] + 0x814U << std::dec << '\n';
+      break;
+    }
+  }
+  std::cout << "SF3 bootstrap poll state: address=0x" << std::hex
+            << std::uppercase << bootstrap_poll_word << " value=0x"
+            << poll_word_value << std::dec << " writes="
+            << poll_writes.size();
+  if (!poll_writes.empty()) {
+    std::cout << " first-writer-pc=0x" << std::hex
+              << poll_writes.front().pc << " first-writer-instruction=0x"
+              << poll_writes.front().instruction << " first-value=0x"
+              << poll_writes.front().value << " last-writer-pc=0x"
+              << poll_writes.back().pc << " last-writer-instruction=0x"
+              << poll_writes.back().instruction << " last-value=0x"
+              << poll_writes.back().value << std::dec;
+  }
+  std::cout << '\n';
+  std::cout << "SF3 bootstrap BIOS event calls: count="
+            << bios_event_calls.size() << '\n';
+  for (std::size_t index = 0U; index < bios_event_calls.size(); ++index) {
+    const auto &call = bios_event_calls[index];
+    std::cout << "  [" << index << "] call=0x" << std::hex
+              << std::uppercase << call[0U] << " a0=0x" << call[1U]
+              << " a1=0x" << call[2U] << " a2=0x" << call[3U]
+              << " a3=0x" << call[4U] << " dicr=0x" << call[5U]
+              << std::dec << '\n';
+  }
+  std::cout << "SF3 bootstrap sound event callback: address=0x" << std::hex
+            << std::uppercase << sf3_sound_event_callback << std::dec << '\n';
+  std::cout << "SF3 bootstrap last poll-writer window: entries="
+            << poll_writer_context.size() << '\n';
+  for (std::size_t index = 0U; index < poll_writer_context.size(); ++index) {
+    const auto &entry = poll_writer_context[index];
+    std::cout << "  [" << index << "] pc=0x" << std::hex << std::uppercase
+              << entry.pc << " instruction=0x" << entry.instruction
+              << " v0=0x" << entry.state.gpr[2U] << " v1=0x"
+              << entry.state.gpr[3U] << " a0=0x" << entry.state.gpr[4U]
+              << " a1=0x" << entry.state.gpr[5U] << " t1=0x"
+              << entry.state.gpr[9U] << " s0=0x" << entry.state.gpr[16U]
+              << " s1=0x" << entry.state.gpr[17U] << " s2=0x"
+              << entry.state.gpr[18U] << " gp=0x" << entry.state.gpr[28U]
+              << " sp=0x" << entry.state.gpr[29U] << " ra=0x"
+              << entry.state.gpr[31U] << std::dec << '\n';
+  }
+
+  std::cout << "SF3 bootstrap control-flow window: entries=" << trace.size()
+            << '\n';
+  for (std::size_t index = 0U; index < trace.size(); ++index) {
+    const auto &entry = trace[index];
+    std::cout << "  [" << index << "] pc=0x" << std::hex << std::uppercase
+              << entry.pc << " instruction=0x" << entry.instruction
+              << " next=0x" << entry.state.next_pc << " branch=0x"
+              << entry.state.branch_pc << " delay=" << std::dec
+              << entry.state.branch_delay_slot << " v0=0x" << std::hex
+              << entry.state.gpr[2U] << " v1=0x" << entry.state.gpr[3U]
+              << " t9=0x" << entry.state.gpr[25U] << " gp=0x"
+              << entry.state.gpr[28U] << " sp=0x"
+              << entry.state.gpr[29U] << " ra=0x" << entry.state.gpr[31U]
+              << std::dec << '\n';
+  }
+  if (cd_callback_failed) {
+    std::cerr << "SF3 bootstrap failed in retail CD callback: reason="
+              << sf::psx::toString(result.execution.reason) << " pc=0x"
+              << std::hex << std::uppercase << result.execution.pc << std::dec
+              << '\n';
+    return 3;
+  }
+  auto observed_mission_transition = false;
+  for (auto index = std::size_t{2U}; index < application_state_path.size();
+       ++index) {
+    observed_mission_transition |= application_state_path[index - 2U] == 4U &&
+                                   application_state_path[index - 1U] == 6U &&
+                                   application_state_path[index] == 0U;
+  }
+  const auto reached_tokyo_boundary =
+      observed_mission_transition && final_application_state == 0U &&
+      final_application_depth == 1U &&
+      cd_search_paths.contains("\\FOG\\TOKYO.FOG;1") &&
+      cd_search_paths.contains("\\TOKYO\\SLF.RFF;1");
+  const auto reached_title_boundary =
+      final_application_state == 4U && final_application_depth == 2U;
+  const auto expected_boundary =
+      drive_title_shell && budget >= 100'000'000U ? reached_tokyo_boundary
+                                                  : reached_title_boundary;
+  if (budget >= 5'000'000U &&
+      (game_main_entries == 0U || application_loop_entries == 0U ||
+       !expected_boundary || poll_word_value != 0U ||
+       spu_dma_callback_count == 0U || title_frame_entries == 0U ||
+       gpu_submission_entries == 0U ||
+       (budget >= 100'000'000U && valid_presentation_frames == 0U))) {
+    std::cerr << "SF3 bootstrap did not reach the verified "
+              << (drive_title_shell && budget >= 100'000'000U
+                      ? "Mission 1 transition"
+                      : "TITLE regression")
+              << " boundary\n";
+    return 4;
+  }
   return 0;
 }
 
@@ -13947,6 +15411,25 @@ int main(int argc, char **argv) {
         }
       }
       return probeExecutableEntry(argv[2], budget);
+    }
+    if ((argc == 3 || argc == 4) &&
+        (std::string_view{argv[1]} == "probe-sf3-guest-bootstrap" ||
+         std::string_view{argv[1]} == "probe-sf3-title-shell")) {
+      auto budget = std::uint64_t{5'000'000U};
+      if (argc == 4) {
+        const auto text = std::string_view{argv[3]};
+        const auto [pointer, error] =
+            std::from_chars(text.data(), text.data() + text.size(), budget);
+        if (error != std::errc{} || pointer != text.data() + text.size() ||
+            budget == 0U) {
+          throw sf::core::Error{
+              sf::core::ErrorCode::invalid_argument,
+              "Instruction budget must be a positive integer"};
+        }
+      }
+      return probeSf3GuestBootstrap(
+          argv[2], budget,
+          std::string_view{argv[1]} == "probe-sf3-title-shell");
     }
     if ((argc == 3 || argc == 4) &&
         (std::string_view{argv[1]} == "probe-sf2-guest-bootstrap" ||

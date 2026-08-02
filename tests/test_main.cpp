@@ -28,6 +28,7 @@
 #include "sf/game/player_controller.hpp"
 #include "sf/game/runtime_profile.hpp"
 #include "sf/game/sf2_runtime.hpp"
+#include "sf/game/sf3_runtime.hpp"
 #include "sf/game/state_stack.hpp"
 #include "sf/game/supported_games.hpp"
 #include "sf/game/system.hpp"
@@ -187,6 +188,7 @@ void testRuntimeProfiles() {
   const auto &sf3 =
       sf::game::runtimeProfile(sf::game::GameId::syphon_filter_3);
   constexpr auto sf2_guest = sf::game::sf2UsaGuestRuntimeProfile();
+  constexpr auto sf3_guest = sf::game::sf3UsaGuestRuntimeProfile();
   require(
       sf1.kind == sf::game::GameRuntimeKind::sf1 &&
           sf1.uses_legacy_guest_runtime &&
@@ -224,6 +226,37 @@ void testRuntimeProfiles() {
           sf2_guest.interrupt_callback_table == 0x8011d0d4U &&
           sf2_guest.cd_completion_result == 0x80141a10U,
       "Game runtimes no longer have explicit independent ownership");
+  require(sf3_guest.executable_entry == 0x800fb368U &&
+              sf3_guest.game_main_entry == 0x80029ed8U &&
+              sf3_guest.state_loop_entry == 0x80029fb8U &&
+              sf3_guest.title_state_frame_entry == 0x8002a388U &&
+              sf3_guest.application_state_push_entry == 0x8002c6ecU &&
+              sf3_guest.application_state_pop_entry == 0x8002c728U &&
+              sf3_guest.processed_pad_entry == 0x80022a60U &&
+              sf3_guest.title_pad_poll_return == 0x801565b4U &&
+              sf3_guest.title2_pad_poll_return == 0x801597ecU &&
+              sf3_guest.menu_pad_poll_return == 0x8014db80U &&
+              sf3_guest.gpu_submission_entry == 0x800f5b94U &&
+              sf3_guest.render_submission_return == 0x800f458cU &&
+              sf3_guest.cd_completion_callback == 0x800f9dd8U &&
+              sf3_guest.spu_dma_completion_callback == 0x800ff728U &&
+              sf3_guest.interrupt_stack == 0x8000b000U &&
+              sf3_guest.application_state == 0x80121b88U &&
+              sf3_guest.application_state_depth == 0x80121b84U &&
+              sf3_guest.application_state_stack == 0x8010f304U &&
+              sf3_guest.application_transition == 0x80121b8cU &&
+              sf3_guest.title_mode == 0x80157418U &&
+              sf3_guest.title_substate == 0x8015741cU &&
+              sf3_guest.title_state_setter == 0x80151af4U &&
+              sf3_guest.title_mode3_press_callback == 0x8015450cU &&
+              sf3_guest.cd_search_file_entry == 0x800fa688U &&
+              sf3_guest.resident_file_read_entry == 0x80026c7cU &&
+          sf3_guest.movie_playback_init_entry == 0x80147660U &&
+          sf3_guest.movie_playback_update_entry == 0x80147960U &&
+          sf3_guest.movie_completion_entry == 0x8002c930U &&
+          sf3_guest.task_scheduler_tick_entry == 0x80103be4U &&
+          sf3_guest.task_callback_table == 0x8011fda8U,
+          "SF3 guest runtime profile mismatch");
 }
 
 void writeLe32(std::span<std::byte> bytes, std::size_t offset,
