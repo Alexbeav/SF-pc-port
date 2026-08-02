@@ -152,6 +152,12 @@ public:
     [[nodiscard]] const R3000WriteWatchHit& writeTraceHit() const noexcept {
         return write_trace_hit_;
     }
+    [[nodiscard]] const R3000WriteWatchHit& lastWriteTraceHit() const noexcept {
+        return write_trace_last_hit_;
+    }
+    [[nodiscard]] std::uint64_t writeTraceCount() const noexcept {
+        return write_trace_count_;
+    }
 
     [[nodiscard]] bool interruptPending() const noexcept;
 
@@ -222,6 +228,8 @@ private:
     std::uint32_t write_trace_pc_begin_{};
     std::uint32_t write_trace_pc_end_{};
     R3000WriteWatchHit write_trace_hit_{};
+    R3000WriteWatchHit write_trace_last_hit_{};
+    std::uint64_t write_trace_count_{};
     bool break_on_write_watch_{};
     bool suppress_write_watch_{};
 };

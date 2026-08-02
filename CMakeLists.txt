@@ -147,6 +147,13 @@ add_executable(sf_tool
     apps/sf_tool/ui_export.cpp
 )
 target_link_libraries(sf_tool PRIVATE sf::game)
+if(MSVC)
+    # Runtime probes retain multiple full guest diagnostic snapshots while
+    # comparing restore and campaign-transition boundaries. Keep the command
+    # line verifier clear of the Windows linker default's 1 MiB ceiling as
+    # that diagnostic surface grows.
+    target_link_options(sf_tool PRIVATE /STACK:8388608)
+endif()
 sf_set_project_warnings(sf_tool)
 
 include(SfRomProbes)

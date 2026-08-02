@@ -166,11 +166,96 @@ struct Sf2GuestRadarActor {
   bool selected{};
 };
 
+struct Sf2GuestObjectProbeState {
+  std::uint16_t source_index{};
+  std::uint8_t object_class{};
+  std::uint8_t object_flags{};
+  std::int16_t health{};
+  std::int16_t actor_index{-1};
+  std::uint32_t instance{};
+  std::uint32_t physics_node{};
+  std::uint32_t physics_model{};
+  std::uint32_t render_node{};
+  std::uint32_t matrix{};
+  std::uint32_t target{};
+  std::array<std::uint32_t, 16U> target_words{};
+  std::uint32_t actor_controller{};
+  std::array<std::uint32_t, 32U> actor_controller_words{};
+  std::uint32_t render_flags{};
+  std::uint32_t render_next{};
+  std::int16_t motion_minimum_y{};
+  std::array<std::int32_t, 3U> motion_position{};
+  std::array<std::int32_t, 3U> motion_velocity{};
+  std::array<std::uint32_t, 7U> motion_ground_words{};
+  std::int32_t record_x{};
+  std::int32_t record_y{};
+  std::int32_t record_z{};
+  std::int32_t x{};
+  std::int32_t y{};
+  std::int32_t z{};
+};
+
 struct Sf2GuestScriptTimer {
   std::uint32_t program{};
   std::uint16_t timer_index{};
   std::int16_t remaining_ticks{};
   std::array<std::uint32_t, 2U> program_name_words{};
+};
+
+struct Sf2GuestScriptDispatchEvent {
+  std::uint64_t guest_frame{};
+  std::uint32_t event{};
+  std::uint32_t selector{};
+};
+
+struct Sf2GuestScriptHandlerEvent {
+  std::uint64_t guest_frame{};
+  std::uint32_t handler{};
+  std::uint32_t return_address{};
+  std::uint32_t result{};
+  bool has_result{};
+  std::array<std::uint32_t, 4U> arguments{};
+};
+
+struct Sf2GuestObjectEventDispatch {
+  std::uint64_t guest_frame{};
+  std::array<std::uint32_t, 4U> arguments{};
+};
+
+struct Sf2GuestActorActivationEvent {
+  std::uint64_t guest_frame{};
+  std::uint32_t instance{};
+  std::uint32_t return_address{};
+};
+
+struct Sf2GuestMotionUpdateEvent {
+  std::uint64_t guest_frame{};
+  std::uint32_t caller{};
+  std::uint32_t driver{};
+  std::uint32_t driver_state{};
+  std::array<std::uint32_t, 4U> control_words{};
+  std::array<std::uint32_t, 8U> driver_state_words{};
+  std::array<std::uint32_t, 3U> outer_arguments{};
+  std::uint32_t mode{};
+  std::uint32_t flags{};
+  std::array<std::int32_t, 3U> position{};
+  std::array<std::int32_t, 3U> velocity{};
+};
+
+struct Sf2GuestCollisionResponseEvent {
+  std::uint64_t guest_frame{};
+  std::uint32_t pipeline_caller{};
+  std::uint32_t position_lookup{};
+  std::uint32_t instance{};
+  std::uint32_t motion{};
+  std::uint32_t driver_state{};
+  std::uint32_t score{};
+  std::array<std::int32_t, 4U> response{};
+  std::array<std::int32_t, 4U> contact_state{};
+  std::array<std::int32_t, 4U> velocity{};
+  std::array<std::int32_t, 3U> contact_delta{};
+  std::array<std::int32_t, 3U> root_point{};
+  std::array<std::int32_t, 3U> reference_point{};
 };
 
 struct Sf2GuestRuntimeDiagnostics {
@@ -400,9 +485,61 @@ struct Sf2GuestRuntimeDiagnostics {
   std::array<std::uint32_t, 2U> script_level_name_words{};
   std::array<std::uint32_t, 2U> script_lookup_name_words{};
   std::uint64_t script_level_starts{};
+  std::uint64_t airbasex_new_game_state_reads{};
+  std::uint8_t airbasex_new_game_state{};
   std::uint64_t script_dispatches{};
   std::uint64_t script_event5_dispatches{};
   std::array<std::uint32_t, 2U> last_script_dispatch_arguments{};
+  std::uint64_t script_dispatch_event_count{};
+  std::array<Sf2GuestScriptDispatchEvent, 128U> script_dispatch_events{};
+  std::uint64_t script_handler_event_count{};
+  std::array<Sf2GuestScriptHandlerEvent, 128U> script_handler_events{};
+  std::uint64_t object_event_dispatch_count{};
+  std::array<Sf2GuestObjectEventDispatch, 128U> object_event_dispatches{};
+  std::uint64_t actor_activation_count{};
+  std::array<Sf2GuestActorActivationEvent, 64U> actor_activations{};
+  std::uint64_t airbasex_motion_update_count{};
+  std::array<Sf2GuestMotionUpdateEvent, 16U> airbasex_motion_updates{};
+  std::uint64_t actor_collision_response_count{};
+  std::array<Sf2GuestCollisionResponseEvent, 8U>
+      actor_collision_responses{};
+  std::uint64_t airbasex_actor_removal_count{};
+  std::uint16_t airbasex_actor_removal_source{};
+  std::uint32_t airbasex_actor_target_before{};
+  std::uint32_t airbasex_actor_target_word_before{};
+  std::uint32_t airbasex_actor_target_after{};
+  std::uint64_t airbasex_bounds_update_count{};
+  std::uint32_t airbasex_bounds_update_caller{};
+  std::uint32_t airbasex_bounds_update_instance{};
+  std::int16_t airbasex_bounds_minimum_y{};
+  std::array<std::uint32_t, 8U> airbasex_bounds_instance_words{};
+  std::array<std::uint32_t, 16U> airbasex_bounds_physics_words{};
+  std::array<std::uint64_t, 8U> auxiliary_packet_cursor_calls{};
+  std::array<std::uint32_t, 8U> auxiliary_packet_cursor_minimum{};
+  std::array<std::uint32_t, 8U> auxiliary_packet_cursor_maximum{};
+  std::array<std::uint32_t, 8U> auxiliary_packet_output_maximum{};
+  std::uint32_t airbasex_attachment_writer_pc{};
+  std::uint32_t airbasex_attachment_writer_instruction{};
+  std::uint32_t airbasex_attachment_writer_value{};
+  std::uint64_t airbasex_attachment_write_count{};
+  std::array<std::uint32_t, 16U> airbasex_attachment_writer_code{};
+  std::uint64_t airbasex_attachment_init_calls{};
+  std::array<std::uint32_t, 4U> airbasex_attachment_init_arguments{};
+  std::uint64_t airbasex_attachment_link_calls{};
+  std::array<std::uint32_t, 4U> airbasex_attachment_link_arguments{};
+  std::uint32_t airbasex_attachment_existing_link{};
+  std::uint32_t airbasex_attachment_node{};
+  std::uint32_t airbasex_attachment_node_flags{};
+  std::uint64_t airbasex_actor_collision_request_count{};
+  std::uint32_t airbasex_actor_collision_request_caller{};
+  std::uint32_t airbasex_actor_collision_request_object{};
+  std::uint32_t airbasex_actor_collision_request_room{};
+  std::uint32_t airbasex_activation_instruction{};
+  std::uint64_t airbasex_source123_matrix_copies{};
+  std::uint32_t airbasex_source123_matrix_copy_source{};
+  std::uint32_t airbasex_source123_matrix_copy_caller{};
+  std::int32_t airbasex_source123_matrix_copy_y{};
+  std::uint32_t airbasex_source123_local_writer_caller{};
   std::uint64_t script_program_dispatches{};
   std::uint64_t script_activations{};
   std::uint32_t last_script_activation_program{};
@@ -611,6 +748,17 @@ public:
   setPlayerRoomForProbe(std::uint16_t room) noexcept;
   [[nodiscard]] bool
   setPlayerHealthForProbe(std::uint16_t health) noexcept;
+  [[nodiscard]] bool setObjectRecordHealthForProbe(
+      std::uint16_t source_index, std::int16_t health) noexcept;
+  [[nodiscard]] std::optional<Sf2GuestObjectProbeState>
+  objectStateForProbe(std::uint16_t source_index) const noexcept;
+  [[nodiscard]] bool
+  traceObjectMatrixYForProbe(std::uint16_t source_index) noexcept;
+  [[nodiscard]] std::optional<std::uint16_t>
+  scriptProgramVariableForProbe(std::string_view name,
+                                std::uint16_t index) noexcept;
+  [[nodiscard]] bool setMissionProgressBitForProbe(
+      std::uint16_t bit, bool enabled) noexcept;
   [[nodiscard]] bool
   startPlayerObjectInteractionForProbe(std::uint32_t selector) noexcept;
   [[nodiscard]] bool

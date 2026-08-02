@@ -1,4 +1,5 @@
 #include "sf/assets/fog_archive.hpp"
+#include "sf/assets/hog_archive.hpp"
 #include "sf/core/error.hpp"
 #include "sf/game/disc_cdrom_media.hpp"
 #include "sf/game/embedded_hog.hpp"
@@ -870,6 +871,225 @@ public:
                                 controller) &&
            controller != 0U &&
            vm_.runtime().write16(controller + health_value_offset, health);
+  }
+  [[nodiscard]] bool setObjectRecordHealthForProbe(
+      std::uint16_t source_index, std::int16_t health) noexcept {
+    constexpr std::uint32_t object_records_pointer = 0x8011eef8U;
+    constexpr std::uint32_t object_count_address = 0x8011f564U;
+    constexpr std::uint32_t object_record_stride = 0x4cU;
+    constexpr std::uint32_t object_health_offset = 0x40U;
+    std::uint32_t records{};
+    std::uint32_t count_bits{};
+    if (!ready_ || faulted_ ||
+        !vm_.runtime().read32(object_records_pointer, records) ||
+        records == 0U ||
+        !vm_.runtime().read32(object_count_address, count_bits)) {
+      return false;
+    }
+    const auto count = std::bit_cast<std::int32_t>(count_bits);
+    return count > 0 && source_index < count &&
+           vm_.runtime().write16(
+               records + static_cast<std::uint32_t>(source_index) *
+                             object_record_stride +
+                   object_health_offset,
+               std::bit_cast<std::uint16_t>(health));
+  }
+
+  [[nodiscard]] std::optional<Sf2GuestObjectProbeState>
+  objectStateForProbe(std::uint16_t source_index) const noexcept {
+    constexpr std::uint32_t records_pointer = 0x8011eef8U;
+    constexpr std::uint32_t count_address = 0x8011f564U;
+    constexpr std::uint32_t record_stride = 0x4cU;
+    constexpr std::uint32_t instance_offset = 0x34U;
+    std::uint32_t records{};
+    std::uint32_t count_bits{};
+    if (!vm_.runtime().read32(records_pointer, records) || records == 0U ||
+        !vm_.runtime().read32(count_address, count_bits) ||
+        source_index >= count_bits) {
+      return std::nullopt;
+    }
+    Sf2GuestObjectProbeState state{};
+    state.source_index = source_index;
+    const auto record = records +
+        static_cast<std::uint32_t>(source_index) * record_stride;
+    std::uint16_t health_bits{};
+    std::uint32_t record_x_bits{};
+    std::uint32_t record_y_bits{};
+    std::uint32_t record_z_bits{};
+    if (!vm_.runtime().read8(record + 0x2aU, state.object_class) ||
+        !vm_.runtime().read8(record + 0x27U, state.object_flags) ||
+        !vm_.runtime().read32(record + 0x18U, record_x_bits) ||
+        !vm_.runtime().read32(record + 0x1cU, record_y_bits) ||
+        !vm_.runtime().read32(record + 0x20U, record_z_bits) ||
+        !vm_.runtime().read16(record + 0x40U, health_bits) ||
+        !vm_.runtime().read32(record + instance_offset, state.instance)) {
+      return std::nullopt;
+    }
+    state.health = std::bit_cast<std::int16_t>(health_bits);
+    state.record_x = std::bit_cast<std::int32_t>(record_x_bits);
+    state.record_y = std::bit_cast<std::int32_t>(record_y_bits);
+    state.record_z = std::bit_cast<std::int32_t>(record_z_bits);
+    if (state.instance == 0U) {
+      return state;
+    }
+    std::uint16_t actor_index_bits{};
+    if (!vm_.runtime().read16(state.instance + 0x02U,
+                              actor_index_bits) ||
+        !vm_.runtime().read32(state.instance + 0x08U,
+                              state.physics_node) ||
+        !vm_.runtime().read32(state.instance + 0x0cU,
+                              state.render_node) ||
+        !vm_.runtime().read32(state.instance + 0x14U, state.target) ||
+        !vm_.runtime().read32(state.instance + 0x1cU,
+                              state.actor_controller)) {
+      return std::nullopt;
+    }
+    state.actor_index = std::bit_cast<std::int16_t>(actor_index_bits);
+    if (state.actor_controller != 0U) {
+      for (auto index = std::size_t{};
+           index < state.actor_controller_words.size(); ++index) {
+        if (!vm_.runtime().read32(
+                state.actor_controller +
+                    static_cast<std::uint32_t>(index * 4U),
+                state.actor_controller_words[index])) {
+          return std::nullopt;
+        }
+      }
+    }
+    if (state.target != 0U) {
+      for (auto index = std::size_t{}; index < state.target_words.size();
+           ++index) {
+        if (!vm_.runtime().read32(
+                state.target + static_cast<std::uint32_t>(index * 4U),
+                state.target_words[index])) {
+          return std::nullopt;
+        }
+      }
+    }
+    if (state.physics_node == 0U) {
+      return state;
+    }
+    if (!vm_.runtime().read32(state.physics_node, state.physics_model) ||
+        !vm_.runtime().read32(state.physics_node + 0x0cU, state.matrix)) {
+      return std::nullopt;
+    }
+    if (state.render_node != 0U) {
+      std::uint16_t minimum_y_bits{};
+      if (!vm_.runtime().read32(state.render_node + 0x104U,
+                                state.render_flags) ||
+          !vm_.runtime().read32(state.render_node + 0x18cU,
+                                state.render_next) ||
+          !vm_.runtime().read16(state.render_node + 0x10aU,
+                                minimum_y_bits)) {
+        return std::nullopt;
+      }
+      state.motion_minimum_y =
+          std::bit_cast<std::int16_t>(minimum_y_bits);
+      for (auto component = std::size_t{}; component < 3U; ++component) {
+        std::uint32_t position_bits{};
+        std::uint32_t velocity_bits{};
+        if (!vm_.runtime().read32(
+                state.render_node + 0x40U +
+                    static_cast<std::uint32_t>(component * 4U),
+                position_bits) ||
+            !vm_.runtime().read32(
+                state.render_node + 0x50U +
+                    static_cast<std::uint32_t>(component * 4U),
+                velocity_bits)) {
+          return std::nullopt;
+        }
+        state.motion_position[component] =
+            std::bit_cast<std::int32_t>(position_bits);
+        state.motion_velocity[component] =
+            std::bit_cast<std::int32_t>(velocity_bits);
+      }
+      for (auto index = std::size_t{};
+           index < state.motion_ground_words.size(); ++index) {
+        if (!vm_.runtime().read32(
+                state.render_node + 0x120U +
+                    static_cast<std::uint32_t>(index * 4U),
+                state.motion_ground_words[index])) {
+          return std::nullopt;
+        }
+      }
+    }
+    if (state.matrix != 0U) {
+      std::uint32_t x{};
+      std::uint32_t y{};
+      std::uint32_t z{};
+      if (!vm_.runtime().read32(state.matrix + 0x14U, x) ||
+          !vm_.runtime().read32(state.matrix + 0x18U, y) ||
+          !vm_.runtime().read32(state.matrix + 0x1cU, z)) {
+        return std::nullopt;
+      }
+      state.x = std::bit_cast<std::int32_t>(x);
+      state.y = std::bit_cast<std::int32_t>(y);
+      state.z = std::bit_cast<std::int32_t>(z);
+    }
+    return state;
+  }
+  [[nodiscard]] bool
+  traceObjectMatrixYForProbe(std::uint16_t source_index) noexcept {
+    const auto state = objectStateForProbe(source_index);
+    if (!state || state->physics_node == 0U) {
+      return false;
+    }
+    // Diagnostic: the bounds builder consumes the model matrix table pointer
+    // at physics-node +0x18. Trace its lifecycle to distinguish an absent
+    // model attachment from a later erroneous clear.
+    vm_.runtime().setWriteTrace(state->physics_node + 0x18U,
+                                state->physics_node + 0x1cU);
+    vm_.runtime().setWriteTracePc(0U, 0U);
+    return true;
+  }
+  [[nodiscard]] std::optional<std::uint16_t>
+  scriptProgramVariableForProbe(std::string_view name,
+                                std::uint16_t index) noexcept {
+    constexpr std::uint32_t probe_name_address = 0x1f800300U;
+    if (!ready_ || faulted_ || name.empty() || name.size() >= 64U) {
+      return std::nullopt;
+    }
+    std::array<std::byte, 64U> text{};
+    for (auto cursor = std::size_t{}; cursor < name.size(); ++cursor) {
+      text[cursor] =
+          static_cast<std::byte>(static_cast<unsigned char>(name[cursor]));
+    }
+    if (!vm_.runtime().loadBytes(
+            probe_name_address,
+            std::span<const std::byte>{text}.first(name.size() + 1U))) {
+      return std::nullopt;
+    }
+    const std::array lookup_arguments{probe_name_address};
+    const auto lookup = invokeNested(0x800b3920U, lookup_arguments);
+    std::uint8_t count{};
+    std::uint32_t variables{};
+    std::uint16_t value{};
+    if ((!lookup.completed() && !lookup.stoppedAtHostBoundary()) ||
+        lookup.return_value == 0U ||
+        !vm_.runtime().read8(lookup.return_value + 1U, count) ||
+        index >= count ||
+        !vm_.runtime().read32(lookup.return_value + 0x0cU, variables) ||
+        variables == 0U ||
+        !vm_.runtime().read16(
+            variables + static_cast<std::uint32_t>(index) * 2U, value)) {
+      return std::nullopt;
+    }
+    return value;
+  }
+  [[nodiscard]] bool setMissionProgressBitForProbe(
+      std::uint16_t bit, bool enabled) noexcept {
+    constexpr std::uint32_t progress_pointer = 0x8011f570U;
+    constexpr std::uint32_t progress_flags_offset = 0x1cU;
+    std::uint32_t progress{};
+    std::uint32_t flags{};
+    if (!ready_ || faulted_ || bit >= 32U ||
+        !vm_.runtime().read32(progress_pointer, progress) || progress == 0U ||
+        !vm_.runtime().read32(progress + progress_flags_offset, flags)) {
+      return false;
+    }
+    const auto mask = std::uint32_t{1U} << bit;
+    flags = enabled ? flags | mask : flags & ~mask;
+    return vm_.runtime().write32(progress + progress_flags_offset, flags);
   }
   [[nodiscard]] bool startPlayerObjectInteractionForProbe(
       std::uint32_t selector) noexcept {
@@ -1788,10 +2008,78 @@ public:
       }
     }
     result.script_level_starts = script_level_starts_;
+    result.airbasex_new_game_state_reads =
+        airbasex_new_game_state_reads_;
+    result.airbasex_new_game_state = airbasex_new_game_state_;
     result.script_dispatches = script_dispatches_;
     result.script_event5_dispatches = script_event5_dispatches_;
     result.last_script_dispatch_arguments =
         last_script_dispatch_arguments_;
+    result.script_dispatch_event_count = script_dispatch_event_count_;
+    result.script_dispatch_events = script_dispatch_events_;
+    result.script_handler_event_count = script_handler_event_count_;
+    result.script_handler_events = script_handler_events_;
+    result.object_event_dispatch_count = object_event_dispatch_count_;
+    result.object_event_dispatches = object_event_dispatches_;
+    result.actor_activation_count = actor_activation_count_;
+    result.actor_activations = actor_activations_;
+    result.airbasex_motion_update_count = airbasex_motion_update_count_;
+    result.airbasex_motion_updates = airbasex_motion_updates_;
+    result.actor_collision_response_count = actor_collision_response_count_;
+    result.actor_collision_responses = actor_collision_responses_;
+    result.airbasex_actor_removal_count = airbasex_actor_removal_count_;
+    result.airbasex_actor_removal_source = airbasex_actor_removal_source_;
+    result.airbasex_actor_target_before = airbasex_actor_target_before_;
+    result.airbasex_actor_target_word_before =
+        airbasex_actor_target_word_before_;
+    result.airbasex_actor_target_after = airbasex_actor_target_after_;
+    result.airbasex_bounds_update_count = airbasex_bounds_update_count_;
+    result.airbasex_bounds_update_caller = airbasex_bounds_update_caller_;
+    result.airbasex_bounds_update_instance = airbasex_bounds_update_instance_;
+    result.airbasex_bounds_minimum_y = airbasex_bounds_minimum_y_;
+    result.airbasex_bounds_instance_words = airbasex_bounds_instance_words_;
+    result.airbasex_bounds_physics_words = airbasex_bounds_physics_words_;
+    result.auxiliary_packet_cursor_calls = auxiliary_packet_cursor_calls_;
+    result.auxiliary_packet_cursor_minimum = auxiliary_packet_cursor_minimum_;
+    result.auxiliary_packet_cursor_maximum = auxiliary_packet_cursor_maximum_;
+    result.auxiliary_packet_output_maximum =
+        auxiliary_packet_output_maximum_;
+    result.airbasex_attachment_writer_pc = airbasex_attachment_writer_pc_;
+    result.airbasex_attachment_writer_instruction =
+        airbasex_attachment_writer_instruction_;
+    result.airbasex_attachment_writer_value = airbasex_attachment_writer_value_;
+    result.airbasex_attachment_write_count = airbasex_attachment_write_count_;
+    result.airbasex_attachment_writer_code = airbasex_attachment_writer_code_;
+    result.airbasex_attachment_init_calls = airbasex_attachment_init_calls_;
+    result.airbasex_attachment_init_arguments =
+        airbasex_attachment_init_arguments_;
+    result.airbasex_attachment_link_calls = airbasex_attachment_link_calls_;
+    result.airbasex_attachment_link_arguments =
+        airbasex_attachment_link_arguments_;
+    result.airbasex_attachment_existing_link =
+        airbasex_attachment_existing_link_;
+    result.airbasex_attachment_node = airbasex_attachment_node_;
+    result.airbasex_attachment_node_flags = airbasex_attachment_node_flags_;
+    result.airbasex_actor_collision_request_count =
+        airbasex_actor_collision_request_count_;
+    result.airbasex_actor_collision_request_caller =
+        airbasex_actor_collision_request_caller_;
+    result.airbasex_actor_collision_request_object =
+        airbasex_actor_collision_request_object_;
+    result.airbasex_actor_collision_request_room =
+        airbasex_actor_collision_request_room_;
+    static_cast<void>(vm_.runtime().read32(
+        0x80166f58U, result.airbasex_activation_instruction));
+    result.airbasex_source123_matrix_copies =
+        airbasex_source123_matrix_copies_;
+    result.airbasex_source123_matrix_copy_source =
+        airbasex_source123_matrix_copy_source_;
+    result.airbasex_source123_matrix_copy_caller =
+        airbasex_source123_matrix_copy_caller_;
+    result.airbasex_source123_matrix_copy_y =
+        airbasex_source123_matrix_copy_y_;
+    result.airbasex_source123_local_writer_caller =
+        airbasex_source123_local_writer_caller_;
     result.script_program_dispatches = script_program_dispatches_;
     result.script_activations = script_activations_;
     result.last_script_activation_program =
@@ -2935,10 +3223,8 @@ private:
     script_start_guest_frame_ = guest_frame_;
     // The retail mission handoff normally calls ResetAndStartLevel itself.
     // Repeating it here after LEVEL is already active can erase one-shot
-    // activation side effects. AIRBASEX's missing opening actors and static
-    // Homan/truck exposed this duplicate-reset candidate. Only repair the
-    // historical direct-handoff case where the registry is ready but LEVEL is
-    // not active.
+    // activation side effects. Only repair the historical direct-handoff case
+    // where the registry is ready but LEVEL is not active.
     if (script_level_active_at_start_check_) {
       scripts_started_ = true;
       return true;
@@ -3575,12 +3861,139 @@ private:
       fog_files_.emplace(
           entry.name, std::vector<std::byte>{file.begin(), file.end()});
     }
+    // Some sequel missions put their character/model archives one level
+    // deeper (for example AIRBASEX.FOG:NPC.HOG:BUDDY.HOG). Retail opens the
+    // nested names through the same file API after parsing the container.
+    // Keep those authored files addressable by name so the host-backed CD
+    // bridge preserves that behavior instead of returning an empty model.
+    for (const auto &[name, bytes] : fog_files_) {
+      if (!name.ends_with(".HOG")) {
+        continue;
+      }
+      try {
+        const auto outer = assets::HogArchive::parse(bytes);
+        const auto contains_nested_archive = std::ranges::any_of(
+            outer.entries(), [](const assets::HogEntry &entry) {
+              return entry.name.ends_with(".HOG");
+            });
+        if (!contains_nested_archive) {
+          continue;
+        }
+        for (const auto &entry : outer.entries()) {
+          const auto file = outer.file(entry.name);
+          auto payload =
+              std::vector<std::byte>{file.begin(), file.end()};
+          nested_files_.insert_or_assign(entry.name, payload);
+          if (!entry.name.ends_with(".HOG")) {
+            continue;
+          }
+          try {
+            const auto inner = assets::HogArchive::parse(std::move(payload));
+            for (const auto &inner_entry : inner.entries()) {
+              const auto inner_file = inner.file(inner_entry.name);
+              nested_files_.insert_or_assign(
+                  inner_entry.name,
+                  std::vector<std::byte>{inner_file.begin(),
+                                         inner_file.end()});
+            }
+          } catch (const core::Error &) {
+            // A .HOG-named payload that is not itself an archive remains
+            // available as the direct child collected above.
+          }
+        }
+      } catch (const core::Error &) {
+        // Ordinary flat mission HOGs continue through retail's existing
+        // archive path and do not need host-side name exposure.
+      }
+    }
   }
 
   void bindPlatform() {
     vm_.machine().setCdRomMedia(&cdrom_media_);
     vm_.bindPsxBiosCoreVector(true);
     installExceptionBridge();
+    vm_.bindHostCall(
+        0x801669ccU, [this](LegacyHostCallContext &context) {
+          constexpr std::uint32_t source123_physics = 0x801a70a4U;
+          if (mission_index_ == 4U &&
+              context.argument(0U) == source123_physics) {
+            ++airbasex_attachment_init_calls_;
+            for (auto index = std::size_t{};
+                 index < airbasex_attachment_init_arguments_.size();
+                 ++index) {
+              airbasex_attachment_init_arguments_[index] =
+                  context.argument(static_cast<std::uint32_t>(index));
+            }
+            static_cast<void>(context.read32(
+                context.argument(1U) + 0x10U,
+                airbasex_attachment_existing_link_));
+            if (context.read32(context.argument(0U) + 0x10U,
+                               airbasex_attachment_node_) &&
+                airbasex_attachment_node_ != 0U) {
+              static_cast<void>(context.read32(
+                  airbasex_attachment_node_ + 0x28U,
+                  airbasex_attachment_node_flags_));
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800a3f90U, [this](LegacyHostCallContext &context) {
+          std::string name;
+          if (!context.readCString(context.argument(0U), name, 128U)) {
+            context.continueGuestInstruction();
+            return;
+          }
+          std::ranges::transform(
+              name, name.begin(), [](unsigned char value) {
+                return static_cast<char>(std::toupper(value));
+              });
+          const auto nested = nested_files_.find(name);
+          if (nested == nested_files_.end() ||
+              context.argument(1U) == 0U ||
+              nested->second.size() > context.argument(2U)) {
+            context.continueGuestInstruction();
+            return;
+          }
+          const auto callback = context.argument(4U);
+          if (!context.writeBytes(context.argument(1U), nested->second) ||
+              callback == 0U || pending_archive_callback_return_ != 0U) {
+            context.setReturnValue(5U);
+            return;
+          }
+          // Retail action 0x79 immediately drains these nested NPC-resource
+          // reads before it activates their actors. The host scheduler cannot
+          // advance CD hardware from inside that synchronous guest spin, so
+          // deliver the already-authored FOG:HOG extent now and preserve the
+          // retail completion callback as the next guest continuation.
+          pending_archive_callback_return_ = context.returnAddress();
+          context.setRegister(4U, context.argument(3U));
+          context.setRegister(31U, callback);
+          context.setReturnValue(0U);
+        });
+    vm_.bindHostCall(
+        0x800afd6cU, [this](LegacyHostCallContext &context) {
+          if (pending_archive_callback_return_ != 0U) {
+            context.setRegister(31U, pending_archive_callback_return_);
+            pending_archive_callback_return_ = 0U;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80166728U, [this](LegacyHostCallContext &context) {
+          constexpr std::uint32_t source123_physics = 0x801a70a4U;
+          if (mission_index_ == 4U &&
+              context.argument(1U) == source123_physics) {
+            ++airbasex_attachment_link_calls_;
+            for (auto index = std::size_t{};
+                 index < airbasex_attachment_link_arguments_.size();
+                 ++index) {
+              airbasex_attachment_link_arguments_[index] =
+                  context.argument(static_cast<std::uint32_t>(index));
+            }
+          }
+          context.continueGuestInstruction();
+        });
     vm_.bindHostCall(
         0x801058acU, [this](LegacyHostCallContext &context) {
           // Retail SpuSetVoicePitch accepts one of the PS1's 24 hardware
@@ -3888,6 +4301,20 @@ private:
     vm_.bindHostCall(
         0x80078c24U, [this](LegacyHostCallContext &context) {
           const auto request = context.argument(0U);
+          if (mission_index_ == 4U) {
+            const auto homan = objectStateForProbe(123U);
+            if (homan && context.registerValue(17U) == homan->instance) {
+              ++airbasex_actor_collision_request_count_;
+              airbasex_actor_collision_request_caller_ =
+                  context.returnAddress();
+              static_cast<void>(context.read32(
+                  request + 0x08U,
+                  airbasex_actor_collision_request_object_));
+              static_cast<void>(context.read32(
+                  request + 0x0cU,
+                  airbasex_actor_collision_request_room_));
+            }
+          }
           std::uint16_t event{};
           if (context.read16(request, event) && event == 12U) {
             last_player_damage_caller_ = context.registerValue(31U);
@@ -3898,6 +4325,204 @@ private:
                   last_player_damage_request_[index]));
             }
             ++player_damage_events_;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80042cf4U, [this](LegacyHostCallContext &context) {
+          auto &event = object_event_dispatches_[
+              object_event_dispatch_count_ % object_event_dispatches_.size()];
+          event.guest_frame = guest_frame_;
+          for (auto index = std::size_t{}; index < event.arguments.size();
+               ++index) {
+            event.arguments[index] =
+                context.argument(static_cast<std::uint32_t>(index));
+          }
+          ++object_event_dispatch_count_;
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80086d4cU, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U) {
+            auto &event = actor_activations_[
+                actor_activation_count_ % actor_activations_.size()];
+            event = Sf2GuestActorActivationEvent{
+                .guest_frame = guest_frame_,
+                .instance = context.argument(0U),
+                .return_address = context.returnAddress(),
+            };
+            ++actor_activation_count_;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80067830U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U || mission_index_ == 2U) {
+            const auto source = objectStateForProbe(
+                mission_index_ == 4U ? 122U : 45U);
+            if (source && context.argument(0U) == source->instance &&
+                source->render_node != 0U) {
+              auto &event = airbasex_motion_updates_[
+                  airbasex_motion_update_count_ %
+                  airbasex_motion_updates_.size()];
+              event.guest_frame = guest_frame_;
+              event.caller = context.returnAddress();
+              event.driver = context.registerValue(19U);
+              event.driver_state = context.registerValue(18U);
+              for (auto index = std::size_t{};
+                   index < event.control_words.size(); ++index) {
+                static_cast<void>(context.read32(
+                    source->render_node + 0x100U +
+                        static_cast<std::uint32_t>(index * 4U),
+                    event.control_words[index]));
+              }
+              for (auto index = std::size_t{};
+                   index < event.driver_state_words.size(); ++index) {
+                static_cast<void>(context.read32(
+                    event.driver_state + 0x78U +
+                        static_cast<std::uint32_t>(index * 4U),
+                    event.driver_state_words[index]));
+              }
+              event.outer_arguments = {
+                  context.registerValue(20U), context.registerValue(21U),
+                  context.registerValue(23U)};
+              event.mode = context.argument(1U);
+              event.flags = context.argument(2U);
+              for (auto component = std::size_t{}; component < 3U;
+                   ++component) {
+                std::uint32_t position{};
+                std::uint32_t velocity{};
+                static_cast<void>(context.read32(
+                    source->render_node + 0x40U +
+                        static_cast<std::uint32_t>(component * 4U),
+                    position));
+                static_cast<void>(context.read32(
+                    source->render_node + 0x50U +
+                        static_cast<std::uint32_t>(component * 4U),
+                    velocity));
+                event.position[component] =
+                    std::bit_cast<std::int32_t>(position);
+                event.velocity[component] =
+                    std::bit_cast<std::int32_t>(velocity);
+              }
+              ++airbasex_motion_update_count_;
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80066cd4U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U || mission_index_ == 2U) {
+            const auto homan = objectStateForProbe(123U);
+            const auto chance = objectStateForProbe(45U);
+            const auto instance = context.argument(0U);
+            if ((mission_index_ == 4U && homan &&
+                 instance == homan->instance) ||
+                (mission_index_ == 2U && chance &&
+                 instance == chance->instance)) {
+              airbasex_bounds_update_caller_ = context.returnAddress();
+              airbasex_bounds_update_instance_ = instance;
+              for (auto index = std::size_t{};
+                   index < airbasex_bounds_instance_words_.size(); ++index) {
+                static_cast<void>(context.read32(
+                    instance + static_cast<std::uint32_t>(index * 4U),
+                    airbasex_bounds_instance_words_[index]));
+              }
+              const auto physics = airbasex_bounds_instance_words_[2U];
+              for (auto index = std::size_t{};
+                   physics != 0U &&
+                   index < airbasex_bounds_physics_words_.size(); ++index) {
+                static_cast<void>(context.read32(
+                    physics + static_cast<std::uint32_t>(index * 4U),
+                    airbasex_bounds_physics_words_[index]));
+              }
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80066f18U, [this](LegacyHostCallContext &context) {
+          if ((mission_index_ == 4U || mission_index_ == 2U) &&
+              context.registerValue(18U) ==
+                  airbasex_bounds_update_instance_) {
+            const auto instance = context.registerValue(18U);
+            std::uint16_t minimum_y{};
+            std::uint32_t motion{};
+            if (context.read32(instance + 0x0cU, motion) && motion != 0U &&
+                context.read16(motion + 0x10aU, minimum_y)) {
+              airbasex_bounds_minimum_y_ =
+                  std::bit_cast<std::int16_t>(minimum_y);
+            }
+            ++airbasex_bounds_update_count_;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80092aa0U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U || mission_index_ == 2U) {
+            const auto source = objectStateForProbe(
+                mission_index_ == 4U ? 122U : 45U);
+            const auto instance = context.registerValue(18U);
+            if (source && instance == source->instance) {
+              auto &event = actor_collision_responses_[
+                  actor_collision_response_count_ %
+                  actor_collision_responses_.size()];
+              event = {};
+              event.guest_frame = guest_frame_;
+              event.instance = instance;
+              event.position_lookup = last_actor_position_lookup_;
+              event.motion = source->render_node;
+              static_cast<void>(context.read32(source->render_node + 0x158U,
+                                               event.driver_state));
+              const auto stack = context.registerValue(29U);
+              static_cast<void>(
+                  context.read32(stack + 0x140U, event.pipeline_caller));
+              static_cast<void>(context.read32(stack + 0x00U, event.score));
+              const auto read_signed_words =
+                  [&context, stack](std::uint32_t offset, auto &words) {
+                    for (auto index = std::size_t{}; index < words.size();
+                         ++index) {
+                      std::uint32_t word{};
+                      static_cast<void>(context.read32(
+                          stack + offset +
+                              static_cast<std::uint32_t>(index * 4U),
+                          word));
+                      words[index] = std::bit_cast<std::int32_t>(word);
+                    }
+                  };
+              read_signed_words(0x40U, event.response);
+              read_signed_words(0x20U, event.contact_state);
+              read_signed_words(0x30U, event.velocity);
+              read_signed_words(0x50U, event.contact_delta);
+              const auto pipeline_stack = stack + 0x148U;
+              const auto read_pipeline_words =
+                  [&context, pipeline_stack](std::uint32_t offset,
+                                             auto &words) {
+                    for (auto index = std::size_t{}; index < words.size();
+                         ++index) {
+                      std::uint32_t word{};
+                      static_cast<void>(context.read32(
+                          pipeline_stack + offset +
+                              static_cast<std::uint32_t>(index * 4U),
+                          word));
+                      words[index] = std::bit_cast<std::int32_t>(word);
+                    }
+                  };
+              read_pipeline_words(0x18U, event.root_point);
+              read_pipeline_words(0x28U, event.reference_point);
+              ++actor_collision_response_count_;
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800933e0U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U || mission_index_ == 2U) {
+            const auto source = objectStateForProbe(
+                mission_index_ == 4U ? 122U : 45U);
+            if (source && context.registerValue(17U) == source->instance) {
+              last_actor_position_lookup_ = context.registerValue(2U);
+            }
           }
           context.continueGuestInstruction();
         });
@@ -3920,6 +4545,13 @@ private:
         });
     vm_.bindHostCall(
         0x800b3d34U, [this](LegacyHostCallContext &context) {
+          if (script_level_starts_ == 0U) {
+            // The retail TITLE New Game callback sets this state byte
+            // immediately before the mission loader starts LEVEL.
+            // Direct --mission construction bypasses that callback, and the
+            // loader clears any earlier host-side seed during initialization.
+            static_cast<void>(context.write8(0x8011f638U, 1U));
+          }
           ++script_level_starts_;
           context.continueGuestInstruction();
         });
@@ -3931,10 +4563,109 @@ private:
             last_script_dispatch_arguments_[index] =
                 context.argument(static_cast<std::uint32_t>(index));
           }
+          if (last_script_dispatch_arguments_[0U] != 0U) {
+            auto &event = script_dispatch_events_[
+                script_dispatch_event_count_ % script_dispatch_events_.size()];
+            event = Sf2GuestScriptDispatchEvent{
+                .guest_frame = guest_frame_,
+                .event = last_script_dispatch_arguments_[0U],
+                .selector = last_script_dispatch_arguments_[1U],
+            };
+            ++script_dispatch_event_count_;
+          }
           if (last_script_dispatch_arguments_[0U] == 5U) {
             ++script_event5_dispatches_;
             recordTimelineEvent(
                 Sf2GuestTimelineEventKind::script_event5, context);
+          }
+          context.continueGuestInstruction();
+        });
+    // Observe the FIRST_ZONE predicate/action surface without replacing
+    // retail execution. Mission 5's absent opening actors are selected by
+    // these handlers; retaining their resolved arguments makes the authored
+    // branch independently reproducible instead of guessing from visuals.
+    constexpr std::array airbasex_script_handlers{
+        0x800aff4cU, // action 0x79: NPC resource lifecycle
+        0x800b03bcU, // predicate 0x04: program variable equals
+        0x800b07a4U, // predicate 0x16: object node flag
+        0x800b0a14U, // predicate 0x1e: retail New Game state
+        0x800b0c30U, // action 0x06: clear scripted inactive bit
+        0x800b0e20U, // action 0x42: actor activation/state
+        0x800b1030U, // action 0x13: actor relationship
+        0x800b1320U, // action 0x21
+        0x800b1588U, // action 0x19: actor state
+        0x800b1644U, // action 0x56
+        0x800b22a4U, // action/predicate 0x01/0x31: variable assignment
+    };
+    for (const auto handler : airbasex_script_handlers) {
+      vm_.bindHostCall(
+          handler, [this, handler](LegacyHostCallContext &context) {
+            if (mission_index_ == 4U) {
+              if (handler == 0x800b0a14U) {
+                ++airbasex_new_game_state_reads_;
+                static_cast<void>(context.read8(
+                    0x8011f638U, airbasex_new_game_state_));
+              }
+              auto &event = script_handler_events_[
+                  script_handler_event_count_ %
+                  script_handler_events_.size()];
+              event.guest_frame = guest_frame_;
+              event.handler = handler;
+              event.return_address = context.returnAddress();
+              event.result = 0U;
+              event.has_result = false;
+              for (auto index = std::size_t{};
+                   index < event.arguments.size(); ++index) {
+                event.arguments[index] =
+                    context.argument(static_cast<std::uint32_t>(index));
+              }
+              if (event.return_address == 0x800b2d14U) {
+                pending_script_predicate_event_ =
+                    script_handler_event_count_ %
+                    script_handler_events_.size();
+              }
+              ++script_handler_event_count_;
+            }
+            context.continueGuestInstruction();
+        });
+    }
+    vm_.bindHostCall(
+        0x800b0c84U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U) {
+            const auto source = static_cast<std::uint16_t>(
+                context.argument(0U) & 0xffffU);
+            if (source == 148U || source == 149U) {
+              airbasex_actor_removal_source_ = source;
+              if (const auto state = objectStateForProbe(source)) {
+                airbasex_actor_target_before_ = state->target;
+                airbasex_actor_target_word_before_ =
+                    state->target_words[0U];
+              }
+              ++airbasex_actor_removal_count_;
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800b0cbcU, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U &&
+              (airbasex_actor_removal_source_ == 148U ||
+               airbasex_actor_removal_source_ == 149U)) {
+            if (const auto state =
+                    objectStateForProbe(airbasex_actor_removal_source_)) {
+              airbasex_actor_target_after_ = state->target;
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800b2d14U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U && pending_script_predicate_event_) {
+            auto &event = script_handler_events_[
+                *pending_script_predicate_event_];
+            event.result = context.registerValue(2U);
+            event.has_result = true;
+            pending_script_predicate_event_.reset();
           }
           context.continueGuestInstruction();
         });
@@ -3969,6 +4700,38 @@ private:
           }
           if (context.read32(request + 0x0cU, room)) {
             last_world_collision_room_ = static_cast<std::int32_t>(room);
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80011028U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U) {
+            const auto destination = context.registerValue(7U);
+            const auto source = context.registerValue(6U);
+            const auto state = objectStateForProbe(123U);
+            if (state && state->matrix == destination) {
+              std::uint32_t y{};
+              ++airbasex_source123_matrix_copies_;
+              airbasex_source123_matrix_copy_source_ = source;
+              airbasex_source123_matrix_copy_caller_ =
+                  context.returnAddress();
+              if (context.read32(source + 0x18U, y)) {
+                airbasex_source123_matrix_copy_y_ =
+                    std::bit_cast<std::int32_t>(y);
+              }
+            }
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80025188U, [this](LegacyHostCallContext &context) {
+          if (mission_index_ == 4U) {
+            const auto state = objectStateForProbe(123U);
+            if (state && state->actor_controller + 0x1cU ==
+                             context.argument(0U)) {
+              (void)context.read32(context.registerValue(29U) + 0x34U,
+                                   airbasex_source123_local_writer_caller_);
+            }
           }
           context.continueGuestInstruction();
         });
@@ -4695,7 +5458,9 @@ private:
                 return name == path;
               });
           const auto file = fog_files_.find(path);
-          if (entry == fog_entries_.end() || file == fog_files_.end()) {
+          const auto top_level = entry != fog_entries_.end() &&
+                                 file != fog_files_.end();
+          if (!top_level) {
             context.continueGuestInstruction();
             return;
           }
@@ -5042,8 +5807,24 @@ private:
     }
     setXaAbsoluteDiscActive(false);
     setStage("mission archive handoff");
+    if (mission_index_ == 4U) {
+      // Direct AIRBASEX construction is deterministic. Observe the first
+      // initialization of source 123's model-matrix table pointer while the
+      // archive handoff still owns object allocation.
+      vm_.runtime().setWriteTrace(0x801a70bcU, 0x801a70c0U);
+      vm_.runtime().setWriteTracePc(0U, 0U);
+    }
     const auto mission =
         invokeNested(0x80153d30U, std::span<const std::uint32_t>{});
+    if (mission_index_ == 4U) {
+      if (const auto &trace = vm_.runtime().lastWriteTraceHit();
+          trace.width != 0U) {
+        airbasex_attachment_writer_pc_ = trace.pc;
+        airbasex_attachment_writer_instruction_ = trace.instruction;
+        airbasex_attachment_writer_value_ = trace.value;
+      }
+      airbasex_attachment_write_count_ = vm_.runtime().writeTraceCount();
+    }
     if (!mission.completed() && !mission.stoppedAtHostBoundary()) {
       return false;
     }
@@ -5069,6 +5850,26 @@ private:
       if (display_submitted &&
           presentation_frame_ &&
           presentation_frame_->draw_command_count != 0U) {
+        if (mission_index_ == 4U) {
+          if (const auto &trace = vm_.runtime().lastWriteTraceHit();
+              trace.width != 0U) {
+            airbasex_attachment_writer_pc_ = trace.pc;
+            airbasex_attachment_writer_instruction_ = trace.instruction;
+            airbasex_attachment_writer_value_ = trace.value;
+            const auto code_begin = trace.pc - 8U * 4U;
+            for (auto word_index = std::size_t{};
+                 word_index < airbasex_attachment_writer_code_.size();
+                 ++word_index) {
+              static_cast<void>(vm_.runtime().read32(
+                  code_begin +
+                      static_cast<std::uint32_t>(word_index * 4U),
+                  airbasex_attachment_writer_code_[word_index]));
+            }
+          }
+          airbasex_attachment_write_count_ = vm_.runtime().writeTraceCount();
+          vm_.runtime().setWriteTrace(0x8014f000U, 0x80169000U);
+          vm_.runtime().setWriteTracePc(0x800133b4U, 0x800133dcU);
+        }
         return true;
       }
     }
@@ -5436,7 +6237,9 @@ private:
   std::map<std::string, std::vector<std::byte>> resident_files_;
   std::vector<assets::FogEntry> fog_entries_;
   std::map<std::string, std::vector<std::byte>> fog_files_;
+  std::map<std::string, std::vector<std::byte>> nested_files_;
   std::map<std::uint32_t, OpenFile> open_files_;
+  std::uint32_t pending_archive_callback_return_{};
   std::array<std::byte, 0x240U> catalog_copy_{};
   LegacyHostPadState host_pad_{};
   std::shared_ptr<const Sf2PresentationFrame> presentation_frame_;
@@ -5586,6 +6389,8 @@ private:
   std::array<std::uint32_t, 8U> last_pickup_text_words_{};
   std::array<char, 64U> last_pickup_text_bytes_{};
   std::uint64_t script_level_starts_{};
+  std::uint64_t airbasex_new_game_state_reads_{};
+  std::uint8_t airbasex_new_game_state_{};
   std::uint16_t script_program_count_at_start_{};
   std::uint64_t script_start_guest_frame_{};
   std::uint16_t script_active_programs_at_start_check_{};
@@ -5593,6 +6398,57 @@ private:
   std::uint64_t script_dispatches_{};
   std::uint64_t script_event5_dispatches_{};
   std::array<std::uint32_t, 2U> last_script_dispatch_arguments_{};
+  std::uint64_t script_dispatch_event_count_{};
+  std::array<Sf2GuestScriptDispatchEvent, 128U> script_dispatch_events_{};
+  std::uint64_t script_handler_event_count_{};
+  std::array<Sf2GuestScriptHandlerEvent, 128U> script_handler_events_{};
+  std::optional<std::size_t> pending_script_predicate_event_{};
+  std::uint64_t object_event_dispatch_count_{};
+  std::array<Sf2GuestObjectEventDispatch, 128U> object_event_dispatches_{};
+  std::uint64_t actor_activation_count_{};
+  std::array<Sf2GuestActorActivationEvent, 64U> actor_activations_{};
+  std::uint64_t airbasex_motion_update_count_{};
+  std::array<Sf2GuestMotionUpdateEvent, 16U> airbasex_motion_updates_{};
+  std::uint64_t actor_collision_response_count_{};
+  std::array<Sf2GuestCollisionResponseEvent, 8U>
+      actor_collision_responses_{};
+  std::uint32_t last_actor_position_lookup_{};
+  std::uint64_t airbasex_actor_removal_count_{};
+  std::uint16_t airbasex_actor_removal_source_{};
+  std::uint32_t airbasex_actor_target_before_{};
+  std::uint32_t airbasex_actor_target_word_before_{};
+  std::uint32_t airbasex_actor_target_after_{};
+  std::uint64_t airbasex_bounds_update_count_{};
+  std::uint32_t airbasex_bounds_update_caller_{};
+  std::uint32_t airbasex_bounds_update_instance_{};
+  std::int16_t airbasex_bounds_minimum_y_{};
+  std::array<std::uint32_t, 8U> airbasex_bounds_instance_words_{};
+  std::array<std::uint32_t, 16U> airbasex_bounds_physics_words_{};
+  std::array<std::uint64_t, 8U> auxiliary_packet_cursor_calls_{};
+  std::array<std::uint32_t, 8U> auxiliary_packet_cursor_minimum_{};
+  std::array<std::uint32_t, 8U> auxiliary_packet_cursor_maximum_{};
+  std::array<std::uint32_t, 8U> auxiliary_packet_output_maximum_{};
+  std::uint32_t airbasex_attachment_writer_pc_{};
+  std::uint32_t airbasex_attachment_writer_instruction_{};
+  std::uint32_t airbasex_attachment_writer_value_{};
+  std::uint64_t airbasex_attachment_write_count_{};
+  std::array<std::uint32_t, 16U> airbasex_attachment_writer_code_{};
+  std::uint64_t airbasex_attachment_init_calls_{};
+  std::array<std::uint32_t, 4U> airbasex_attachment_init_arguments_{};
+  std::uint64_t airbasex_attachment_link_calls_{};
+  std::array<std::uint32_t, 4U> airbasex_attachment_link_arguments_{};
+  std::uint32_t airbasex_attachment_existing_link_{};
+  std::uint32_t airbasex_attachment_node_{};
+  std::uint32_t airbasex_attachment_node_flags_{};
+  std::uint64_t airbasex_actor_collision_request_count_{};
+  std::uint32_t airbasex_actor_collision_request_caller_{};
+  std::uint32_t airbasex_actor_collision_request_object_{};
+  std::uint32_t airbasex_actor_collision_request_room_{};
+  std::uint64_t airbasex_source123_matrix_copies_{};
+  std::uint32_t airbasex_source123_matrix_copy_source_{};
+  std::uint32_t airbasex_source123_matrix_copy_caller_{};
+  std::int32_t airbasex_source123_matrix_copy_y_{};
+  std::uint32_t airbasex_source123_local_writer_caller_{};
   std::uint64_t script_program_dispatches_{};
   std::uint64_t script_activations_{};
   std::uint32_t last_script_activation_program_{};
@@ -5727,6 +6583,33 @@ bool Sf2GuestMissionRuntime::setPlayerRoomForProbe(
 bool Sf2GuestMissionRuntime::setPlayerHealthForProbe(
     std::uint16_t health) noexcept {
   return impl_->setPlayerHealthForProbe(health);
+}
+
+bool Sf2GuestMissionRuntime::setObjectRecordHealthForProbe(
+    std::uint16_t source_index, std::int16_t health) noexcept {
+  return impl_->setObjectRecordHealthForProbe(source_index, health);
+}
+
+std::optional<Sf2GuestObjectProbeState>
+Sf2GuestMissionRuntime::objectStateForProbe(
+    std::uint16_t source_index) const noexcept {
+  return impl_->objectStateForProbe(source_index);
+}
+
+bool Sf2GuestMissionRuntime::traceObjectMatrixYForProbe(
+    std::uint16_t source_index) noexcept {
+  return impl_->traceObjectMatrixYForProbe(source_index);
+}
+
+std::optional<std::uint16_t>
+Sf2GuestMissionRuntime::scriptProgramVariableForProbe(
+    std::string_view name, std::uint16_t index) noexcept {
+  return impl_->scriptProgramVariableForProbe(name, index);
+}
+
+bool Sf2GuestMissionRuntime::setMissionProgressBitForProbe(
+    std::uint16_t bit, bool enabled) noexcept {
+  return impl_->setMissionProgressBitForProbe(bit, enabled);
 }
 
 bool Sf2GuestMissionRuntime::startPlayerObjectInteractionForProbe(

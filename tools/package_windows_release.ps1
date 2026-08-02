@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.7",
+    [string]$Version = "0.1.0-sf2-guest-alpha.8",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -159,10 +159,12 @@ AUDIO / CUTSCENE STATUS
   reload also resumes with synchronized effects.
 - Mission 7 has been completed interactively with continuous music and
   synchronized effects; its full host-audio diagnostic run remains healthy.
-- Mission 5 is not currently a valid playthrough target: its opening areas can
-  omit guards, Homan and the truck can remain stationary, and prolonged play
-  can develop UI/full-screen flickering. This is a known authored-runtime bug,
-  not missing data in the tester's disc image.
+- Mission 5 now loads its nested retail NPC resources: the opening guards,
+  Homan/truck departure and silenced-rifle patrols appear and animate. Guard
+  detection can still fail to trigger the authored mission failure, and
+  hostile fire was observed without effects audio or player damage.
+- Mission 1 has one reported late crash after detonating the C4 and passing
+  through the cleared tunnel; the opening and earlier gameplay remain valid.
 
 - All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
@@ -241,9 +243,11 @@ and connected campaign/save/movie handoffs are implemented. This remains a
 playtesting build rather than a finished PC port.
 
 Mission 1's opening, Mission 3 dialogue, post-checkpoint audio and Mission 7
-music now pass interactive checks. Mission 5/AIRBASEX currently fails to
-initialize or advance parts of its authored actor/script state and may later
-flicker; it is an explicit known issue in this build.
+music pass interactive checks. Mission 5/AIRBASEX now loads the authored
+nested NPC resources and its opening population/choreography passes an
+interactive check. Its detection/failure, enemy damage/effects-audio behavior
+and natural mid-mission movie still need playtest coverage. Mission 1 has one
+reported post-C4 late-level guest-runtime crash under investigation.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.

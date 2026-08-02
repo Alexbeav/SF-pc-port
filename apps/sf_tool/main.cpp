@@ -107,7 +107,14 @@ void printUsage() {
          "[resource-index-0-based] [scripted-movie-ordinal-0-based]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> <maximum-frames> "
          "replay <resource-index-0-based> <input.sf2pad>\n"
+      << "  sf_tool probe-sf2-product-runtime <disc-1.cue> "
+         "<maximum-frames> airbasex 4\n"
       << "  sf_tool probe-sf2-apc-dialogue <disc-1.cue> [settle-frames]\n"
+      << "  sf_tool probe-sf2-airbasex-movie <disc-1.cue> [settle-frames]\n"
+      << "  sf_tool probe-sf2-airbasex-first-zone <disc-1.cue> "
+         "[settle-frames] [event-3-selector]\n"
+      << "  sf_tool probe-sf2-object-state <game.cue> <mission-index-0-based> "
+         "<source-index> <frames>\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -143,6 +150,20 @@ std::uint32_t parseSf2MissionIndex(const char *text) {
     throw sf::core::Error{
         sf::core::ErrorCode::invalid_format,
         "SF2 mission index must be in the range 0..20"};
+  }
+  return index;
+}
+
+std::uint32_t parseSf2ObjectIndex(const char *text) {
+  const std::string_view value{text};
+  std::uint32_t index{};
+  const auto *const value_end = value.data() + value.size();
+  const auto [end, error] =
+      std::from_chars(value.data(), value_end, index);
+  if (error != std::errc{} || end != value_end || index > 1023U) {
+    throw sf::core::Error{
+        sf::core::ErrorCode::invalid_format,
+        "SF2 object index must be in the range 0..1023"};
   }
   return index;
 }
@@ -6719,6 +6740,732 @@ int probeSf2ApcDialogue(const char *cue_path, std::uint32_t settle_frames) {
   return 0;
 }
 
+int probeSf2AirbaseExteriorMovie(const char *cue_path,
+                                 std::uint32_t settle_frames) {
+  constexpr std::uint32_t mission_index = 4U;
+  constexpr std::uint16_t trailing_mib_source = 150U;
+  constexpr std::uint16_t trailing_mib_room = 34U;
+  constexpr std::uint8_t expected_catalog_index = 10U;
+  constexpr std::uint32_t request_timeout = 2'000U;
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, mission_index};
+  if (!runtime.ready()) {
+    std::cerr << "SF2 AIRBASEX movie runtime failed: "
+              << runtime.faultDetail() << '\n';
+    return 7;
+  }
+  runtime.setHostPadState({});
+  const auto advance = [&runtime](std::uint32_t count) {
+    std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+    for (auto frame = 0U; frame < count; ++frame) {
+      if (!runtime.advanceHostUpdate()) {
+        return false;
+      }
+      while (runtime.takePcm(pcm) != 0U) {
+      }
+    }
+    return true;
+  };
+  const auto dump_actor_states = [&runtime] {
+    constexpr std::array actor_sources{
+        std::uint16_t{115U}, std::uint16_t{117U}, std::uint16_t{118U},
+        std::uint16_t{119U}, std::uint16_t{120U}, std::uint16_t{122U},
+        std::uint16_t{123U}, std::uint16_t{148U}, std::uint16_t{149U},
+        std::uint16_t{150U}, std::uint16_t{165U}, std::uint16_t{168U},
+        std::uint16_t{169U}, std::uint16_t{206U}};
+    std::cerr << "SF2 AIRBASEX actor states:";
+    for (const auto source : actor_sources) {
+      const auto actor = runtime.objectStateForProbe(source);
+      if (!actor) {
+        std::cerr << " " << source << "=unreadable";
+        continue;
+      }
+      std::cerr << " " << source << "=c" << std::hex
+                << static_cast<unsigned int>(actor->object_class) << "/f"
+                << static_cast<unsigned int>(actor->object_flags) << "/i"
+                << actor->instance << "/pn" << actor->physics_node << "/vn"
+                << actor->render_node << "/rf" << actor->render_flags
+                << "/next" << actor->render_next
+                << std::dec << "/motion=" << actor->motion_position[0U]
+                << "," << actor->motion_position[1U] << ","
+                << actor->motion_position[2U] << "/velocity="
+                << actor->motion_velocity[0U] << ","
+                << actor->motion_velocity[1U] << ","
+                << actor->motion_velocity[2U] << std::hex
+                << "/target" << actor->target
+                << std::dec << "/h" << actor->health << "/record-xyz"
+                << actor->record_x << "," << actor->record_y << ","
+                << actor->record_z << "/scene-xyz"
+                << actor->x << "," << actor->y << "," << actor->z;
+      if (source == 122U || source == 123U || source == 148U ||
+          source == 149U || source == 206U) {
+        std::cerr << "/ctrl=" << std::hex << actor->actor_controller << ":";
+        for (const auto word : actor->actor_controller_words) {
+          std::cerr << word << ",";
+        }
+        std::cerr << std::dec;
+        std::cerr << "/groundwords=" << std::hex;
+        for (const auto word : actor->motion_ground_words) {
+          std::cerr << word << ",";
+        }
+        std::cerr << std::dec;
+        std::cerr << "/targetwords=" << std::hex;
+        for (const auto word : actor->target_words) {
+          std::cerr << word << ",";
+        }
+        std::cerr << std::dec;
+      }
+    }
+    std::cerr << '\n';
+    std::cerr << "SF2 AIRBASEX class-2 roster:";
+    for (auto source = std::uint16_t{}; source < 1024U; ++source) {
+      const auto actor = runtime.objectStateForProbe(source);
+      if (!actor) {
+        break;
+      }
+      if (actor->object_class != 2U) {
+        continue;
+      }
+      std::cerr << " " << source << "=h" << actor->health << "/i0x"
+                << std::hex << actor->instance << "/p0x"
+                << actor->physics_node << "/v0x" << actor->render_node
+                << "/t0x" << actor->target << std::dec << "/xyz"
+                << actor->x << "," << actor->y << "," << actor->z;
+    }
+    std::cerr << '\n';
+    std::array<std::uint32_t, 256U> class_counts{};
+    std::array<std::uint32_t, 256U> live_class_counts{};
+    for (auto source = std::uint16_t{}; source < 1024U; ++source) {
+      const auto actor = runtime.objectStateForProbe(source);
+      if (!actor) {
+        break;
+      }
+      ++class_counts[actor->object_class];
+      if (actor->render_node != 0U || actor->target != 0U) {
+        ++live_class_counts[actor->object_class];
+      }
+    }
+    std::cerr << "SF2 AIRBASEX class counts:";
+    for (auto object_class = std::size_t{};
+         object_class < class_counts.size(); ++object_class) {
+      if (class_counts[object_class] != 0U) {
+        std::cerr << " " << object_class << "="
+                  << class_counts[object_class] << "/live"
+                  << live_class_counts[object_class];
+      }
+    }
+    std::cerr << '\n';
+    std::cerr << "SF2 AIRBASEX health roster:";
+    for (auto source = std::uint16_t{}; source < 1024U; ++source) {
+      const auto actor = runtime.objectStateForProbe(source);
+      if (!actor) {
+        break;
+      }
+      if (actor->health <= 1) {
+        continue;
+      }
+      std::cerr << " " << source << "=c"
+                << static_cast<unsigned>(actor->object_class) << "/h"
+                << actor->health << "/v0x" << std::hex
+                << actor->render_node << "/t0x" << actor->target << std::dec
+                << "/xyz" << actor->x << "," << actor->y << ","
+                << actor->z;
+    }
+    std::cerr << '\n';
+    std::cerr << "SF2 AIRBASEX live class-3 roster:";
+    for (auto source = std::uint16_t{}; source < 1024U; ++source) {
+      const auto actor = runtime.objectStateForProbe(source);
+      if (!actor) {
+        break;
+      }
+      if (actor->object_class != 3U ||
+          (actor->render_node == 0U && actor->target == 0U &&
+           actor->health <= 0)) {
+        continue;
+      }
+      std::cerr << " " << source << "=h" << actor->health << "/v0x"
+                << std::hex << actor->render_node << "/t0x"
+                << actor->target << std::dec << "/xyz" << actor->x << ","
+                << actor->y << "," << actor->z;
+    }
+    std::cerr << '\n';
+  };
+  const auto dump_first_zone_variables = [&runtime] {
+    std::cerr << "SF2 AIRBASEX FIRST_ZONE variables:";
+    for (auto index = std::uint16_t{}; index < 12U; ++index) {
+      const auto value =
+          runtime.scriptProgramVariableForProbe("FIRST_ZONE", index);
+      std::cerr << " " << index << "=";
+      if (value) {
+        std::cerr << *value;
+      } else {
+        std::cerr << "unreadable";
+      }
+    }
+    std::cerr << '\n';
+  };
+  if (!advance(1U) || !runtime.traceObjectMatrixYForProbe(123U)) {
+    std::cerr << "SF2 AIRBASEX could not arm source-123 matrix trace\n";
+    return 10;
+  }
+  if (settle_frames > 1U && !advance(settle_frames - 1U)) {
+    return 7;
+  }
+  dump_actor_states();
+  dump_first_zone_variables();
+  const auto writer_diagnostics = runtime.diagnostics();
+  std::cerr << "SF2 AIRBASEX actor removals: count="
+            << writer_diagnostics.airbasex_actor_removal_count
+            << " source="
+            << writer_diagnostics.airbasex_actor_removal_source
+            << " target=0x" << std::hex
+            << writer_diagnostics.airbasex_actor_target_before
+            << "/word=0x"
+            << writer_diagnostics.airbasex_actor_target_word_before
+            << "/after=0x"
+            << writer_diagnostics.airbasex_actor_target_after << std::dec
+            << '\n';
+  std::cerr << "SF2 AIRBASEX bounds updates: count="
+            << writer_diagnostics.airbasex_bounds_update_count
+            << " caller=0x" << std::hex
+            << writer_diagnostics.airbasex_bounds_update_caller
+            << " instance=0x"
+            << writer_diagnostics.airbasex_bounds_update_instance << std::dec
+            << " min-y=" << writer_diagnostics.airbasex_bounds_minimum_y
+            << '\n';
+  std::cerr << "SF2 AIRBASEX bounds instance words:";
+  for (const auto word : writer_diagnostics.airbasex_bounds_instance_words) {
+    std::cerr << " 0x" << std::hex << word;
+  }
+  std::cerr << std::dec << '\n';
+  std::cerr << "SF2 AIRBASEX bounds physics words:";
+  for (const auto word : writer_diagnostics.airbasex_bounds_physics_words) {
+    std::cerr << " 0x" << std::hex << word;
+  }
+  std::cerr << std::dec << '\n';
+  std::cerr << "SF2 AIRBASEX auxiliary packet cursors:";
+  for (auto index = std::size_t{};
+       index < writer_diagnostics.auxiliary_packet_cursor_calls.size();
+       ++index) {
+    if (writer_diagnostics.auxiliary_packet_cursor_calls[index] != 0U) {
+      std::cerr << " table" << index << "="
+                << writer_diagnostics.auxiliary_packet_cursor_calls[index]
+                << "/0x" << std::hex
+                << writer_diagnostics.auxiliary_packet_cursor_minimum[index]
+                << "..0x"
+                << writer_diagnostics.auxiliary_packet_cursor_maximum[index]
+                << "/end=0x"
+                << writer_diagnostics.auxiliary_packet_output_maximum[index]
+                << std::dec;
+    }
+  }
+  std::cerr << " attachment-writer=0x" << std::hex
+            << writer_diagnostics.airbasex_attachment_writer_pc << "/0x"
+            << writer_diagnostics.airbasex_attachment_writer_instruction
+            << "=" << writer_diagnostics.airbasex_attachment_writer_value
+            << std::dec << "/count="
+            << writer_diagnostics.airbasex_attachment_write_count << '\n';
+  std::cerr << "SF2 AIRBASEX attachment writer code:";
+  for (const auto word : writer_diagnostics.airbasex_attachment_writer_code) {
+    std::cerr << " 0x" << std::hex << word;
+  }
+  std::cerr << std::dec << '\n';
+  std::cerr << "SF2 AIRBASEX attachment lifecycle: init="
+            << writer_diagnostics.airbasex_attachment_init_calls << ":";
+  for (const auto argument :
+       writer_diagnostics.airbasex_attachment_init_arguments) {
+    std::cerr << " 0x" << std::hex << argument;
+  }
+  std::cerr << std::dec << " link="
+            << writer_diagnostics.airbasex_attachment_link_calls << ":";
+  for (const auto argument :
+       writer_diagnostics.airbasex_attachment_link_arguments) {
+    std::cerr << " 0x" << std::hex << argument;
+  }
+  std::cerr << std::dec << "/existing=0x" << std::hex
+            << writer_diagnostics.airbasex_attachment_existing_link
+            << "/node=0x" << writer_diagnostics.airbasex_attachment_node
+            << "/flags=0x"
+            << writer_diagnostics.airbasex_attachment_node_flags
+            << "/collision="
+            << writer_diagnostics.airbasex_actor_collision_request_count
+            << "@0x" << std::hex
+            << writer_diagnostics.airbasex_actor_collision_request_caller
+            << ":" << writer_diagnostics.airbasex_actor_collision_request_object
+            << "/" << writer_diagnostics.airbasex_actor_collision_request_room
+            << "/activation-instruction=0x"
+            << writer_diagnostics.airbasex_activation_instruction
+            << std::dec << '\n';
+  std::cerr << "SF2 AIRBASEX script handlers:";
+  const auto retained_handler_events = static_cast<std::size_t>(std::min<
+      std::uint64_t>(writer_diagnostics.script_handler_event_count,
+                     writer_diagnostics.script_handler_events.size()));
+  const auto first_handler_event =
+      writer_diagnostics.script_handler_event_count >
+              writer_diagnostics.script_handler_events.size()
+          ? static_cast<std::size_t>(
+                writer_diagnostics.script_handler_event_count %
+                writer_diagnostics.script_handler_events.size())
+          : 0U;
+  for (auto offset = std::size_t{}; offset < retained_handler_events;
+       ++offset) {
+    const auto &event = writer_diagnostics.script_handler_events[
+        (first_handler_event + offset) %
+        writer_diagnostics.script_handler_events.size()];
+    std::cerr << " " << event.guest_frame << "@" << std::hex
+              << event.handler << "->" << event.return_address << "("
+              << event.arguments[0U] << ","
+              << event.arguments[1U] << "," << event.arguments[2U] << ","
+              << event.arguments[3U] << ")";
+    if (event.has_result) {
+      std::cerr << "=" << event.result;
+    }
+    std::cerr << std::dec;
+  }
+  std::cerr << '\n';
+  std::cerr << "SF2 AIRBASEX retail New Game state: value="
+            << static_cast<unsigned int>(
+                   writer_diagnostics.airbasex_new_game_state)
+            << " reads="
+            << writer_diagnostics.airbasex_new_game_state_reads << '\n';
+  if (writer_diagnostics.airbasex_new_game_state_reads == 0U ||
+      writer_diagnostics.airbasex_new_game_state != 1U) {
+    std::cerr << "SF2 AIRBASEX did not consume the retail New Game state\n";
+    return 10;
+  }
+  std::cerr << "SF2 AIRBASEX source-123 motion updates:";
+  const auto retained_motion_updates = static_cast<std::size_t>(std::min<
+      std::uint64_t>(writer_diagnostics.airbasex_motion_update_count,
+                     writer_diagnostics.airbasex_motion_updates.size()));
+  const auto first_motion_update =
+      writer_diagnostics.airbasex_motion_update_count >
+              writer_diagnostics.airbasex_motion_updates.size()
+          ? static_cast<std::size_t>(
+                writer_diagnostics.airbasex_motion_update_count %
+                writer_diagnostics.airbasex_motion_updates.size())
+          : 0U;
+  for (auto offset = std::size_t{}; offset < retained_motion_updates;
+       ++offset) {
+    const auto &event = writer_diagnostics.airbasex_motion_updates[
+        (first_motion_update + offset) %
+        writer_diagnostics.airbasex_motion_updates.size()];
+    std::cerr << " " << event.guest_frame << ":0x" << std::hex
+              << event.caller << ":" << event.driver << "/"
+              << event.driver_state << ":";
+    for (const auto word : event.control_words) {
+      std::cerr << word << ",";
+    }
+    std::cerr << "/state=";
+    for (const auto word : event.driver_state_words) {
+      std::cerr << word << ",";
+    }
+    std::cerr << "/" << event.outer_arguments[0U] << ","
+              << event.outer_arguments[1U] << ","
+              << event.outer_arguments[2U];
+    std::cerr << std::dec << ":" << event.mode << "/"
+              << event.flags << "@" << event.position[0U] << ","
+              << event.position[1U] << "," << event.position[2U] << "+"
+              << event.velocity[0U] << "," << event.velocity[1U] << ","
+              << event.velocity[2U];
+  }
+  std::cerr << '\n';
+  std::cerr << "SF2 AIRBASEX source-123 matrix writers:";
+  for (auto index = std::size_t{};
+       index < writer_diagnostics.hud_primitive_writer_pcs.size(); ++index) {
+    if (writer_diagnostics.hud_primitive_writer_pcs[index] != 0U) {
+      std::cerr << " 0x" << std::hex
+                << writer_diagnostics.hud_primitive_writer_pcs[index]
+                << "@0x"
+                << writer_diagnostics.hud_primitive_writer_addresses[index]
+                << "/0x"
+                << writer_diagnostics.hud_primitive_writer_instructions[index]
+                << std::dec << "="
+                << writer_diagnostics.hud_primitive_writer_counts[index];
+    }
+  }
+  std::cerr << " copies="
+            << writer_diagnostics.airbasex_source123_matrix_copies
+            << "/source=0x" << std::hex
+            << writer_diagnostics.airbasex_source123_matrix_copy_source
+            << "/caller=0x"
+            << writer_diagnostics.airbasex_source123_matrix_copy_caller
+            << std::dec << "/y="
+            << writer_diagnostics.airbasex_source123_matrix_copy_y
+            << "/local-caller=0x" << std::hex
+            << writer_diagnostics.airbasex_source123_local_writer_caller
+            << std::dec << '\n';
+  if (settle_frames < 600U) {
+    return 0;
+  }
+  if (
+      !runtime.activateScriptProgramForProbe("TRAILING_MIBS") ||
+      !runtime.dispatchScriptEventForProbe(32U, 142U)) {
+    std::cerr << "SF2 AIRBASEX movie could not enter trailing encounter: "
+              << runtime.faultDetail() << '\n';
+    return 10;
+  }
+  const auto encounter_ready =
+      runtime.scriptProgramVariableForProbe("TRAILING_MIBS", 7U);
+  if (encounter_ready != 1U ||
+      !runtime.setMissionProgressBitForProbe(0U, true) ||
+      !runtime.setPlayerPositionForProbe(-10'881, 1, -7'429) ||
+      !runtime.setPlayerRoomForProbe(trailing_mib_room) ||
+      !runtime.setObjectRecordHealthForProbe(trailing_mib_source, 0)) {
+    std::cerr << "SF2 AIRBASEX movie could not prepare authored predicates: "
+              << runtime.faultDetail() << '\n';
+    return 10;
+  }
+  auto request = std::optional<std::uint8_t>{};
+  auto request_frame = std::uint32_t{};
+  for (; request_frame < request_timeout && !request; ++request_frame) {
+    if (!advance(1U)) {
+      return 7;
+    }
+    request = runtime.consumeScriptedMovieRequest();
+  }
+  if (request != expected_catalog_index) {
+    const auto diagnostics = runtime.diagnostics();
+    std::cerr << "SF2 AIRBASEX authored movie request missing: observed=";
+    if (request) {
+      std::cerr << static_cast<unsigned int>(*request);
+    } else {
+      std::cerr << "none";
+    }
+    std::cerr << " handoffs=" << diagnostics.scripted_movie_handoffs
+              << " scripts=" << diagnostics.script_dispatches << "/"
+              << diagnostics.script_program_dispatches << "/"
+              << diagnostics.script_activations << '\n';
+    return 10;
+  }
+  if (!runtime.completeScriptedMovie(*request) || !advance(120U)) {
+    std::cerr << "SF2 AIRBASEX authored movie completion failed\n";
+    return 10;
+  }
+  const auto diagnostics = runtime.diagnostics();
+  if (diagnostics.application_state != 0U ||
+      diagnostics.last_scripted_movie_catalog_index != expected_catalog_index) {
+    std::cerr << "SF2 AIRBASEX movie did not return to gameplay\n";
+    return 10;
+  }
+  std::cout << "SF2 AIRBASEX authored movie lifecycle passed: catalog="
+            << static_cast<unsigned int>(expected_catalog_index)
+            << " request-frame=" << request_frame
+            << " state=" << diagnostics.application_state << '\n';
+  return 0;
+}
+
+int probeSf2AirbaseExteriorFirstZone(const char *cue_path,
+                                     std::uint32_t settle_frames,
+                                     std::uint32_t selector) {
+  constexpr std::uint32_t mission_index = 4U;
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, mission_index};
+  if (!runtime.ready()) {
+    std::cerr << "SF2 AIRBASEX first-zone runtime failed: "
+              << runtime.faultDetail() << '\n';
+    return 7;
+  }
+  runtime.setHostPadState({});
+  const auto advance = [&runtime](std::uint32_t count) {
+    std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+    for (auto frame = 0U; frame < count; ++frame) {
+      if (!runtime.advanceHostUpdate()) {
+        return false;
+      }
+      while (runtime.takePcm(pcm) != 0U) {
+      }
+    }
+    return true;
+  };
+  if (!advance(settle_frames)) {
+    return 7;
+  }
+  const auto before = runtime.objectStateForProbe(122U);
+  const auto before_diagnostics = runtime.diagnostics();
+  if (!before || !runtime.dispatchScriptEventForProbe(3U, selector)) {
+    std::cerr << "SF2 AIRBASEX could not dispatch event 3/" << selector
+              << ": "
+              << runtime.faultDetail() << '\n';
+    return 10;
+  }
+  const auto dispatch_diagnostics = runtime.diagnostics();
+  if (!advance(120U)) {
+    return 7;
+  }
+  const auto after = runtime.objectStateForProbe(122U);
+  const auto first_zone_9 =
+      runtime.scriptProgramVariableForProbe("FIRST_ZONE", 9U);
+  const auto diagnostics = runtime.diagnostics();
+  std::cout << "SF2 AIRBASEX event-3/" << selector << " dispatch: var9=";
+  if (first_zone_9) {
+    std::cout << *first_zone_9;
+  } else {
+    std::cout << "unreadable";
+  }
+  std::cout << " source122-flags=0x" << std::hex
+            << (before ? before->actor_controller_words[0U] : 0U) << "->0x"
+            << (after ? after->actor_controller_words[0U] : 0U) << std::dec
+            << " events=" << diagnostics.script_dispatch_event_count
+            << " actors=";
+  for (const auto source :
+       {std::uint16_t{122U}, std::uint16_t{123U}, std::uint16_t{125U},
+        std::uint16_t{126U}, std::uint16_t{148U}, std::uint16_t{149U},
+        std::uint16_t{165U}}) {
+    const auto state = runtime.objectStateForProbe(source);
+    std::cout << source << ":" << (state ? state->health : -1) << "/f0x"
+              << std::hex
+              << static_cast<unsigned>(state ? state->object_flags : 0U)
+              << "/v0x"
+              << std::hex << (state ? state->render_node : 0U) << "/0x"
+              << (state ? state->target : 0U) << std::dec << ",";
+  }
+  std::cout << " handlers=";
+  const auto first_handler = std::max(
+      before_diagnostics.script_handler_event_count,
+      dispatch_diagnostics.script_handler_event_count >
+              dispatch_diagnostics.script_handler_events.size()
+          ? dispatch_diagnostics.script_handler_event_count -
+                dispatch_diagnostics.script_handler_events.size()
+          : 0U);
+  for (auto serial = first_handler;
+       serial < dispatch_diagnostics.script_handler_event_count; ++serial) {
+    const auto &event = dispatch_diagnostics.script_handler_events[
+        serial % dispatch_diagnostics.script_handler_events.size()];
+    std::cout << event.guest_frame << "@0x" << std::hex << event.handler
+              << "(";
+    for (const auto argument : event.arguments) {
+      std::cout << argument << ",";
+    }
+    std::cout << ")" << std::dec << ";";
+  }
+  std::cout << " activations=" << diagnostics.actor_activation_count << ":";
+  const auto first_activation =
+      diagnostics.actor_activation_count > diagnostics.actor_activations.size()
+          ? diagnostics.actor_activation_count -
+                diagnostics.actor_activations.size()
+          : 0U;
+  for (auto serial = first_activation;
+       serial < diagnostics.actor_activation_count; ++serial) {
+    const auto &event = diagnostics.actor_activations[
+        serial % diagnostics.actor_activations.size()];
+    auto source = -1;
+    for (auto candidate = std::uint16_t{}; candidate < 1024U; ++candidate) {
+      const auto state = runtime.objectStateForProbe(candidate);
+      if (!state) {
+        break;
+      }
+      if (static_cast<std::uint32_t>(
+              static_cast<std::int32_t>(state->actor_index)) ==
+          event.instance) {
+        source = candidate;
+        break;
+      }
+    }
+    std::cout << event.guest_frame << ":" << source << "/0x" << std::hex
+              << event.instance << "@0x" << event.return_address << std::dec
+              << ",";
+  }
+  std::cout << '\n';
+  if (selector == 35U && first_zone_9 != 1U) {
+    std::cerr << "SF2 AIRBASEX FIRST_ZONE did not accept trigger 35\n";
+    return 10;
+  }
+  return 0;
+}
+
+int probeSf2ObjectState(const char *cue_path, std::uint32_t mission_index,
+                        std::uint16_t source_index,
+                        std::uint32_t frames) {
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, mission_index};
+  if (!runtime.ready()) {
+    std::cerr << "SF2 object-state runtime failed: "
+              << runtime.faultDetail() << '\n';
+    return 7;
+  }
+  runtime.setHostPadState({});
+  std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+  for (auto frame = 0U; frame < frames; ++frame) {
+    if (!runtime.advanceHostUpdate()) {
+      return 7;
+    }
+    while (runtime.takePcm(pcm) != 0U) {
+    }
+  }
+  const auto state = runtime.objectStateForProbe(source_index);
+  if (!state || state->instance == 0U) {
+    std::cerr << "SF2 object state is unavailable for source "
+              << source_index << '\n';
+    return 10;
+  }
+  std::vector<std::byte> guest_ram(sf::psx::R3000Runtime::ram_size);
+  const auto copied_guest_ram = runtime.copyGuestRamForProbe(guest_ram);
+  const auto read_guest16 = [&guest_ram, copied_guest_ram](
+                                std::uint32_t address) -> std::uint16_t {
+    if (!copied_guest_ram) {
+      return 0U;
+    }
+    const auto offset = static_cast<std::size_t>(address & 0x1fffffU);
+    if (offset + 2U > guest_ram.size()) {
+      return 0U;
+    }
+    return static_cast<std::uint16_t>(
+        std::to_integer<std::uint8_t>(guest_ram[offset])) |
+           static_cast<std::uint16_t>(
+               std::to_integer<std::uint8_t>(guest_ram[offset + 1U]))
+               << 8U;
+  };
+  const auto read_guest32 = [&guest_ram, copied_guest_ram](
+                                std::uint32_t address) -> std::uint32_t {
+    if (!copied_guest_ram) {
+      return 0U;
+    }
+    const auto offset = static_cast<std::size_t>(address & 0x1fffffU);
+    if (offset + 4U > guest_ram.size()) {
+      return 0U;
+    }
+    auto value = std::uint32_t{};
+    for (auto byte = std::size_t{}; byte < 4U; ++byte) {
+      value |= static_cast<std::uint32_t>(
+                   std::to_integer<std::uint8_t>(guest_ram[offset + byte]))
+               << (byte * 8U);
+    }
+    return value;
+  };
+  const auto object_index = read_guest16(state->instance + 2U);
+  const auto object_records = read_guest32(0x8011eef8U);
+  const auto object_record =
+      object_records + static_cast<std::uint32_t>(object_index) * 76U;
+  const auto model_definition =
+      static_cast<std::uint16_t>(read_guest16(object_record + 0x24U) & 0x3fU);
+  const auto model_definition_record =
+      0x8012f624U + static_cast<std::uint32_t>(model_definition) * 36U;
+  std::cout << "SF2 object state: mission=" << mission_index
+            << " source=" << source_index << " instance=0x" << std::hex
+            << state->instance << " motion=0x" << state->render_node
+            << " model=0x" << state->physics_model
+            << std::dec << " class=" << static_cast<unsigned>(state->object_class)
+            << " flags=" << static_cast<unsigned>(state->object_flags)
+            << " health=" << state->health << " record=" << state->record_x << ","
+            << state->record_y << "," << state->record_z << " scene="
+            << state->x << "," << state->y << "," << state->z
+            << " integrated=" << state->motion_position[0U] << ","
+            << state->motion_position[1U] << ","
+            << state->motion_position[2U] << " velocity="
+            << state->motion_velocity[0U] << ","
+            << state->motion_velocity[1U] << ","
+            << state->motion_velocity[2U] << " min-y="
+            << state->motion_minimum_y << " ground=" << std::hex;
+  for (const auto word : state->motion_ground_words) {
+    std::cout << word << ",";
+  }
+  std::cout << " definition=" << std::dec << model_definition
+            << "/record=0x" << std::hex << model_definition_record
+            << "/words=";
+  for (auto index = std::uint32_t{}; index < 9U; ++index) {
+    std::cout << read_guest32(model_definition_record + index * 4U) << ",";
+  }
+  std::cout << "/object-record=";
+  for (auto index = std::uint32_t{}; index < 19U; ++index) {
+    std::cout << read_guest32(object_record + index * 4U) << ",";
+  }
+  std::cout << "/instance=";
+  for (auto index = std::uint32_t{}; index < 12U; ++index) {
+    std::cout << read_guest32(state->instance + index * 4U) << ",";
+  }
+  std::cout << "/physics=";
+  for (auto index = std::uint32_t{}; index < 16U; ++index) {
+    std::cout << read_guest32(state->physics_node + index * 4U) << ",";
+  }
+  const auto attachment = read_guest32(state->physics_node + 0x10U);
+  const auto attachment_resource = read_guest32(attachment + 0x20U);
+  std::cout << "/attachment=" << attachment << "/resource="
+            << attachment_resource << "/resource-words=";
+  for (auto index = std::uint32_t{}; index < 12U; ++index) {
+    std::cout << read_guest32(attachment_resource + index * 4U) << ",";
+  }
+  const auto diagnostics = runtime.diagnostics();
+  std::cout << std::dec << " updates="
+            << diagnostics.airbasex_motion_update_count << ":";
+  const auto first_update = diagnostics.airbasex_motion_update_count > 8U
+                                ? diagnostics.airbasex_motion_update_count - 8U
+                                : 0U;
+  for (auto serial = first_update;
+       serial < diagnostics.airbasex_motion_update_count; ++serial) {
+    const auto &event = diagnostics.airbasex_motion_updates[
+        serial % diagnostics.airbasex_motion_updates.size()];
+    std::cout << event.guest_frame << "@0x" << std::hex << event.caller
+              << "/" << event.driver << "/" << event.driver_state << ":";
+    for (const auto word : event.control_words) {
+      std::cout << word << ",";
+    }
+    std::cout << "/state=";
+    for (const auto word : event.driver_state_words) {
+      std::cout << word << ",";
+    }
+    std::cout << "/" << event.outer_arguments[0U] << ","
+              << event.outer_arguments[1U] << ","
+              << event.outer_arguments[2U];
+    std::cout << std::dec << ":" << event.mode << "/" << event.flags
+              << "+" << event.velocity[0U] << "," << event.velocity[1U]
+              << "," << event.velocity[2U] << ";";
+  }
+  std::cout << " collision=" << diagnostics.actor_collision_response_count
+            << ":";
+  const auto first_collision =
+      diagnostics.actor_collision_response_count > 4U
+          ? diagnostics.actor_collision_response_count - 4U
+          : 0U;
+  for (auto serial = first_collision;
+       serial < diagnostics.actor_collision_response_count; ++serial) {
+    const auto &event = diagnostics.actor_collision_responses[
+        serial % diagnostics.actor_collision_responses.size()];
+    std::cout << event.guest_frame << "@0x" << std::hex
+              << event.pipeline_caller << "/lookup="
+              << event.position_lookup << std::dec << "/" << event.score
+              << "/r=";
+    for (const auto word : event.response) {
+      std::cout << word << ",";
+    }
+    std::cout << "/c=";
+    for (const auto word : event.contact_state) {
+      std::cout << word << ",";
+    }
+    std::cout << "/v=";
+    for (const auto word : event.velocity) {
+      std::cout << word << ",";
+    }
+    std::cout << "/d=";
+    for (const auto word : event.contact_delta) {
+      std::cout << word << ",";
+    }
+    std::cout << "/root=";
+    for (const auto word : event.root_point) {
+      std::cout << word << ",";
+    }
+    std::cout << "/ref=";
+    for (const auto word : event.reference_point) {
+      std::cout << word << ",";
+    }
+    std::cout << ";";
+  }
+  std::cout << " bounds=" << diagnostics.airbasex_bounds_update_count
+            << "/instance=0x" << std::hex
+            << diagnostics.airbasex_bounds_update_instance << "/min-y="
+            << std::dec << diagnostics.airbasex_bounds_minimum_y
+            << "/instance-words=";
+  for (const auto word : diagnostics.airbasex_bounds_instance_words) {
+    std::cout << std::hex << word << ",";
+  }
+  std::cout << "/physics-words=";
+  for (const auto word : diagnostics.airbasex_bounds_physics_words) {
+    std::cout << std::hex << word << ",";
+  }
+  std::cout << std::dec;
+  std::cout << '\n';
+  return 0;
+}
+
 int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool forward, bool combat, bool crouch,
                            bool crouch_back,
@@ -6727,6 +7474,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool scan_ui_objects, bool pause_flow,
                            bool mission_complete_probe,
                            bool retail_completion_flow,
+                           bool airbasex_route,
                            bool compact_movie_trace,
                            std::uint32_t mission_index,
                            std::uint32_t scripted_movie_ordinal,
@@ -6914,6 +7662,11 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       std::numeric_limits<double>::infinity();
   auto objective_minimum_distance_frame = std::uint32_t{};
   auto objective_waypoint = std::size_t{};
+  auto airbasex_waypoint = std::size_t{};
+  auto airbasex_previous_x = runtime.diagnostics().player_x;
+  auto airbasex_previous_z = runtime.diagnostics().player_z;
+  auto airbasex_heading = 0.0;
+  auto airbasex_heading_known = false;
   auto objective_looted = false;
   auto objective_loot_frame = std::uint32_t{};
   auto objective_baseline_captured = false;
@@ -6977,6 +7730,17 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
           {2423.0, -21363.0},
           {3448.0, -25485.0},
           {4206.0, -25824.0},
+      }};
+  constexpr std::array<std::array<double, 2U>, 8U>
+      airbasex_waypoints{{
+          {14'500.0, 700.0},
+          {14'000.0, 1'300.0},
+          {13'450.0, 2'100.0},
+          {11'000.0, 2'200.0},
+          {8'500.0, 2'400.0},
+          {6'300.0, 2'500.0},
+          {4'900.0, 3'000.0},
+          {4'400.0, 3'076.0},
       }};
   for (std::uint32_t frame = 0U; frame < frames; ++frame) {
     if (expected_scripted_movie_catalog_index &&
@@ -7190,6 +7954,53 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
         // return traversal that previously exposed the manual crash.
         navigation.kneel = true;
         navigation.move = 0.0;
+      }
+      pad = sf::game::legacyPadStateFromPlayerInput(navigation);
+    }
+    if (airbasex_route && frame >= 1'500U) {
+      if (!runtime.setPlayerHealthForProbe(1000U)) {
+        std::cerr << "SF2 AIRBASEX route could not retain diagnostic "
+                     "player health\n";
+        return 10;
+      }
+      const auto player = runtime.diagnostics();
+      const auto velocity_x =
+          static_cast<double>(player.player_x - airbasex_previous_x);
+      const auto velocity_z =
+          static_cast<double>(player.player_z - airbasex_previous_z);
+      if (std::hypot(velocity_x, velocity_z) >= 2.0) {
+        airbasex_heading = std::atan2(velocity_z, velocity_x);
+        airbasex_heading_known = true;
+      }
+      airbasex_previous_x = player.player_x;
+      airbasex_previous_z = player.player_z;
+      auto delta_x =
+          airbasex_waypoints[airbasex_waypoint][0U] - player.player_x;
+      auto delta_z =
+          airbasex_waypoints[airbasex_waypoint][1U] - player.player_z;
+      auto distance = std::hypot(delta_x, delta_z);
+      if (distance <= 280.0 &&
+          airbasex_waypoint + 1U < airbasex_waypoints.size()) {
+        ++airbasex_waypoint;
+        delta_x =
+            airbasex_waypoints[airbasex_waypoint][0U] - player.player_x;
+        delta_z =
+            airbasex_waypoints[airbasex_waypoint][1U] - player.player_z;
+        distance = std::hypot(delta_x, delta_z);
+      }
+      auto navigation = sf::game::PlayerInput{};
+      navigation.run = true;
+      navigation.move = distance > 220.0 ? 1.0 : 0.0;
+      if (airbasex_heading_known) {
+        constexpr auto pi = 3.14159265358979323846;
+        auto error = std::atan2(delta_z, delta_x) - airbasex_heading;
+        while (error > pi) {
+          error -= 2.0 * pi;
+        }
+        while (error < -pi) {
+          error += 2.0 * pi;
+        }
+        navigation.turn = -std::clamp(error, -1.0, 1.0);
       }
       pad = sf::game::legacyPadStateFromPlayerInput(navigation);
     }
@@ -7647,6 +8458,33 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                 << " did not retain exact health/armor/inventory carry\n";
       return 10;
     }
+    if (mission_index == 3U) {
+      auto next_pcm = std::array<sf::psx::SpuPcmFrame, 4096U>{};
+      for (auto frame = 1U; frame < 1'600U; ++frame) {
+        if (!next_runtime.advanceHostUpdate()) {
+          std::cerr << "SF2 completion-flow Mission 5 settle stopped: "
+                    << next_runtime.faultDetail() << '\n';
+          return 10;
+        }
+        while (next_runtime.takePcm(next_pcm) != 0U) {
+        }
+      }
+      const auto homan = next_runtime.objectStateForProbe(123U);
+      const auto truck = next_runtime.objectStateForProbe(122U);
+      if (!homan || !truck) {
+        std::cerr << "SF2 completion-flow Mission 5 actor state missing\n";
+        return 10;
+      }
+      std::cerr << "SF2 completion-flow Mission 5 actors: 122="
+                << truck->x << "," << truck->y << "," << truck->z
+                << "/motion=" << truck->motion_position[0U] << ","
+                << truck->motion_position[1U] << ","
+                << truck->motion_position[2U] << " 123=" << homan->x
+                << "," << homan->y << "," << homan->z << "/motion="
+                << homan->motion_position[0U] << ","
+                << homan->motion_position[1U] << ","
+                << homan->motion_position[2U] << '\n';
+    }
   }
   if (compact_movie_trace) {
     std::cout << "SF2 movie trace: mission=" << mission_index + 1U
@@ -7856,6 +8694,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
           ? "quickobjective"
       : objective_event
           ? "objective"
+      : airbasex_route ? "airbasex"
       : combat       ? "combat"
       : forward      ? "forward"
       : crouch       ? "crouch"
@@ -8243,6 +9082,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.script_program_dispatches << "/"
             << diagnostics.script_activations << "/0x" << std::hex
             << diagnostics.last_script_activation_program << std::dec
+            << "/newgame="
+            << diagnostics.airbasex_new_game_state_reads << ":"
+            << static_cast<unsigned int>(
+                   diagnostics.airbasex_new_game_state)
             << "/timers="
             << static_cast<unsigned int>(
                    diagnostics.active_script_timer_count) << ":";
@@ -8253,6 +9096,40 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
               << timer.program_name_words[0U] << "/"
               << timer.program_name_words[1U] << std::dec << "/"
               << timer.timer_index << "=" << timer.remaining_ticks << ",";
+  }
+  std::cout << "/events=";
+  const auto first_script_event =
+      diagnostics.script_dispatch_event_count >
+              diagnostics.script_dispatch_events.size()
+          ? diagnostics.script_dispatch_event_count -
+                diagnostics.script_dispatch_events.size()
+          : 0U;
+  for (auto serial = first_script_event;
+       serial < diagnostics.script_dispatch_event_count; ++serial) {
+    const auto &event = diagnostics.script_dispatch_events[
+        serial % diagnostics.script_dispatch_events.size()];
+    std::cout << event.guest_frame << ":" << event.event << "/"
+              << event.selector << ",";
+  }
+  std::cout << "/object-events=";
+  const auto first_object_event =
+      diagnostics.object_event_dispatch_count >
+              diagnostics.object_event_dispatches.size()
+          ? diagnostics.object_event_dispatch_count -
+                diagnostics.object_event_dispatches.size()
+          : 0U;
+  for (auto serial = first_object_event;
+       serial < diagnostics.object_event_dispatch_count; ++serial) {
+    const auto &event = diagnostics.object_event_dispatches[
+        serial % diagnostics.object_event_dispatches.size()];
+    std::cout << event.guest_frame << ":" << std::hex;
+    for (const auto argument : event.arguments) {
+      std::cout << argument << "/";
+    }
+    std::cout << std::dec << ",";
+  }
+  if (airbasex_route) {
+    std::cout << "/airbasex-waypoint=" << airbasex_waypoint;
   }
   std::cout << "/hud=" << diagnostics.mission_timer_visible << "/"
             << diagnostics.mission_timer_ticks << "/"
@@ -8464,6 +9341,23 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cerr << "SF2 mission-script startup gate failed: retail LEVEL was "
                  "not already active exactly once\n";
     return 10;
+  }
+  if (mission_index == 4U &&
+      (diagnostics.airbasex_new_game_state_reads == 0U ||
+       diagnostics.airbasex_new_game_state != 1U)) {
+    std::cerr << "SF2 AIRBASEX startup gate failed: retail New Game state "
+                 "was not consumed as 1\n";
+    return 10;
+  }
+  if (mission_index == 4U && frames >= 30U) {
+    const auto buddy = runtime.objectStateForProbe(123U);
+    if (!buddy || buddy->physics_model == 0U ||
+        buddy->motion_minimum_y <= 0 ||
+        std::abs(buddy->motion_position[1U]) > 4'096) {
+      std::cerr << "SF2 AIRBASEX nested NPC-resource gate failed: BUDDY "
+                   "did not receive a valid model and stable floor bounds\n";
+      return 10;
+    }
   }
   if (frames >= 800U && !retail_completion_flow &&
       (nonzero_pcm_frames == 0U || peak_pcm_sample == 0U ||
@@ -12848,6 +13742,24 @@ int main(int argc, char **argv) {
       return probeSf2ApcDialogue(
           argv[2], argc == 4 ? parseFrameCount(argv[3]) : 1'500U);
     }
+    if ((argc == 3 || argc == 4) &&
+        std::string_view{argv[1]} == "probe-sf2-airbasex-movie") {
+      return probeSf2AirbaseExteriorMovie(
+          argv[2], argc == 4 ? parseFrameCount(argv[3]) : 600U);
+    }
+    if ((argc >= 3 && argc <= 5) &&
+        std::string_view{argv[1]} == "probe-sf2-airbasex-first-zone") {
+      return probeSf2AirbaseExteriorFirstZone(
+          argv[2], argc >= 4 ? parseFrameCount(argv[3]) : 1'600U,
+          argc == 5 ? parseSf2ObjectIndex(argv[4]) : 35U);
+    }
+    if (argc == 6 &&
+        std::string_view{argv[1]} == "probe-sf2-object-state") {
+      return probeSf2ObjectState(
+          argv[2], parseSf2MissionIndex(argv[3]),
+          static_cast<std::uint16_t>(parseSf2ObjectIndex(argv[4])),
+          parseFrameCount(argv[5]));
+    }
     if ((argc >= 3 && argc <= 7) &&
         std::string_view{argv[1]} == "probe-sf2-product-runtime") {
       const auto mode = argc >= 5 ? std::string_view{argv[4]}
@@ -12863,6 +13775,7 @@ int main(int argc, char **argv) {
           mode != "weapons" && mode != "pause" && mode != "complete" &&
           mode != "completeflow" &&
           mode != "movies" &&
+          mode != "airbasex" &&
           mode != "replay" &&
           mode != "ui" &&
           mode != "uiobjective" &&
@@ -12882,6 +13795,7 @@ int main(int argc, char **argv) {
           mode == "ui" || mode == "uiobjective", mode == "pause",
           mode == "complete" || mode == "completeflow",
           mode == "completeflow",
+          mode == "airbasex",
           mode == "movies",
           argc >= 6 ? parseSf2MissionIndex(argv[5]) : 2U,
           argc == 7 && mode == "movies" ? parseSf2MovieOrdinal(argv[6]) : 0U,

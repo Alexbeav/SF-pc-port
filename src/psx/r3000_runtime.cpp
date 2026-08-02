@@ -555,6 +555,8 @@ void R3000Runtime::setWriteTrace(std::uint32_t begin,
     write_trace_begin_ = 0U;
     write_trace_end_ = 0U;
     write_trace_hit_ = {};
+    write_trace_last_hit_ = {};
+    write_trace_count_ = 0U;
     if (begin >= end || !physicalAddress(begin, physical_begin) ||
         !physicalAddress(end - 1U, physical_end)) {
         return;
@@ -581,13 +583,18 @@ void R3000Runtime::recordWriteTrace(std::uint32_t address,
         physical + width <= write_trace_begin_) {
         return;
     }
-    write_trace_hit_ = R3000WriteWatchHit{
+    const auto hit = R3000WriteWatchHit{
         .address = address,
         .value = value,
         .pc = executing_pc_,
         .instruction = executing_instruction_,
         .width = width,
     };
+    write_trace_last_hit_ = hit;
+    ++write_trace_count_;
+    if (write_trace_hit_.width == 0U) {
+        write_trace_hit_ = hit;
+    }
 }
 
 bool R3000Runtime::recordWriteWatch(std::uint32_t address,
