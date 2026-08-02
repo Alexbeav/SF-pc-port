@@ -102,6 +102,8 @@ void printUsage() {
          "[instruction-budget]\n"
       << "  sf_tool probe-sf3-title-shell <game.cue> "
          "[instruction-budget]\n"
+      << "  sf_tool probe-sf3-product-runtime <game.cue> [frames] "
+         "[neutral|forward]\n"
       << "  sf_tool probe-sf2-guest-bootstrap <game.cue> "
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-mission-transition <game.cue> "
@@ -15561,6 +15563,62 @@ int probeLegacyFrame(const char *cue_path, const char *ram_path,
   return frame.completed() ? 0 : 10;
 }
 
+int probeSf3ProductRuntime(const char *cue_path, std::uint32_t frames,
+                           std::string_view mode) {
+  if (mode != "neutral" && mode != "forward") {
+    throw sf::core::Error{sf::core::ErrorCode::invalid_argument,
+                          "SF3 product probe mode must be neutral or forward"};
+  }
+  sf::game::Sf3GuestMissionRuntime runtime{cue_path};
+  if (!runtime.ready()) {
+    std::cerr << "SF3 product runtime bootstrap failed: "
+              << runtime.faultDetail() << '\n';
+    return 24;
+  }
+  std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+  auto pcm_frames = std::uint64_t{};
+  for (auto frame = std::uint32_t{}; frame < frames; ++frame) {
+    auto pad = sf::game::LegacyHostPadState{};
+    if (mode == "forward") {
+      pad.left_y = 0x00U;
+    }
+    runtime.setHostPadState(pad);
+    if (!runtime.advanceHostUpdate()) {
+      std::cerr << "SF3 product runtime stopped at frame " << frame << ": "
+                << runtime.faultDetail() << '\n';
+      return 25;
+    }
+    while (const auto count = runtime.takePcm(pcm)) {
+      pcm_frames += count;
+    }
+  }
+  const auto diagnostics = runtime.diagnostics();
+  const auto &presentation = runtime.presentationFrame();
+  std::cout << "SF3 product runtime: mode=" << mode << " requested=" << frames
+            << " state=" << diagnostics.application_state << '/'
+            << diagnostics.application_depth << " guest-frames="
+            << diagnostics.guest_frames << " input="
+            << diagnostics.input_samples << " gpu="
+            << diagnostics.gpu_submissions << " presentation="
+            << diagnostics.presentation_frames << " xa="
+            << diagnostics.xa_sectors_received << '/'
+            << diagnostics.xa_sectors_admitted << " pcm=" << pcm_frames;
+  if (presentation) {
+    std::cout << " final=" << presentation->application_state << "/0x"
+              << std::hex << std::uppercase
+              << presentation->ordering_table_root << std::dec << '/'
+              << presentation->packets.size() << '/'
+              << presentation->draw_command_count;
+  }
+  std::cout << '\n';
+  return diagnostics.application_state == 0U &&
+                 diagnostics.application_depth == 1U && presentation &&
+                 presentation->application_state == 0U &&
+                 diagnostics.guest_frames >= frames
+             ? 0
+             : 26;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -15703,6 +15761,12 @@ int main(int argc, char **argv) {
       return probeSf3GuestBootstrap(
           argv[2], budget,
           std::string_view{argv[1]} == "probe-sf3-title-shell");
+    }
+    if (argc >= 3 && argc <= 5 &&
+        std::string_view{argv[1]} == "probe-sf3-product-runtime") {
+      return probeSf3ProductRuntime(
+          argv[2], argc >= 4 ? parseFrameCount(argv[3]) : 120U,
+          argc == 5 ? std::string_view{argv[4]} : std::string_view{"neutral"});
     }
     if ((argc == 3 || argc == 4) &&
         (std::string_view{argv[1]} == "probe-sf2-guest-bootstrap" ||

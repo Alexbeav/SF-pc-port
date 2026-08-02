@@ -22,6 +22,7 @@
 #include "sf/game/pause_menu_data.hpp"
 #include "sf/game/retail_cheats.hpp"
 #include "sf/game/sf2_runtime.hpp"
+#include "sf/game/sf3_runtime.hpp"
 #include "sf/game/supported_games.hpp"
 #include "sf/platform/player_input.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
@@ -15919,6 +15920,178 @@ SceneViewerResult runSf2GuestScene(
   }
 }
 
+SceneViewerResult runSf3GuestScene(
+    const game::MissionPackage &mission, PADRAW &pad,
+    std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
+    const KeyboardMouseBindings &input,
+    game::GameplaySession &native_residency) {
+  struct NativeFramebufferPageReset {
+    ~NativeFramebufferPageReset() { GR_SetNativeFramebufferPage(0); }
+  } native_framebuffer_page_reset;
+
+  game::Sf3GuestMissionRuntime runtime{cue_path};
+  if (!runtime.ready()) {
+    const auto detail = runtime.faultDetail();
+    PsyX_Log_Error("SF3 guest runtime bootstrap failed: %.*s\n",
+                   static_cast<int>(detail.size()), detail.data());
+    return SceneViewerResult{previous_buttons,
+                             SceneExitReason::return_to_title};
+  }
+
+  // This initial product slice retains the native mission package only as a
+  // PS1 texture-residency service. SCUS-94640 owns simulation, input,
+  // application state, GPU ordering tables and SPU/XA production.
+  auto textures = std::make_unique<TextureStreamer>(mission);
+  textures->ensure(native_residency);
+  const auto camera = native_residency.camera();
+  const auto texture_bank = static_cast<unsigned int>(
+      native_residency.textureBankAt(camera.x, camera.z));
+
+  PsyCrossAudioOutput audio{12U, "sf3-gameplay"};
+  RelativeMouseCapture mouse_capture;
+  mouse_capture.set(true);
+  constexpr double simulation_step = 1.0 / 60.0;
+  constexpr double maximum_frame_time = 0.25;
+  constexpr unsigned int maximum_updates = 4U;
+  auto simulation_accumulator = 0.0;
+  auto previous_counter = SDL_GetPerformanceCounter();
+  const auto frequency = SDL_GetPerformanceFrequency();
+  auto pause_was_down = false;
+  auto drawn_presentation_sequence = std::uint64_t{};
+  std::array<psx::SpuPcmFrame, 4096U> pcm{};
+
+  PsyX_Log_Info(
+      "SF3 guest alpha: campaign=1 title=\"%s\" resource=%s "
+      "retail TITLE->TOKYO direct GP0/SPU handoff\n",
+      mission.definition().title.data(),
+      mission.definition().resource_name.data());
+
+  for (;;) {
+    const auto counter = SDL_GetPerformanceCounter();
+    const auto elapsed = std::clamp(
+        frequency == 0U
+            ? 0.0
+            : static_cast<double>(counter - previous_counter) /
+                  static_cast<double>(frequency),
+        0.0, maximum_frame_time);
+    previous_counter = counter;
+    simulation_accumulator =
+        std::min(simulation_accumulator + elapsed, simulation_step * 5.0);
+
+    PsyX_UpdateInput();
+    const auto buttons = readButtons(pad);
+    const auto held = static_cast<std::uint16_t>(~buttons);
+    int keyboard_count{};
+    const auto *keyboard = SDL_GetKeyboardState(&keyboard_count);
+    const auto keyboard_pad_mask =
+        keyboardOriginPadMask(keyboard, keyboard_count, g_cfg_keyboardMapping);
+    const auto controller_held = static_cast<std::uint16_t>(
+        held & static_cast<std::uint16_t>(~keyboard_pad_mask));
+    const auto keyboard_state =
+        keyboard != nullptr && keyboard_count > 0
+            ? std::span<const std::uint8_t>{
+                  keyboard, static_cast<std::size_t>(keyboard_count)}
+            : std::span<const std::uint8_t>{};
+    const auto mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
+    const auto actions = sampleKeyboardMouseActions(
+        input, KeyboardMouseDeviceState{
+                   .keyboard = keyboard_state,
+                   .mouse_left =
+                       (mouse_buttons & SDL_BUTTON_LMASK) != 0U,
+                   .mouse_right =
+                       (mouse_buttons & SDL_BUTTON_RMASK) != 0U,
+                   .mouse_middle =
+                       (mouse_buttons & SDL_BUTTON_MMASK) != 0U,
+                   .mouse_x1 = (mouse_buttons & SDL_BUTTON_X1MASK) != 0U,
+                   .mouse_x2 = (mouse_buttons & SDL_BUTTON_X2MASK) != 0U,
+                   .mouse_wheel_delta = consumePsyCrossMouseWheel(),
+               });
+    const auto raw = pcPlayerInputFromKeyboardMouseActions(actions);
+    const auto pause_down = actions[KeyboardMouseAction::pause];
+    if (pause_down && !pause_was_down) {
+      runtime.clearPcm();
+      mouse_capture.set(false);
+      return SceneViewerResult{buttons, SceneExitReason::return_to_title};
+    }
+    pause_was_down = pause_down;
+
+    auto guest_input = game::GameplayInput{
+        .move = static_cast<double>(raw.move_forward) -
+                static_cast<double>(raw.move_backward),
+        .turn = std::clamp(static_cast<double>(raw.turn_right) -
+                              static_cast<double>(raw.turn_left),
+                          -1.0, 1.0),
+        .run = !raw.run,
+        .aim = raw.aim,
+        .strafe = static_cast<double>(raw.strafe_right) -
+                  static_cast<double>(raw.strafe_left),
+        .fire_held = raw.fire,
+        .roll = raw.roll,
+        .reload = raw.reload,
+        .kneel = raw.crouch,
+        .interact = raw.interact,
+        .target_lock_held = raw.target_lock,
+        .quick_turn = raw.quick_turn,
+    };
+    auto host_pad = game::legacyPadStateFromPlayerInput(guest_input);
+    const auto retail_menu_key =
+        static_cast<std::size_t>(KeyboardMouseInput::p);
+    if (retail_menu_key < keyboard_state.size() &&
+        keyboard_state[retail_menu_key] != 0U) {
+      host_pad.buttons =
+          static_cast<std::uint16_t>(host_pad.buttons | 0x0008U);
+    }
+    host_pad.buttons =
+        static_cast<std::uint16_t>(host_pad.buttons | controller_held);
+    host_pad.face_axis_buttons = 0U;
+    host_pad.use_explicit_face_axis_buttons = true;
+    const auto analog_active = [](std::uint8_t value) {
+      return std::abs(static_cast<int>(value) - 128) > 20;
+    };
+    if (analog_active(pad.analog[2]) || analog_active(pad.analog[3])) {
+      host_pad.left_x = pad.analog[2];
+      host_pad.left_y = pad.analog[3];
+    }
+    host_pad.right_x = pad.analog[0];
+    host_pad.right_y = pad.analog[1];
+    previous_buttons = buttons;
+
+    auto updates = 0U;
+    while (updates < maximum_updates &&
+           simulation_accumulator + 1.0e-9 >= simulation_step) {
+      runtime.setHostPadState(host_pad);
+      if (!runtime.advanceHostUpdate()) {
+        const auto detail = runtime.faultDetail();
+        PsyX_Log_Error("SF3 guest runtime stopped: %.*s\n",
+                       static_cast<int>(detail.size()), detail.data());
+        runtime.clearPcm();
+        mouse_capture.set(false);
+        return SceneViewerResult{previous_buttons,
+                                 SceneExitReason::return_to_title};
+      }
+      while (const auto count = runtime.takePcm(pcm)) {
+        audio.queue(std::span<const psx::SpuPcmFrame>{pcm}.first(count));
+      }
+      simulation_accumulator =
+          std::max(0.0, simulation_accumulator - simulation_step);
+      ++updates;
+    }
+    audio.update();
+
+    if (const auto &frame = runtime.presentationFrame()) {
+      const auto fresh_presentation =
+          frame->sequence != drawn_presentation_sequence;
+      beginSf2GuestFrame(sf2GuestFramebufferPage(*frame),
+                         fresh_presentation);
+      if (fresh_presentation) {
+        drawSf2GuestFrame(*frame, texture_bank);
+        drawn_presentation_sequence = frame->sequence;
+      }
+      PsyX_EndScene();
+    }
+  }
+}
+
 } // namespace
 
 #if defined(_MSC_VER)
@@ -15944,6 +16117,16 @@ SceneViewerResult PsyCrossSceneViewer::run(
   if (mission.gameId() == game::GameId::syphon_filter_2) {
     return runSf2GuestScene(mission, pad, previous_buttons, cue_path, input_,
                             *preloaded_gameplay, campaign_carry);
+  }
+  if (mission.gameId() == game::GameId::syphon_filter_3) {
+    if (mission.definition().index != 0U) {
+      PsyX_Log_Error(
+          "SF3 guest runtime currently supports retail Mission 1 only\n");
+      return SceneViewerResult{previous_buttons,
+                               SceneExitReason::return_to_title};
+    }
+    return runSf3GuestScene(mission, pad, previous_buttons, cue_path, input_,
+                            *preloaded_gameplay);
   }
   auto &gameplay = *preloaded_gameplay;
   // The retail terminal transition can retire the live mission/inventory

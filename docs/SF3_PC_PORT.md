@@ -113,8 +113,18 @@ retail parses the TOKYO catalog and loads `SLF.RFF`, `TOKYO.DAT`,
 Mission 1 PAD caller, dismisses application state 8 through its processed PAD
 record, and remains in the retail state-0 gameplay loop under neutral input.
 A 150,000,000-operation gate captures 201 state-0 display submissions, admits
-the opening XA sectors and reports no CPU fault. Product runtime selection and
-interactive validation remain pending.
+the opening XA sectors and reports no CPU fault.
+
+As of 2026-08-03, this same continuous runtime is selected by the Release
+product for SF3 Mission 1. The scene host translates keyboard/mouse/controller
+actions into the exact processed-PAD boundary, submits captured retail GPU
+ordering tables through PsyCross, retains mission data only for PS1 texture
+residency, and queues retail SPU/XA PCM. It does not enter the earlier native
+SF3 gameplay implementation. The current alpha automatically drives the
+retail frontend and loading shell into Hotel Fukushima before giving PAD
+control to the player; interactive title selection, campaign completion,
+quick states, full presentation verification and long human play remain open
+parts of S3 and later milestones.
 
 ### S4 — runtime systems
 
@@ -206,13 +216,19 @@ $sf3 = "Z:\Emulators\PS1 Games\Syphon Filter 3 (USA).cue"
 .\build\windows-psycross\Release\sf_tool.exe inspect $sf3
 .\build\windows-psycross\Release\sf_tool.exe inspect-mission-archive $sf3 TOKYO
 .\build\windows-psycross\Release\sf_tool.exe probe-sf3-guest-bootstrap $sf3 5000000
+.\build\windows-psycross\Release\sf_tool.exe probe-sf3-product-runtime $sf3 300 neutral
+& .\build\windows-psycross\Release\syphon_filter.exe `
+  --no-launcher --mission=1 --scene-test $sf3
 ```
 
 `inspect-disc-info` is currently SF2-specific because SF3 has no external
 `DISK*.INF` selection catalog. Use `inspect` plus the checked-in SF3 mission
 resource table until an SF3-specific information view is added.
 
-The existing `--scene-test` path is useful only as a data/presentation smoke
-test until the SF3 guest runtime owns gameplay. Do not label it a playable
-mission or use it as proof of script, AI, checkpoint, audio, or campaign
-correctness.
+For SF3 Mission 1, `--scene-test` now selects the retail guest runtime and is
+the shortest route to the current playable alpha. It automatically traverses
+the retail frontend into Tokyo. Escape returns to the host title and `P` maps
+to retail Start; configured movement, aim, fire, action and controller inputs
+are transported through the processed PAD record. Other SF3 missions remain
+unsupported by this guest product path and must not fall back to native
+substitute gameplay.

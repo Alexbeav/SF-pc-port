@@ -4,8 +4,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 
 namespace sf::game {
 
@@ -97,5 +100,45 @@ captureSf3PresentationFrame(std::span<const std::byte> guest_ram,
                             std::uint32_t application_state,
                             std::uint64_t sequence,
                             std::uint64_t guest_frame) noexcept;
+
+struct Sf3GuestRuntimeDiagnostics {
+  std::uint32_t application_state{};
+  std::uint32_t application_depth{};
+  std::uint64_t guest_frames{};
+  std::uint64_t input_samples{};
+  std::uint64_t gpu_submissions{};
+  std::uint64_t presentation_frames{};
+  std::uint64_t xa_sectors_received{};
+  std::uint64_t xa_sectors_admitted{};
+};
+
+// Continuous SCUS-94640 runtime used by the PC product. The current product
+// slice deterministically follows the retail frontend into Mission 1, then
+// exposes only processed PAD, authored GPU and PCM platform boundaries.
+class Sf3GuestMissionRuntime final {
+public:
+  explicit Sf3GuestMissionRuntime(const std::filesystem::path &cue_path);
+  ~Sf3GuestMissionRuntime();
+  Sf3GuestMissionRuntime(Sf3GuestMissionRuntime &&) noexcept;
+  Sf3GuestMissionRuntime &operator=(Sf3GuestMissionRuntime &&) noexcept;
+  Sf3GuestMissionRuntime(const Sf3GuestMissionRuntime &) = delete;
+  Sf3GuestMissionRuntime &operator=(const Sf3GuestMissionRuntime &) = delete;
+
+  [[nodiscard]] bool ready() const noexcept;
+  [[nodiscard]] bool faulted() const noexcept;
+  [[nodiscard]] std::string_view faultDetail() const noexcept;
+  void setHostPadState(const LegacyHostPadState &state) noexcept;
+  [[nodiscard]] bool advanceHostUpdate() noexcept;
+  [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
+  presentationFrame() const noexcept;
+  [[nodiscard]] std::size_t
+  takePcm(std::span<psx::SpuPcmFrame> destination) noexcept;
+  void clearPcm() noexcept;
+  [[nodiscard]] Sf3GuestRuntimeDiagnostics diagnostics() const noexcept;
+
+private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 } // namespace sf::game
