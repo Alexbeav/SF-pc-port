@@ -198,6 +198,9 @@ Mandatory in-repository reading:
   object-handler and XA catalogs.
 - [`devlogs/2026-08-02-sf3-bring-up.md`](devlogs/2026-08-02-sf3-bring-up.md)
   — dedicated SF3 chronological record beginning at this baseline.
+- [`handoffs/sf3-retail-guest-alpha-2026-08-03/README.md`](handoffs/sf3-retail-guest-alpha-2026-08-03/README.md)
+  — self-contained source-only handoff package for sibling projects, including
+  verified findings, implementation map, reproduction gates and open work.
 
 The ignored `.local-context/` directory indexes the user-owned disc and any
 future external research. External information is a lead: independently verify
