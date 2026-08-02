@@ -9352,7 +9352,11 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                  "was not consumed as 1\n";
     return 10;
   }
-  if (mission_index == 4U && frames >= 30U) {
+  // The connected completion probe deliberately resumes TITLE after retail
+  // has torn down the mission heap. AIRBASEX residency is asserted by every
+  // ordinary/quick-state/combat route before that teardown; do not mistake
+  // the successful shell handoff for a missing BUDDY resource.
+  if (mission_index == 4U && frames >= 30U && !retail_completion_flow) {
     const auto buddy = runtime.objectStateForProbe(123U);
     if (!buddy || buddy->physics_model == 0U ||
         buddy->motion_minimum_y <= 0 ||
