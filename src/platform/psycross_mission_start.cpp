@@ -66,7 +66,15 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
   preloaded_audio_ = std::make_unique<PsyCrossAudioOutput>();
   auto preload = std::async(std::launch::async, [&mission, carry] {
     auto gameplay = std::make_unique<game::GameplaySession>(mission);
-    if (carry && !gameplay->applyCampaignCarryState(*carry)) {
+    // SF2's preloaded GameplaySession is only the native texture/residency
+    // shell. Its authoritative player state lives in Sf2GuestMissionRuntime,
+    // which applies the exact sequel carry after its retail mission bootstrap.
+    // Applying it here as well routes the SF2 payload through the older
+    // LegacyFirstMissionRuntime bridge; Mission 2 has not constructed that
+    // bridge's player inventory at this loading boundary and rejects an
+    // otherwise valid Mission 1 continuation before gameplay can start.
+    if (mission.gameId() != game::GameId::syphon_filter_2 && carry &&
+        !gameplay->applyCampaignCarryState(*carry)) {
       throw core::Error{core::ErrorCode::invalid_format,
                         "Campaign carry could not be applied to retail RAM"};
     }

@@ -14271,6 +14271,10 @@ SceneViewerResult runSf2GuestScene(
   auto automatic_quick_save_completed = false;
   auto automatic_quick_load_completed = false;
   auto combat_diagnostics = runtime.diagnostics();
+  auto airbasex_source150_mode = std::optional<std::uint32_t>{};
+  auto airbasex_source150_sample_clock = std::uint32_t{};
+  auto airbasex_source150_sample_x = std::int32_t{};
+  auto airbasex_source150_sample_z = std::int32_t{};
   if (ignored_health_pin) {
     PsyX_Log_Info(
         "SF2 health pin ignored: SF2_PIN_HEALTH is restricted to input "
@@ -14788,8 +14792,9 @@ SceneViewerResult runSf2GuestScene(
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
       }
+      const auto post_update_diagnostics = runtime.diagnostics();
       {
-        const auto current = runtime.diagnostics();
+        const auto &current = post_update_diagnostics;
         if (current.damage_events != combat_diagnostics.damage_events ||
             current.player_damage_events !=
                 combat_diagnostics.player_damage_events ||
@@ -14811,6 +14816,47 @@ SceneViewerResult runSf2GuestScene(
               current.last_player_damage_request[3U]);
         }
         combat_diagnostics = current;
+      }
+      if (mission.definition().index == 4U) {
+        const auto actor = runtime.objectStateForProbe(150U);
+        if (actor && actor->actor_controller != 0U) {
+          // TRAILING_MIBS owns the final Falkan/helicopter route through
+          // source 150. Record authored controller-mode transitions and one
+          // position delta per retail second so an interactive report can
+          // distinguish a wrong script mode from a correctly selected mode
+          // executing at the wrong speed.
+          const auto mode =
+              (actor->actor_controller_words[4U] >> 16U) & 0xffU;
+          if (!airbasex_source150_mode ||
+              *airbasex_source150_mode != mode) {
+            PsyX_Log_Info(
+                "SF2 AIRBASEX source 150 mode: clock=%u mode=%u "
+                "position=(%d,%d,%d) velocity=(%d,%d,%d)\n",
+                post_update_diagnostics.system_clock, mode, actor->x, actor->y,
+                actor->z, actor->motion_velocity[0U],
+                actor->motion_velocity[1U], actor->motion_velocity[2U]);
+            airbasex_source150_mode = mode;
+            airbasex_source150_sample_clock =
+                post_update_diagnostics.system_clock;
+            airbasex_source150_sample_x = actor->x;
+            airbasex_source150_sample_z = actor->z;
+          } else if (mode == 7U &&
+                     post_update_diagnostics.system_clock >=
+                         airbasex_source150_sample_clock + 20U) {
+            PsyX_Log_Info(
+                "SF2 AIRBASEX source 150 pace: clock=%u mode=%u "
+                "position=(%d,%d,%d) delta=(%d,%d) velocity=(%d,%d,%d)\n",
+                post_update_diagnostics.system_clock, mode, actor->x, actor->y,
+                actor->z, actor->x - airbasex_source150_sample_x,
+                actor->z - airbasex_source150_sample_z,
+                actor->motion_velocity[0U], actor->motion_velocity[1U],
+                actor->motion_velocity[2U]);
+            airbasex_source150_sample_clock =
+                post_update_diagnostics.system_clock;
+            airbasex_source150_sample_x = actor->x;
+            airbasex_source150_sample_z = actor->z;
+          }
+        }
       }
       if (runtime.missionCompleteRequested()) {
         const auto carry =

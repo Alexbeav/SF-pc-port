@@ -116,7 +116,8 @@ void printUsage() {
       << "  sf_tool probe-sf2-object-state <game.cue> <mission-index-0-based> "
          "<source-index> <frames>\n"
       << "  sf_tool probe-sf2-script-event <game.cue> "
-         "<mission-index-0-based> <program> <event> <selector> [frames]\n"
+         "<mission-index-0-based> <program> <event> <selector> [frames] "
+         "[object-source]\n"
       << "  sf_tool probe-sf2-raw-cd-sync <disc-1.cue>\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
@@ -9460,7 +9461,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
 
 int probeSf2ScriptEvent(const char *cue_path, std::uint32_t mission_index,
                         std::string_view program, std::uint32_t event,
-                        std::uint32_t selector, std::uint32_t frames) {
+                        std::uint32_t selector, std::uint32_t frames,
+                        std::optional<std::uint16_t> object_source) {
   sf::game::Sf2GuestMissionRuntime runtime{
       std::filesystem::path{cue_path}, mission_index};
   if (!runtime.ready()) {
@@ -9500,7 +9502,27 @@ int probeSf2ScriptEvent(const char *cue_path, std::uint32_t mission_index,
             << " cd=" << diagnostics.cd_lba << '/'
             << diagnostics.xa_sectors_received
             << " scripts=" << diagnostics.script_dispatches << '/'
-            << diagnostics.script_program_dispatches << '\n';
+            << diagnostics.script_program_dispatches;
+  if (object_source) {
+    const auto object = runtime.objectStateForProbe(*object_source);
+    if (!object) {
+      std::cout << " object=" << *object_source << ":missing";
+    } else {
+      const auto movement_mode =
+          object->actor_controller == 0U
+              ? 0xffU
+              : (object->actor_controller_words[4U] >> 16U) & 0xffU;
+      std::cout << " object=" << *object_source << ":instance=0x"
+                << std::hex << std::uppercase << object->instance
+                << "/controller=0x" << object->actor_controller << std::dec
+                << "/mode=" << movement_mode << "/position=" << object->x
+                << ',' << object->y << ',' << object->z << "/velocity="
+                << object->motion_velocity[0U] << ','
+                << object->motion_velocity[1U] << ','
+                << object->motion_velocity[2U];
+    }
+  }
+  std::cout << '\n';
   return 0;
 }
 
@@ -13828,12 +13850,16 @@ int main(int argc, char **argv) {
           static_cast<std::uint16_t>(parseSf2ObjectIndex(argv[4])),
           parseFrameCount(argv[5]));
     }
-    if ((argc == 7 || argc == 8) &&
+    if ((argc == 7 || argc == 8 || argc == 9) &&
         std::string_view{argv[1]} == "probe-sf2-script-event") {
       return probeSf2ScriptEvent(
           argv[2], parseSf2MissionIndex(argv[3]), argv[4],
           parseSf2ObjectIndex(argv[5]), parseSf2ObjectIndex(argv[6]),
-          argc == 8 ? parseFrameCount(argv[7]) : 120U);
+          argc >= 8 ? parseFrameCount(argv[7]) : 120U,
+          argc == 9
+              ? std::optional<std::uint16_t>{static_cast<std::uint16_t>(
+                    parseSf2ObjectIndex(argv[8]))}
+              : std::nullopt);
     }
     if (argc == 3 &&
         std::string_view{argv[1]} == "probe-sf2-raw-cd-sync") {
