@@ -1,5 +1,16 @@
 # Roadmap
 
+## Community return
+
+The project consumes substantial public emulator, decompilation, SDK, and
+hardware-documentation work. Generic fixes, deterministic tests, diagnostic
+tools, and independently verified documentation corrections that can help an
+upstream project should be separated from Syphon Filter-specific material and
+prepared for contribution upstream. Follow
+`I:\Projects\PSX-References\COMMUNITY_CONTRIBUTION_POLICY.md`; never include
+retail data, private research, personal paths, or license-incompatible code in
+a public report or patch.
+
 ## Retail gameplay completion
 
 - G2 — retail scripts, terrain triggers, spawn/despawn, doors, portals and
