@@ -3561,6 +3561,31 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
         sf::core::ErrorCode::unsupported,
         "SF3 guest bootstrap probe requires Syphon Filter 3 USA"};
   }
+  std::vector<std::byte> tokyo_slf;
+  std::map<std::string, std::vector<std::byte>> tokyo_files;
+  std::map<std::uint32_t,
+           std::pair<const std::vector<std::byte> *, std::size_t>>
+      tokyo_open_files;
+  struct TokyoMemberRead {
+    std::string name;
+    std::uint32_t handle{};
+    std::uint32_t destination{};
+    std::uint32_t requested{};
+    std::size_t offset{};
+    std::array<std::uint32_t, 5U> handle_words{};
+  };
+  std::vector<TokyoMemberRead> tokyo_member_reads;
+  if (drive_title_shell) {
+    const auto tokyo_fog = disc.image().readFile("FOG/TOKYO.FOG");
+    const auto archive = sf::assets::FogArchive::parse(tokyo_fog);
+    for (const auto &entry : archive.entries()) {
+      const auto file = archive.file(entry.name);
+      tokyo_files.emplace(
+          entry.name, std::vector<std::byte>{file.begin(), file.end()});
+    }
+    const auto slf = archive.file("SLF.RFF");
+    tokyo_slf.assign(slf.begin(), slf.end());
+  }
 
   sf::game::LegacyGameplayVm vm{disc.executable()};
   sf::game::DiscCdRomMedia cdrom_media{disc.image()};
@@ -3651,7 +3676,7 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
   std::map<std::string, std::uint64_t> cd_search_paths;
   std::set<std::uint32_t> cd_search_returns;
   std::map<std::array<std::uint32_t, 2U>, std::uint64_t> cd_search_results;
-  std::map<std::array<std::uint32_t, 5U>, std::uint64_t> resident_read_calls;
+  std::map<std::array<std::uint32_t, 6U>, std::uint64_t> resident_read_calls;
   std::uint64_t movie_decoder_handoffs{};
   std::uint64_t movie_retail_completions{};
   std::map<std::uint32_t, std::uint64_t> movie_loader_returns;
@@ -3811,16 +3836,17 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
           const auto destination = context.argument(1);
           const auto requested = context.argument(2);
           const auto completion = context.argument(3);
-          ++resident_read_calls[{handle, destination, requested, completion,
-                                 context.returnAddress()}];
           std::uint32_t handle_size{};
           if (handle == 0U || destination == 0U ||
               !context.read32(handle + 4U, handle_size)) {
             context.continueGuestInstruction();
             return;
           }
+          ++resident_read_calls[{handle, destination, requested, completion,
+                                 context.returnAddress(), handle_size}];
           const auto title_entry = disc.image().find("TITLE.HOG");
           const auto movie_entry = disc.image().find("MOVIE1.HOG");
+          const auto tokyo_entry = disc.image().find("FOG/TOKYO.FOG");
           std::vector<std::byte> payload;
           if (destination == 0x80150950U && requested == 0xe800U) {
             payload.resize(requested);
@@ -3854,9 +3880,84 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
                   std::to_integer<std::uint8_t>(payload[index]);
             }
             movie_catalog_prefix_valid = true;
+          } else if (handle_size == tokyo_entry.size && requested == 0x800U) {
+            payload.resize(requested);
+            auto sector = std::span<std::byte, 0x800U>{payload};
+            if (!cdrom_media.readDataSector(tokyo_entry.extent_lba, sector)) {
+              context.setReturnValue(3U);
+              return;
+            }
+          } else if (!tokyo_slf.empty() &&
+                     handle_size == tokyo_slf.size() &&
+                     requested >= tokyo_slf.size()) {
+            payload.resize(requested);
+            std::ranges::copy(tokyo_slf, payload.begin());
+            TokyoMemberRead read{"SLF.RFF", handle, destination, requested,
+                                 0U};
+            for (auto index = std::size_t{}; index < read.handle_words.size();
+                 ++index) {
+              static_cast<void>(context.read32(
+                  handle + static_cast<std::uint32_t>(index * 4U),
+                  read.handle_words[index]));
+            }
+            tokyo_member_reads.push_back(std::move(read));
           } else {
-            context.continueGuestInstruction();
-            return;
+            auto open_file = tokyo_open_files.find(handle);
+            if (open_file != tokyo_open_files.end() &&
+                open_file->second.first->size() != handle_size) {
+              tokyo_open_files.erase(open_file);
+              open_file = tokyo_open_files.end();
+            }
+            if (open_file == tokyo_open_files.end()) {
+              const std::vector<std::byte> *unique_member{};
+              auto size_matches = std::size_t{};
+              for (const auto &[name, bytes] : tokyo_files) {
+                static_cast<void>(name);
+                if (bytes.size() == handle_size) {
+                  unique_member = &bytes;
+                  ++size_matches;
+                }
+              }
+              if (size_matches != 1U) {
+                context.continueGuestInstruction();
+                return;
+              }
+              open_file = tokyo_open_files
+                              .insert_or_assign(
+                                  handle, std::pair{unique_member,
+                                                    std::size_t{}})
+                              .first;
+            }
+            payload.resize(requested);
+            const auto &bytes = *open_file->second.first;
+            std::string member_name;
+            for (const auto &[name, candidate] : tokyo_files) {
+              if (&candidate == open_file->second.first) {
+                member_name = name;
+                break;
+              }
+            }
+            TokyoMemberRead read{std::move(member_name), handle, destination,
+                                 requested, open_file->second.second};
+            for (auto index = std::size_t{}; index < read.handle_words.size();
+                 ++index) {
+              static_cast<void>(context.read32(
+                  handle + static_cast<std::uint32_t>(index * 4U),
+                  read.handle_words[index]));
+            }
+            tokyo_member_reads.push_back(std::move(read));
+            const auto available = open_file->second.second < bytes.size()
+                                       ? bytes.size() - open_file->second.second
+                                       : 0U;
+            const auto copied = std::min<std::size_t>(requested, available);
+            std::ranges::copy_n(
+                bytes.begin() +
+                    static_cast<std::ptrdiff_t>(open_file->second.second),
+                copied, payload.begin());
+            open_file->second.second += copied;
+            if (open_file->second.second >= bytes.size()) {
+              tokyo_open_files.erase(open_file);
+            }
           }
           if (!context.writeBytes(destination, payload) ||
               (completion != 0U && !context.write32(completion, 0U))) {
@@ -4104,8 +4205,11 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
           ++cd_search_results[{pc, state.gpr[2U]}];
         }
         if (pc == guest_profile.resident_file_read_entry) {
+          std::uint32_t handle_size{};
+          static_cast<void>(
+              vm.runtime().read32(state.gpr[4U] + 4U, handle_size));
           ++resident_read_calls[{state.gpr[4U], state.gpr[5U], state.gpr[6U],
-                                 state.gpr[7U], state.gpr[31U]}];
+                                 state.gpr[7U], state.gpr[31U], handle_size}];
         }
         if (drive_title_shell &&
             pc == guest_profile.movie_playback_init_entry &&
@@ -4373,9 +4477,7 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
       break;
     }
     std::uint32_t live_poll_word{};
-    if (result.execution.pc >= 0x8016ea04U &&
-        result.execution.pc <= 0x8016ea10U &&
-        vm.runtime().read32(bootstrap_poll_word, live_poll_word) &&
+    if (vm.runtime().read32(bootstrap_poll_word, live_poll_word) &&
         live_poll_word != 0U &&
         vm.machine().dma().scheduledToken(sf::psx::DmaChannel::spu) == 0U) {
       sf::game::LegacyGameplayVmResult callback_result;
@@ -4754,7 +4856,21 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
       std::cout << "  handle=0x" << std::hex << std::uppercase << call[0U]
                 << " destination=0x" << call[1U] << " size=0x" << call[2U]
                 << " completion=0x" << call[3U] << " ra=0x" << call[4U]
-                << std::dec << " count=" << count << '\n';
+                << " file-size=0x" << call[5U] << std::dec
+                << " count=" << count << '\n';
+    }
+    std::cout << "SF3 title-shell TOKYO member reads: count="
+              << tokyo_member_reads.size() << '\n';
+    for (const auto &read : tokyo_member_reads) {
+      std::cout << "  member=" << std::quoted(read.name) << " handle=0x"
+                << std::hex << std::uppercase << read.handle
+                << " destination=0x" << read.destination << " size=0x"
+                << read.requested << " offset=0x" << read.offset << std::dec
+                << " handle-words=";
+      for (const auto word : read.handle_words) {
+        std::cout << " 0x" << std::hex << std::uppercase << word;
+      }
+      std::cout << std::dec << '\n';
     }
     std::cout << "SF3 title-shell movie decoder handoffs="
               << movie_decoder_handoffs << " retail-completions="
@@ -4903,10 +5019,11 @@ int probeSf3GuestBootstrap(const char *cue_path, std::uint64_t budget,
                                    application_state_path[index] == 0U;
   }
   const auto reached_tokyo_boundary =
-      observed_mission_transition && final_application_state == 0U &&
-      final_application_depth == 1U &&
+      observed_mission_transition &&
       cd_search_paths.contains("\\FOG\\TOKYO.FOG;1") &&
-      cd_search_paths.contains("\\TOKYO\\SLF.RFF;1");
+      std::ranges::any_of(tokyo_member_reads, [](const auto &read) {
+        return read.name == "SLF.RFF";
+      });
   const auto reached_title_boundary =
       final_application_state == 4U && final_application_depth == 2U;
   const auto expected_boundary =

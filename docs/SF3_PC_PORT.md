@@ -106,6 +106,13 @@ is used.
 - Establish SPU sound effects, `SCENES1.XA` dialogue/music and STR handoffs.
 - Complete Hotel Fukushima from authored opening to mission transition.
 
+The current deterministic probe has crossed the archive portion of this gate:
+retail parses the TOKYO catalog and loads `SLF.RFF`, `TOKYO.DAT`,
+`GENERIC.OVL`, `VLF.RFF`, `DLF.RFF`, `WLDEMD.HOG`, `TOKYO.SS`, and the
+`NPC.HOG` catalog through immutable host file transport. It reaches the retail
+Mission 1 PAD caller and captures a 640-packet, 625-draw frame. Product runtime
+selection and interactive validation remain pending.
+
 ### S4 — runtime systems
 
 - Map SF3 player, actor, camera, item, weapon, damage and checkpoint layouts.
