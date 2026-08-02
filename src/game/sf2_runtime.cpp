@@ -858,6 +858,47 @@ public:
            vm_.runtime().read32(owner_handle, owner) && owner != 0U &&
            vm_.runtime().write16(owner + collision_owner_room_offset, room);
   }
+  [[nodiscard]] bool exerciseRawCdSyncWaitForProbe() noexcept {
+    constexpr std::uint32_t raw_cd_result = 0x8011cf5cU;
+    constexpr std::uint32_t raw_cd_started_at = 0x8011cf60U;
+    constexpr std::uint32_t raw_cd_outer_started_at = 0x8011cf64U;
+    constexpr std::uint32_t raw_cd_callback = 0x8011cf6cU;
+    std::uint32_t retrace{};
+    if (!ready_ || faulted_ ||
+        !vm_.runtime().read32(
+            disc_.game()->executable_layout.retrace_counter_address,
+            retrace) ||
+        !vm_.runtime().write32(raw_cd_result, 1U) ||
+        !vm_.runtime().write32(raw_cd_started_at, retrace) ||
+        !vm_.runtime().write32(raw_cd_outer_started_at, retrace) ||
+        !vm_.runtime().write32(raw_cd_callback, 0U)) {
+      return false;
+    }
+    const auto slices_before = raw_cd_sync_scheduler_slices_;
+    const std::array arguments{0U, 0U};
+    const auto synchronized = invokeNested(0x800f7704U, arguments);
+    if ((!synchronized.completed() &&
+         !synchronized.stoppedAtHostBoundary()) ||
+        raw_cd_sync_scheduler_slices_ == slices_before) {
+      const auto hex = [](std::uint32_t value) {
+        constexpr char digits[] = "0123456789ABCDEF";
+        std::string text(8U, '0');
+        for (auto index = std::size_t{}; index < text.size(); ++index) {
+          text[text.size() - index - 1U] =
+              digits[(value >> (index * 4U)) & 0x0fU];
+        }
+        return text;
+      };
+      markFault("RawCdSync probe reason=" +
+                std::string{psx::toString(synchronized.execution.reason)} +
+                " pc=0x" + hex(synchronized.execution.pc) + " ra=0x" +
+                hex(vm_.runtime().state().gpr[31U]) + " slices=" +
+                std::to_string(raw_cd_sync_scheduler_slices_ -
+                               slices_before));
+      return false;
+    }
+    return true;
+  }
   [[nodiscard]] bool
   setPlayerHealthForProbe(std::uint16_t health) noexcept {
     constexpr std::uint32_t player_pointer = 0x8012a574U;
@@ -2227,6 +2268,7 @@ public:
     result.async_file_services = async_file_services_;
     result.async_file_completions = async_file_completions_;
     result.last_async_completion_caller = last_async_completion_caller_;
+    result.raw_cd_sync_scheduler_slices = raw_cd_sync_scheduler_slices_;
     result.input_samples = host_pad_samples_;
     result.checkpoint_restores = alpha_checkpoint_restores_;
     result.checkpoint_audio_discarded_frames =
@@ -5670,9 +5712,31 @@ private:
               psx::R3000StopReason::instruction_budget &&
           result.execution.pc >= 0x80014d8cU &&
           result.execution.pc <= 0x80014dc0U;
+      // Retail RawCdSync (0x800F7704) also polls completion without
+      // publishing a GPU boundary. Mission 1 reaches this path after the C4
+      // tunnel transition; withholding the host scheduler leaves its raw-CD
+      // callback state unchanged until the global instruction budget expires
+      // around 0x800F7778. Advance only while execution is inside that exact
+      // synchronization routine so the authored request/callback owns the
+      // result and ordinary gameplay pacing remains display-driven.
+      const auto raw_cd_sync_vsync_return =
+          vm_.runtime().state().gpr[31U] == 0x800f773cU ||
+          vm_.runtime().state().gpr[31U] == 0x800f776cU;
+      const auto raw_cd_sync_wait =
+          realtime_display_clock_ &&
+          result.execution.reason ==
+              psx::R3000StopReason::instruction_budget &&
+          ((result.execution.pc >= 0x800f7704U &&
+            result.execution.pc < 0x800f77d8U) ||
+           (result.execution.pc >= 0x800f48f0U &&
+            result.execution.pc < 0x800f4a68U &&
+            raw_cd_sync_vsync_return));
+      if (raw_cd_sync_wait) {
+        ++raw_cd_sync_scheduler_slices_;
+      }
       const auto scheduler_ticks =
           !realtime_display_clock_ || synchronous_wait ||
-                  lifecycle_vsync_wait
+                  lifecycle_vsync_wait || raw_cd_sync_wait
               ? result.execution.instructions
               : 0U;
       if (!serviceScheduler(scheduler_ticks)) {
@@ -6479,6 +6543,7 @@ private:
   std::uint64_t async_file_services_{};
   std::uint64_t async_file_completions_{};
   std::uint32_t last_async_completion_caller_{};
+  std::uint64_t raw_cd_sync_scheduler_slices_{};
   std::uint32_t xa_status_source_{};
   std::uint32_t xa_status_result_{};
   std::optional<QuickState> quick_state_;
@@ -6578,6 +6643,10 @@ bool Sf2GuestMissionRuntime::setPlayerPositionForProbe(
 bool Sf2GuestMissionRuntime::setPlayerRoomForProbe(
     std::uint16_t room) noexcept {
   return impl_->setPlayerRoomForProbe(room);
+}
+
+bool Sf2GuestMissionRuntime::exerciseRawCdSyncWaitForProbe() noexcept {
+  return impl_->exerciseRawCdSyncWaitForProbe();
 }
 
 bool Sf2GuestMissionRuntime::setPlayerHealthForProbe(

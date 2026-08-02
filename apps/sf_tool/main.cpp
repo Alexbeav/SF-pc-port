@@ -115,6 +115,9 @@ void printUsage() {
          "[settle-frames] [event-3-selector]\n"
       << "  sf_tool probe-sf2-object-state <game.cue> <mission-index-0-based> "
          "<source-index> <frames>\n"
+      << "  sf_tool probe-sf2-script-event <game.cue> "
+         "<mission-index-0-based> <program> <event> <selector> [frames]\n"
+      << "  sf_tool probe-sf2-raw-cd-sync <disc-1.cue>\n"
       << "  sf_tool probe-legacy-cd <game.cue>\n"
       << "  sf_tool probe-legacy-loop <game.cue>\n"
       << "  sf_tool probe-legacy-bootstrap <game.cue>\n"
@@ -9451,6 +9454,67 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
   return 0;
 }
 
+int probeSf2ScriptEvent(const char *cue_path, std::uint32_t mission_index,
+                        std::string_view program, std::uint32_t event,
+                        std::uint32_t selector, std::uint32_t frames) {
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, mission_index};
+  if (!runtime.ready()) {
+    std::cerr << "SF2 script-event runtime failed: "
+              << runtime.faultDetail() << '\n';
+    return 7;
+  }
+  runtime.setHostPadState({});
+  std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
+  const auto advance = [&runtime, &pcm](std::uint32_t count) {
+    for (auto frame = std::uint32_t{}; frame < count; ++frame) {
+      if (!runtime.advanceHostUpdate()) {
+        return false;
+      }
+      while (runtime.takePcm(pcm) != 0U) {
+      }
+    }
+    return true;
+  };
+  if (!advance(1U) || !runtime.activateScriptProgramForProbe(program) ||
+      !runtime.dispatchScriptEventForProbe(event, selector) ||
+      !advance(frames)) {
+    std::cerr << "SF2 script-event route failed: mission=" << mission_index
+              << " program=" << program << " event=" << event << '/'
+              << selector << " detail=" << runtime.faultDetail() << '\n';
+    return 10;
+  }
+  const auto diagnostics = runtime.diagnostics();
+  std::cout << "SF2 script-event route passed: mission=" << mission_index
+            << " program=" << program << " event=" << event << '/'
+            << selector << " frames=" << frames
+            << " state=" << diagnostics.application_state
+            << " clock=" << diagnostics.system_clock
+            << " async=" << diagnostics.async_file_services << '/'
+            << diagnostics.async_file_completions
+            << " raw-sync=" << diagnostics.raw_cd_sync_scheduler_slices
+            << " cd=" << diagnostics.cd_lba << '/'
+            << diagnostics.xa_sectors_received
+            << " scripts=" << diagnostics.script_dispatches << '/'
+            << diagnostics.script_program_dispatches << '\n';
+  return 0;
+}
+
+int probeSf2RawCdSync(const char *cue_path) {
+  sf::game::Sf2GuestMissionRuntime runtime{
+      std::filesystem::path{cue_path}, 0U};
+  if (!runtime.ready() || !runtime.exerciseRawCdSyncWaitForProbe()) {
+    std::cerr << "SF2 RawCdSync scheduler gate failed: "
+              << runtime.faultDetail() << '\n';
+    return 10;
+  }
+  const auto diagnostics = runtime.diagnostics();
+  std::cout << "SF2 RawCdSync scheduler gate passed: slices="
+            << diagnostics.raw_cd_sync_scheduler_slices
+            << " clock=" << diagnostics.system_clock << '\n';
+  return diagnostics.raw_cd_sync_scheduler_slices != 0U ? 0 : 10;
+}
+
 int probeLegacyCd(const char *cue_path) {
   auto disc = openDisc(cue_path);
   if (!disc.game() || disc.game()->serial != "SCUS-94240" ||
@@ -13759,6 +13823,17 @@ int main(int argc, char **argv) {
           argv[2], parseSf2MissionIndex(argv[3]),
           static_cast<std::uint16_t>(parseSf2ObjectIndex(argv[4])),
           parseFrameCount(argv[5]));
+    }
+    if ((argc == 7 || argc == 8) &&
+        std::string_view{argv[1]} == "probe-sf2-script-event") {
+      return probeSf2ScriptEvent(
+          argv[2], parseSf2MissionIndex(argv[3]), argv[4],
+          parseSf2ObjectIndex(argv[5]), parseSf2ObjectIndex(argv[6]),
+          argc == 8 ? parseFrameCount(argv[7]) : 120U);
+    }
+    if (argc == 3 &&
+        std::string_view{argv[1]} == "probe-sf2-raw-cd-sync") {
+      return probeSf2RawCdSync(argv[2]);
     }
     if ((argc >= 3 && argc <= 7) &&
         std::string_view{argv[1]} == "probe-sf2-product-runtime") {

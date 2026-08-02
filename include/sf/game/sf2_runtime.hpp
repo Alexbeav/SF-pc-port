@@ -597,6 +597,7 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t async_file_services{};
   std::uint64_t async_file_completions{};
   std::uint32_t last_async_completion_caller{};
+  std::uint64_t raw_cd_sync_scheduler_slices{};
   std::uint64_t input_samples{};
   std::uint64_t checkpoint_restores{};
   std::uint64_t checkpoint_audio_discarded_frames{};
@@ -746,6 +747,10 @@ public:
       std::int32_t x, std::int32_t y, std::int32_t z) noexcept;
   [[nodiscard]] bool
   setPlayerRoomForProbe(std::uint16_t room) noexcept;
+  // Exercises retail's blocking RawCdSync timeout path while the product owns
+  // the suppressed-interrupt scheduler. Diagnostic-only; the runtime should
+  // be discarded after this call.
+  [[nodiscard]] bool exerciseRawCdSyncWaitForProbe() noexcept;
   [[nodiscard]] bool
   setPlayerHealthForProbe(std::uint16_t health) noexcept;
   [[nodiscard]] bool setObjectRecordHealthForProbe(

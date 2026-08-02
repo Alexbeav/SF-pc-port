@@ -54,13 +54,16 @@ maps every authored EOL selection on both discs, including Mission 21's
 The final interactive Mission 3-to-4 handoff and broader natural completion
 playthroughs remain the release gate.
 
-Mission 5 interactive testing exposed a post-Alpha-7 blocker: its live retail
-script VM was being reset a second time by the host after `LEVEL` and five child
-programs were already active, risking loss of one-shot opening state. The duplicate
-reset is removed and the all-mission matrix now hard-fails unless retail owns
-exactly one `LEVEL` start. Automated actor residency and script gates pass;
-interactive AIRBASEX choreography and its natural `6_3.STR` transition remain
-the next human validation boundary.
+Mission 5's missing opening actors and vehicle choreography were traced to
+nested `NPC.HOG` resources whose retail synchronous completion path was not
+being serviced. Exact nested payload delivery now resumes the authored retail
+callback, and interactive testing confirms the opening guards, Homan/truck
+departure, and silenced-rifle patrols. A clean playtest still needs to validate
+detection/failure and gunshot effects audio; the earlier no-damage observation
+was made with diagnostic health pinning left enabled. Mission 1's post-C4 stop
+is now localized to a blocking retail `RawCdSync` loop and has a deterministic
+scheduler regression gate; crossing the destroyed tunnel interactively remains
+the final confirmation for that fix.
 
 1. **Presentation stability — complete for the current playtest gate.** The
    persistent two-page renderer, atlas/state handling, room residency, floor

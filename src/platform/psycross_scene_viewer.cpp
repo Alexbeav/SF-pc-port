@@ -14190,7 +14190,11 @@ SceneViewerResult runSf2GuestScene(
       diagnostic_frame("SF2_CAPTURE_ON_UI_TEXT").value_or(0U) != 0U;
   const auto input_record_path = diagnostic_path("SF2_RECORD_INPUT");
   const auto input_replay_path = diagnostic_path("SF2_REPLAY_INPUT");
+  // Health pinning exists only to keep deterministic recording/replay routes
+  // alive. Do not let a variable left behind in a PowerShell session turn a
+  // later ordinary playtest into an undocumented god-mode run.
   const auto pin_recording_health =
+      (input_record_path || input_replay_path) &&
       diagnostic_frame("SF2_PIN_HEALTH").value_or(0U) != 0U;
   const auto trace_presentation =
       diagnostic_frame("SF2_TRACE_PRESENTATION").value_or(0U) != 0U;
