@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.9",
+    [string]$Version = "0.1.0-sf2-guest-alpha.10",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -176,8 +176,12 @@ AUDIO / CUTSCENE STATUS
 - The retail HUD, text, weapon artwork, radar actors/threat cones and
   widescreen in-engine cinematic bars render through the guest GPU bridge.
 - Native-wide guest projection keeps world geometry, backgrounds and NPCs
-  visible across the wider viewport. Missions 1-4 pass interactive coverage;
-  Missions 5-21 still need the same widescreen regression pass.
+  visible across the wider viewport. Missions 1-7 pass interactive campaign
+  coverage, including the open-air, train, scoped-weapon and NVG routes.
+- Retail briefing records now use SF2's forward field order, restoring the
+  authored location, operative, date/time and directive layout.
+- Native chase pitch yields to scripted retail camera ownership during
+  in-engine cinematics and resumes when control returns to the player.
 - P opens and closes the retail pause/map screen without replacing the live
   mission, and cross-mission startup no longer retains its full-screen grid.
 - Connected campaign progression, SF2 inventory/vitals carry, save handoff,
@@ -249,17 +253,20 @@ and connected campaign/save/movie handoffs are implemented. This remains a
 playtesting build rather than a finished PC port.
 
 Mission 1's opening and complete post-C4 route, Mission 3 dialogue,
-post-checkpoint audio and Mission 7 music pass interactive checks. Mission
-5/AIRBASEX now loads the authored
-nested NPC resources and its opening population/choreography passes an
-interactive check. Its detection/failure, enemy damage/effects-audio behavior
-and natural mid-mission movie still need playtest coverage. A Mission 1 death
+post-checkpoint audio, Mission 5 choreography and Mission 7 music pass
+interactive checks. Missions 1-7 have been played consecutively through the
+current campaign, presentation and control paths. A Mission 1 death
 during the playable parachute opening still restores an invalid boundary state
 instead of replaying the complete in-engine parachute intro.
 
 Native relative-mouse aim/chase control and native-wide guest projection are
-included. Missions 1-4 pass interactive widescreen coverage; Missions 5-21
-still need the same regression pass.
+included. Scripted in-engine cameras retain vertical ownership, and the default
+third-person mouse yaw is 0.75. SF2 briefing fields and text layout now match
+the retail record order.
+
+Known presentation follow-ups include the missing decorative briefing frame,
+the Mission 6 NVG right-edge strip, and mission-failure letterbox bars that
+animate at 4:3 before extending across the widescreen viewport when settled.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.

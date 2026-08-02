@@ -294,6 +294,24 @@ struct TextLayout {
   int lines{1};
 };
 
+bool isSf2OperativeBriefing(const assets::MissionBriefing &briefing) noexcept {
+  constexpr std::string_view prefix = "operative:";
+  const auto directive = briefing.directive();
+  if (directive.size() < prefix.size()) {
+    return false;
+  }
+  for (auto index = std::size_t{}; index < prefix.size(); ++index) {
+    auto character = directive[index];
+    if (character >= 'A' && character <= 'Z') {
+      character = static_cast<char>(character - 'A' + 'a');
+    }
+    if (character != prefix[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 TextLayout layoutTextObject(std::string_view text, int left, int top, int right,
                             int bottom) {
   TextLayout layout;
@@ -354,9 +372,13 @@ double briefingTextProgress(const assets::MissionBriefing &briefing,
                             double retail_time) {
   auto y = top;
   auto animation_steps = std::size_t{};
-  const auto include = [&](std::string_view text) {
-    const auto layout = layoutTextObject(text, left, y, right, bottom);
-    y += layout.lines * retail_line_height;
+  const auto include = [&](std::string_view text, int text_left,
+                           bool advance_line = true) {
+    const auto layout =
+        layoutTextObject(text, text_left, y, right, bottom);
+    if (advance_line) {
+      y += layout.lines * retail_line_height;
+    }
     if (layout.glyphs.empty()) {
       return;
     }
@@ -366,10 +388,18 @@ double briefingTextProgress(const assets::MissionBriefing &briefing,
         animation_steps,
         (layout.glyphs.size() + glyphs_per_tick - 1U) / glyphs_per_tick);
   };
-  include(briefing.retailTitle());
+  if (isSf2OperativeBriefing(briefing)) {
+    include(briefing.location(), left, false);
+    include(briefing.missionTitle(),
+            left + assets::RetailBriefingLayout::sf2_title_column, false);
+    y += retail_line_height;
+    include(briefing.dateTime(), left);
+  } else {
+    include(briefing.retailTitle(), left);
+  }
   for (const auto directive : briefing.retailDirectives()) {
     if (!directive.empty()) {
-      include(directive);
+      include(directive, left);
     }
   }
   if (animation_steps == 0U) {
@@ -565,10 +595,26 @@ bool PsyCrossRetailBriefing::draw(const assets::MissionBriefing &briefing,
 
   auto text_animation_complete = true;
   auto y = top;
-  y += drawTextObject(font, briefing.retailTitle(), left, y, right, bottom,
-                      retail_tick, impl_->native_font.get(),
-                      &text_animation_complete) *
-       retail_line_height;
+  if (isSf2OperativeBriefing(briefing)) {
+    const auto location_lines = drawTextObject(
+        font, briefing.location(), left, y, right, bottom, retail_tick,
+        impl_->native_font.get(), &text_animation_complete);
+    const auto title_lines = drawTextObject(
+        font, briefing.missionTitle(),
+        left + assets::RetailBriefingLayout::sf2_title_column, y, right,
+        bottom, retail_tick, impl_->native_font.get(),
+        &text_animation_complete);
+    y += std::max(location_lines, title_lines) * retail_line_height;
+    y += drawTextObject(font, briefing.dateTime(), left, y, right, bottom,
+                        retail_tick, impl_->native_font.get(),
+                        &text_animation_complete) *
+         retail_line_height;
+  } else {
+    y += drawTextObject(font, briefing.retailTitle(), left, y, right, bottom,
+                        retail_tick, impl_->native_font.get(),
+                        &text_animation_complete) *
+         retail_line_height;
+  }
   for (const auto directive : briefing.retailDirectives()) {
     if (directive.empty()) {
       continue;

@@ -47,6 +47,23 @@ bool isDateTime(std::string_view value) noexcept {
          value[10] >= '0' && value[10] <= '9';
 }
 
+bool startsWithOperative(std::string_view value) noexcept {
+  constexpr std::string_view prefix = "operative:";
+  if (value.size() < prefix.size()) {
+    return false;
+  }
+  for (auto index = std::size_t{}; index < prefix.size(); ++index) {
+    auto character = value[index];
+    if (character >= 'A' && character <= 'Z') {
+      character = static_cast<char>(character - 'A' + 'a');
+    }
+    if (character != prefix[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<std::string> readBriefingStrings(std::span<const std::byte> dlf) {
   const auto data_offset =
       static_cast<std::size_t>(readLe32(dlf, data_offset_field));
@@ -144,6 +161,27 @@ ParsedBriefingRecord parseBriefingRecord(std::vector<std::string> strings,
   const auto date = records[record_index].date;
   auto date_time = strings[date];
   trimLineEnding(date_time);
+
+  // SF2 stores each briefing in display order:
+  // location, title, date, operative/directive, additional directive. SF1's
+  // INIT data is arranged around the date in the opposite direction. The
+  // operative label is an authored, unambiguous discriminator and avoids
+  // imposing sequel ordering on the predecessor's continuation tables.
+  if (date >= 2U && date + 2U < strings.size() &&
+      startsWithOperative(strings[date + 1U])) {
+    auto location = strings[date - 2U];
+    auto title = strings[date - 1U];
+    auto directive = strings[date + 1U];
+    auto additional_directive = strings[date + 2U];
+    trimLineEnding(location);
+    trimLineEnding(title);
+    trimLineEnding(directive);
+    trimLineEnding(additional_directive);
+    return ParsedBriefingRecord{
+        std::move(location), std::move(title), std::move(date_time),
+        std::move(directive), std::move(additional_directive)};
+  }
+
   auto title =
       mission_title.empty() ? strings[date + 1U] : std::string{mission_title};
   // Shared continuation tables store the geographic location only after

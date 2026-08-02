@@ -16,6 +16,9 @@ struct RetailBriefingLayout final {
   static constexpr int region_y = -90;
   static constexpr int region_width = 310;
   static constexpr int region_height = 170;
+  // SF2 INIT.OVL places the mission title in a second column on the location
+  // row rather than concatenating both fields into one wrapped text object.
+  static constexpr int sf2_title_column = 104;
   static constexpr std::uint8_t red = 110U;
   static constexpr std::uint8_t green = 130U;
   static constexpr std::uint8_t blue = 200U;

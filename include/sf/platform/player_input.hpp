@@ -192,7 +192,7 @@ struct KeyboardMouseBindings {
   double mouse_pitch_sensitivity{1.0};
   // Third-person chase-camera multipliers are independent because authored
   // body turning and direct camera pitch have very different native scales.
-  double mouse_chase_yaw_sensitivity{6.0};
+  double mouse_chase_yaw_sensitivity{0.75};
   double mouse_chase_pitch_sensitivity{1.25};
 
   [[nodiscard]] KeyboardMouseInput

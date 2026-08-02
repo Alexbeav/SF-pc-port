@@ -1049,6 +1049,16 @@ public:
     pc_manual_aim_pitch_pending_ = std::clamp(
         pc_manual_aim_pitch_pending_ + pitch_delta, -1024, 1024);
   }
+  void setPcChaseCameraYawInput(std::int32_t delta,
+                                bool enabled) noexcept {
+    pc_chase_yaw_enabled_ = enabled;
+    if (!enabled) {
+      pc_chase_yaw_pending_ = 0;
+      return;
+    }
+    pc_chase_yaw_pending_ = std::clamp<std::int32_t>(
+        pc_chase_yaw_pending_ + delta, -1024, 1024);
+  }
   void setPcChaseCameraPitchInput(std::int32_t delta,
                                   bool enabled) noexcept {
     pc_chase_pitch_enabled_ = enabled;
@@ -1770,6 +1780,8 @@ public:
     result.pc_chase_camera_base = pc_chase_camera_base_;
     result.pc_chase_desired_pitch = pc_chase_pitch_target_;
     result.pc_chase_rendered_pitch = pc_chase_rendered_pitch_;
+    result.pc_chase_yaw_hook_calls = pc_chase_yaw_hook_calls_;
+    result.pc_chase_yaw_command = pc_chase_yaw_command_;
     result.pc_manual_aim_hook_calls = pc_manual_aim_hook_calls_;
     result.pc_manual_aim_yaw_command = pc_manual_aim_yaw_command_;
     result.pc_manual_aim_pitch_command = pc_manual_aim_pitch_command_;
@@ -4122,7 +4134,7 @@ private:
     vm_.bindHostCall(
         0x80053464U, [this](LegacyHostCallContext &context) {
           applyPcChaseCameraPitch();
-          applyPcManualAimVector(context);
+          applyPcMouseFacingVector(context);
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -5441,8 +5453,8 @@ private:
     pc_manual_aim_snap_yaw_.reset();
   }
 
-  void applyPcManualAimVector(LegacyHostCallContext &context) noexcept {
-    if (!pc_manual_aim_enabled_) {
+  void applyPcMouseFacingVector(LegacyHostCallContext &context) noexcept {
+    if (!pc_manual_aim_enabled_ && !pc_chase_yaw_enabled_) {
       return;
     }
     // SF1's accepted 0x80037B08 hook writes the processed mouse vector to
@@ -5453,8 +5465,18 @@ private:
     constexpr std::uint32_t vertical_offset = 0xd4U;
     constexpr std::int32_t fixed_one = 4096;
     const auto controller = context.registerValue(18U);
-    const auto yaw = std::clamp(pc_manual_aim_yaw_pending_, -256, 256);
-    const auto pitch = std::clamp(pc_manual_aim_pitch_pending_, -96, 96);
+    const auto manual_aim = pc_manual_aim_enabled_;
+    const auto yaw = std::clamp(
+        manual_aim ? pc_manual_aim_yaw_pending_ : pc_chase_yaw_pending_,
+        -256, 256);
+    const auto pitch = manual_aim
+                           ? std::clamp(pc_manual_aim_pitch_pending_, -96, 96)
+                           : 0;
+    // Normal-play mouse yaw is an additive aftermarket command. With no
+    // pending motion, leave retail's keyboard/controller facing vector alone.
+    if (!manual_aim && yaw == 0) {
+      return;
+    }
     if (controller == 0U ||
         !context.write32(controller + horizontal_offset,
                          std::bit_cast<std::uint32_t>(yaw * fixed_one)) ||
@@ -5463,11 +5485,17 @@ private:
                          std::bit_cast<std::uint32_t>(pitch * fixed_one))) {
       return;
     }
-    ++pc_manual_aim_hook_calls_;
-    pc_manual_aim_yaw_command_ = yaw;
-    pc_manual_aim_pitch_command_ = pitch;
-    pc_manual_aim_yaw_pending_ = 0;
-    pc_manual_aim_pitch_pending_ = 0;
+    if (manual_aim) {
+      ++pc_manual_aim_hook_calls_;
+      pc_manual_aim_yaw_command_ = yaw;
+      pc_manual_aim_pitch_command_ = pitch;
+      pc_manual_aim_yaw_pending_ = 0;
+      pc_manual_aim_pitch_pending_ = 0;
+    } else {
+      ++pc_chase_yaw_hook_calls_;
+      pc_chase_yaw_command_ = yaw;
+      pc_chase_yaw_pending_ = 0;
+    }
   }
 
   void applyPcChaseCameraPitch() noexcept {
@@ -5478,6 +5506,7 @@ private:
     constexpr std::uint32_t instance_player_state_offset = 0x20U;
     constexpr std::uint32_t player_state_camera_offset = 0xe0U;
     constexpr std::uint32_t camera_wrapper_base_offset = 0xa4U;
+    constexpr std::uint32_t camera_wrapper_owner_offset = 0xdcU;
     constexpr std::uint32_t camera_desired_pitch_offset = 0x8e8U;
     constexpr std::uint32_t camera_rendered_pitch_offset = 0x918U;
     constexpr std::int32_t maximum_pitch = 512;
@@ -5486,6 +5515,7 @@ private:
     std::uint32_t player_state{};
     std::uint32_t camera_wrapper{};
     std::uint32_t camera_base{};
+    std::uint32_t camera_owner{};
     if (!pc_chase_pitch_enabled_ ||
         !vm_.runtime().read32(player_pointer, player) || player == 0U ||
         !vm_.runtime().read32(player + instance_player_state_offset,
@@ -5496,7 +5526,15 @@ private:
         camera_wrapper == 0U ||
         !vm_.runtime().read32(camera_wrapper + camera_wrapper_base_offset,
                               camera_base) ||
-        camera_base == 0U) {
+        camera_base == 0U ||
+        !vm_.runtime().read32(camera_wrapper + camera_wrapper_owner_offset,
+                              camera_owner) ||
+        camera_owner != player) {
+      // The camera base survives retail ownership transfers. During an
+      // in-engine cinematic wrapper+0xDC names the scripted camera actor;
+      // ordinary chase gameplay names the live player instance. Never carry
+      // mouse motion accumulated under scripted ownership into the handoff.
+      pc_chase_pitch_pending_ = 0;
       pc_chase_pitch_valid_ = false;
       pc_chase_camera_base_ = 0U;
       return;
@@ -6607,6 +6645,10 @@ private:
   std::uint32_t pc_chase_camera_base_{};
   std::uint64_t pc_chase_pitch_hook_calls_{};
   std::int32_t pc_chase_rendered_pitch_{};
+  bool pc_chase_yaw_enabled_{};
+  std::int32_t pc_chase_yaw_pending_{};
+  std::uint64_t pc_chase_yaw_hook_calls_{};
+  std::int32_t pc_chase_yaw_command_{};
   std::shared_ptr<const Sf2PresentationFrame> presentation_frame_;
   std::optional<Sf2PresentationFrame> pending_presentation_;
   std::uint32_t pending_presentation_clock_{};
@@ -6963,6 +7005,11 @@ void Sf2GuestMissionRuntime::setPcManualAimInput(
     std::int32_t yaw_delta, std::int32_t pitch_delta,
     bool enabled) noexcept {
   impl_->setPcManualAimInput(yaw_delta, pitch_delta, enabled);
+}
+
+void Sf2GuestMissionRuntime::setPcChaseCameraYawInput(
+    std::int32_t delta, bool enabled) noexcept {
+  impl_->setPcChaseCameraYawInput(delta, enabled);
 }
 
 void Sf2GuestMissionRuntime::setPcChaseCameraPitchInput(

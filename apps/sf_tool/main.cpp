@@ -7789,6 +7789,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
 #endif
   for (std::uint32_t frame = 0U; frame < frames; ++frame) {
     if (probe_chase_pitch) {
+      runtime.setPcChaseCameraYawInput(8, true);
       runtime.setPcChaseCameraPitchInput(8, true);
     }
     if (probe_manual_aim) {
@@ -8877,7 +8878,9 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.pc_chase_pitch_hook_calls << "/0x" << std::hex
             << diagnostics.pc_chase_camera_base << std::dec << "/"
             << diagnostics.pc_chase_desired_pitch << "/"
-            << diagnostics.pc_chase_rendered_pitch << ":manual-aim="
+            << diagnostics.pc_chase_rendered_pitch << ":chase-yaw="
+            << diagnostics.pc_chase_yaw_hook_calls << "/"
+            << diagnostics.pc_chase_yaw_command << ":manual-aim="
             << diagnostics.pc_manual_aim_hook_calls << "/"
             << diagnostics.pc_manual_aim_yaw_command << "/"
             << diagnostics.pc_manual_aim_pitch_command << ":radar="

@@ -13471,12 +13471,40 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       if (polygon_span_rejected({1U, 2U, 3U, 4U})) {
         return;
       }
+      const auto minimum_y = std::min({packedScreenY(words[1U]),
+                                       packedScreenY(words[2U]),
+                                       packedScreenY(words[3U]),
+                                       packedScreenY(words[4U])});
+      const auto maximum_y = std::max({packedScreenY(words[1U]),
+                                       packedScreenY(words[2U]),
+                                       packedScreenY(words[3U]),
+                                       packedScreenY(words[4U])});
+      // Retail animates its cinematic mattes as black F4 quads attached to
+      // the top and bottom edges.  Auxiliary OTs retain their authored 4:3
+      // coordinates, so widen those quads continuously as their Y edges
+      // move.  The former full-width-only test did not recognize a matte
+      // until the last animation frame, which made its widescreen extension
+      // snap into place.  World OTs already receive the same compensation
+      // through world_presentation_scale and must not be scaled twice.
+      const auto animated_cinematic_matte =
+          (words[0U] & 0x00ffffffU) == 0U &&
+          (minimum_y <= -screen_height / 2 ||
+           maximum_y >= screen_height / 2);
+      const auto horizontal_scale =
+          animated_cinematic_matte && !native_wide_world
+              ? std::max(PsyX_CalculatePresentationScale(
+                             g_windowWidth, g_windowHeight, g_cfg_aspectMode)
+                             .x,
+                         0.01F)
+              : 1.0F;
       POLY_F4 primitive{};
       setPolyF4(&primitive);
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
-      setXY4(&primitive, x(1U), y(1U), x(2U), y(2U), x(3U), y(3U),
-             x(4U), y(4U));
+      setXY4(&primitive, x(1U) / horizontal_scale, y(1U),
+             x(2U) / horizontal_scale, y(2U),
+             x(3U) / horizontal_scale, y(3U),
+             x(4U) / horizontal_scale, y(4U));
       DrawPrim(&primitive);
       return;
     }
@@ -14560,6 +14588,13 @@ SceneViewerResult runSf2GuestScene(
             -512LL, 512LL)),
         raw.aim && weapon_state.application_state == 0U &&
             weapon_state.player_health != 0U);
+    runtime.setPcChaseCameraYawInput(
+        static_cast<std::int32_t>(std::clamp(
+            std::llround(static_cast<double>(mouse_x) *
+                         input.mouse_chase_yaw_sensitivity),
+            -512LL, 512LL)),
+        !raw.aim && weapon_state.application_state == 0U &&
+            weapon_state.player_health != 0U);
     runtime.setPcChaseCameraPitchInput(
         static_cast<std::int32_t>(std::clamp(
             std::llround(static_cast<double>(mouse_y) *
@@ -14618,26 +14653,17 @@ SceneViewerResult runSf2GuestScene(
     const auto pc_strafe =
         static_cast<double>(raw.strafe_right) -
         static_cast<double>(raw.strafe_left);
-    // Chase yaw remains on the authored locomotion path. Manual aim also gets
-    // the direct camera-angle feed above. Retain a reduced retail-axis signal
-    // as a compatibility fallback for weapon-specific aim controllers and
-    // keyboard/controller paths which do not visit the common angle hook.
+    // Manual aim retains a reduced retail-axis signal as a compatibility
+    // fallback for weapon-specific controllers which do not visit the common
+    // angle hook. Chase mouse yaw uses the direct facing feed above; only
+    // keyboard/controller turning remains on the authored locomotion axis.
     constexpr double mouse_aim_yaw_counts_per_full_deflection = 48.0;
     constexpr double mouse_aim_pitch_counts_per_full_deflection = 64.0;
-    constexpr double mouse_chase_yaw_counts_per_full_deflection = 72.0;
     const auto aim_mouse_yaw = static_cast<double>(mouse_motion.x()) *
                                input.mouse_yaw_sensitivity;
-    const auto chase_mouse_yaw = static_cast<double>(mouse_motion.x()) *
-                                 input.mouse_chase_yaw_sensitivity;
     auto guest_input = game::GameplayInput{
         .move = pc_move,
-        .turn = std::clamp(
-            pc_turn +
-                (raw.aim
-                     ? 0.0
-                     : chase_mouse_yaw /
-                           mouse_chase_yaw_counts_per_full_deflection),
-            -1.0, 1.0),
+        .turn = std::clamp(pc_turn, -1.0, 1.0),
         .run = !raw.run,
         .aim = raw.aim,
         .strafe = pc_strafe,

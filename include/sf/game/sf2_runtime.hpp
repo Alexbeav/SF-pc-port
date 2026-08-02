@@ -291,6 +291,8 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t pc_chase_camera_base{};
   std::int32_t pc_chase_desired_pitch{};
   std::int32_t pc_chase_rendered_pitch{};
+  std::uint64_t pc_chase_yaw_hook_calls{};
+  std::int32_t pc_chase_yaw_command{};
   std::uint64_t pc_manual_aim_hook_calls{};
   std::int32_t pc_manual_aim_yaw_command{};
   std::int32_t pc_manual_aim_pitch_command{};
@@ -770,6 +772,10 @@ public:
   void setPcManualAimInput(std::int32_t yaw_delta,
                            std::int32_t pitch_delta,
                            bool enabled) noexcept;
+  // Supplies aftermarket third-person mouse yaw at the common retail
+  // camera/facing boundary. This avoids the original analog turn-rate cap.
+  void setPcChaseCameraYawInput(std::int32_t delta,
+                                bool enabled) noexcept;
   // Supplies aftermarket third-person mouse pitch to the sequel camera hook.
   // Delta is accumulated until the player's authored chase-camera update.
   void setPcChaseCameraPitchInput(std::int32_t delta,

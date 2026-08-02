@@ -3767,6 +3767,33 @@ void testMissionBriefing() {
           "Washington Park",
       "Fallback briefing added an empty location prefix");
 
+  std::vector<std::byte> sf2_dlf(1024U);
+  writeLe32(sf2_dlf, 0x14U, static_cast<std::uint32_t>(data_offset));
+  auto sf2_cursor = data_offset + 0x18U;
+  const auto appendSf2 = [&sf2_dlf](std::size_t &offset,
+                                    std::string_view text) {
+    std::ranges::transform(
+        text, sf2_dlf.begin() + static_cast<std::ptrdiff_t>(offset),
+        [](char value) { return static_cast<std::byte>(value); });
+    offset += text.size();
+    sf2_dlf[offset++] = std::byte{};
+  };
+  appendSf2(sf2_cursor, "Colorado, USA");
+  appendSf2(sf2_cursor, "C-130 Wreckage Site");
+  appendSf2(sf2_cursor, "09/08 06:45");
+  appendSf2(sf2_cursor,
+            "Operative: GABE LOGAN\n\nThe Agency reached the crash site.");
+  appendSf2(sf2_cursor, "\nRetrieve the discs and rendezvous with Lian.");
+  const auto sf2_briefing = sf::assets::MissionBriefing::parse(sf2_dlf);
+  require(sf2_briefing.location() == "Colorado, USA" &&
+              sf2_briefing.missionTitle() == "C-130 Wreckage Site" &&
+              sf2_briefing.dateTime() == "09/08 06:45" &&
+              sf2_briefing.directive() ==
+                  "Operative: GABE LOGAN\n\nThe Agency reached the crash site." &&
+              sf2_briefing.additionalDirective() ==
+                  "\nRetrieve the discs and rendezvous with Lian.",
+          "SF2 forward-order briefing record was parsed as an SF1 record");
+
   std::vector<std::byte> shared_dlf(1024U);
   writeLe32(shared_dlf, 0x14U, static_cast<std::uint32_t>(data_offset));
   auto shared_cursor = data_offset + 0x18U;
@@ -3844,6 +3871,7 @@ void testMissionBriefing() {
                 sf::assets::RetailBriefingLayout::region_y == -90 &&
                 sf::assets::RetailBriefingLayout::region_width == 310 &&
                 sf::assets::RetailBriefingLayout::region_height == 170 &&
+                sf::assets::RetailBriefingLayout::sf2_title_column == 104 &&
                 sf::assets::RetailBriefingLayout::red == 110U &&
                 sf::assets::RetailBriefingLayout::green == 130U &&
                 sf::assets::RetailBriefingLayout::blue == 200U &&

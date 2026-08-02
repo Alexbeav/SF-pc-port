@@ -5,6 +5,28 @@ pre-release tags rather than a stable semantic-versioning promise.
 
 ## Unreleased
 
+## 0.1.0-sf2-guest-alpha.10 - 2026-08-02
+
+### SF2 campaign playtest candidate
+
+- Corrected SF2 briefing parsing and placement to use the sequel's forward
+  location/title/date/operative/directive record order.
+- Prevented enhanced vertical mouse look from overriding retail-owned cameras
+  during in-engine cinematics; control resumes when the player regains camera
+  ownership.
+- Set the default third-person mouse yaw sensitivity to 0.75 while retaining
+  separate command-line overrides for aim and chase axes.
+- Extended the native-wide projection playtest through Missions 1-7, including
+  Mission 5 choreography, Mission 6 NVG gameplay and Mission 7 train flow.
+- Kept full-width cinematic mattes and the complete 21-test Release gate; the
+  mission-failure matte's 4:3 transition animation remains a minor follow-up.
+
+### Release artifact
+
+- File: `SyphonFilterPC-0.1.0-sf2-guest-alpha.10-win64.zip`
+- Checksum: supplied in the accompanying `.zip.sha256` file.
+- Required discs: *Syphon Filter 2* USA Disc 1/Disc 2, BIN/CUE.
+
 ## 0.1.0-sf2-guest-alpha.9 - 2026-08-02
 
 ### SF2 controls, campaign and widescreen
