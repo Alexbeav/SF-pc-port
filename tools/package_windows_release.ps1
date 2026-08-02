@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.8",
+    [string]$Version = "0.1.0-sf2-guest-alpha.9",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -163,8 +163,9 @@ AUDIO / CUTSCENE STATUS
   Homan/truck departure and silenced-rifle patrols appear and animate. Guard
   detection can still fail to trigger the authored mission failure, and
   hostile fire was observed without effects audio or player damage.
-- Mission 1 has one reported late crash after detonating the C4 and passing
-  through the cleared tunnel; the opening and earlier gameplay remain valid.
+- Mission 1 now completes beyond the former post-C4 blocking-CD stop. Dying by
+  falling during its playable parachute opening still restarts at an invalid
+  boundary state instead of replaying the complete in-engine parachute intro.
 
 - All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
@@ -174,6 +175,9 @@ AUDIO / CUTSCENE STATUS
   checkpoint restart and in-session F5/F9 quick states are functional.
 - The retail HUD, text, weapon artwork, radar actors/threat cones and
   widescreen in-engine cinematic bars render through the guest GPU bridge.
+- Native-wide guest projection keeps world geometry, backgrounds and NPCs
+  visible across the wider viewport. Missions 1-4 pass interactive coverage;
+  Missions 5-21 still need the same widescreen regression pass.
 - P opens and closes the retail pause/map screen without replacing the live
   mission, and cross-mission startup no longer retains its full-screen grid.
 - Connected campaign progression, SF2 inventory/vitals carry, save handoff,
@@ -189,9 +193,11 @@ AUDIO / CUTSCENE STATUS
 - The remaining AIRBASEX movie transition needs broader interactive coverage.
 - Quick states are in-session only and do not persist after process exit.
 
-Controls use the existing PC bindings. Mouse aiming works in first person;
-A/D strafe and C crouches. Mouse wheel and bracket keys select previous/next
-weapons, middle click advances once, and number keys select owned weapon slots.
+Controls use the existing PC bindings. Native relative-mouse control works on
+both axes in first-person aim and the enhanced third-person chase camera; each
+mode's yaw/pitch sensitivity has a separate command-line option. A/D strafe
+and C crouches. Mouse wheel and bracket keys select previous/next weapons,
+middle click advances once, and number keys select owned weapon slots.
 
 BUG REPORTS
 ===========
@@ -242,12 +248,18 @@ can be launched directly, the complete deterministic validation matrix passes,
 and connected campaign/save/movie handoffs are implemented. This remains a
 playtesting build rather than a finished PC port.
 
-Mission 1's opening, Mission 3 dialogue, post-checkpoint audio and Mission 7
-music pass interactive checks. Mission 5/AIRBASEX now loads the authored
+Mission 1's opening and complete post-C4 route, Mission 3 dialogue,
+post-checkpoint audio and Mission 7 music pass interactive checks. Mission
+5/AIRBASEX now loads the authored
 nested NPC resources and its opening population/choreography passes an
 interactive check. Its detection/failure, enemy damage/effects-audio behavior
-and natural mid-mission movie still need playtest coverage. Mission 1 has one
-reported post-C4 late-level guest-runtime crash under investigation.
+and natural mid-mission movie still need playtest coverage. A Mission 1 death
+during the playable parachute opening still restores an invalid boundary state
+instead of replaying the complete in-engine parachute intro.
+
+Native relative-mouse aim/chase control and native-wide guest projection are
+included. Missions 1-4 pass interactive widescreen coverage; Missions 5-21
+still need the same regression pass.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.

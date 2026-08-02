@@ -103,7 +103,7 @@ void printUsage() {
          "[instruction-budget]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> [frames] "
          "[neutral|forward|combat|crouch|quickstate|quickobjective|"
-         "crouchback|objective|objective-dialogue|weapons|pause|complete|completeflow|movies|ui|uiobjective] "
+         "crouchback|objective|objective-dialogue|weapons|h11scope|sniperscope|pause|complete|completeflow|movies|ui|uiobjective] "
          "[resource-index-0-based] [scripted-movie-ordinal-0-based]\n"
       << "  sf_tool probe-sf2-product-runtime <game.cue> <maximum-frames> "
          "replay <resource-index-0-based> <input.sf2pad>\n"
@@ -7027,14 +7027,14 @@ int probeSf2AirbaseExteriorMovie(const char *cue_path,
     std::cerr << std::dec;
   }
   std::cerr << '\n';
-  std::cerr << "SF2 AIRBASEX retail New Game state: value="
+  std::cerr << "SF2 AIRBASEX Hard-difficulty state: value="
             << static_cast<unsigned int>(
-                   writer_diagnostics.airbasex_new_game_state)
+                   writer_diagnostics.airbasex_hard_difficulty)
             << " reads="
-            << writer_diagnostics.airbasex_new_game_state_reads << '\n';
-  if (writer_diagnostics.airbasex_new_game_state_reads == 0U ||
-      writer_diagnostics.airbasex_new_game_state != 1U) {
-    std::cerr << "SF2 AIRBASEX did not consume the retail New Game state\n";
+            << writer_diagnostics.airbasex_hard_difficulty_reads << '\n';
+  if (writer_diagnostics.airbasex_hard_difficulty_reads == 0U ||
+      writer_diagnostics.airbasex_hard_difficulty != 0U) {
+    std::cerr << "SF2 AIRBASEX did not retain Normal difficulty\n";
     return 10;
   }
   std::cerr << "SF2 AIRBASEX source-123 motion updates:";
@@ -7480,6 +7480,7 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
                            bool retail_completion_flow,
                            bool airbasex_route,
                            bool compact_movie_trace,
+                           std::optional<std::uint8_t> scope_probe_item,
                            std::uint32_t mission_index,
                            std::uint32_t scripted_movie_ordinal,
                            const std::optional<std::filesystem::path>
@@ -7535,6 +7536,25 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     std::cerr << "SF2 product runtime failed: " << runtime.faultDetail()
               << '\n';
     return 7;
+  }
+  if (scope_probe_item) {
+    sf::game::CampaignCarryState carry;
+    carry.current_weapon = 0U;
+    carry.owned_weapons = 1U;
+    carry.health = 150U;
+    carry.sequel = sf::game::SequelCampaignCarryState{};
+    carry.sequel->current_item = *scope_probe_item;
+    carry.sequel->owned_items[static_cast<std::size_t>(*scope_probe_item) /
+                              32U] |=
+        std::uint32_t{1U}
+        << (static_cast<std::size_t>(*scope_probe_item) % 32U);
+    carry.sequel->magazines[*scope_probe_item] = 10U;
+    carry.sequel->reserves[*scope_probe_item] = 30U;
+    if (!runtime.applyCampaignCarryState(carry)) {
+      std::cerr << "SF2 scope probe could not equip retail item "
+                << static_cast<unsigned int>(*scope_probe_item) << '\n';
+      return 10;
+    }
   }
   sf::game::LegacyHostPadState pad;
   pad.buttons = forward ? 0x0010U
@@ -7630,6 +7650,12 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       dialogue_state_transitions;
   dialogue_state_transitions.emplace_back(0U, last_dialogue_word);
   auto maximum_sprite_commands = std::size_t{};
+  auto maximum_scope_sprite_commands = std::size_t{};
+  auto scope_aim_frames = std::uint32_t{};
+  auto last_scope_sprite_commands = std::numeric_limits<std::size_t>::max();
+  std::vector<std::pair<std::uint32_t, std::size_t>>
+      scope_sprite_transitions;
+  std::map<std::uint32_t, std::array<std::size_t, 4U>> scope_roots;
   auto maximum_active_spu_voices = std::size_t{};
   auto minimum_player_health = std::numeric_limits<std::uint16_t>::max();
   auto first_xa_frame = std::uint32_t{};
@@ -7746,7 +7772,28 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
           {4'900.0, 3'000.0},
           {4'400.0, 3'076.0},
       }};
+  auto probe_chase_pitch = false;
+  auto probe_manual_aim = false;
+#if defined(_WIN32)
+  std::size_t probe_chase_pitch_size{};
+  static_cast<void>(getenv_s(&probe_chase_pitch_size, nullptr, 0U,
+                             "SF2_PROBE_CHASE_PITCH"));
+  probe_chase_pitch = probe_chase_pitch_size != 0U;
+  std::size_t probe_manual_aim_size{};
+  static_cast<void>(getenv_s(&probe_manual_aim_size, nullptr, 0U,
+                             "SF2_PROBE_MANUAL_AIM"));
+  probe_manual_aim = probe_manual_aim_size != 0U;
+#else
+  probe_chase_pitch = std::getenv("SF2_PROBE_CHASE_PITCH") != nullptr;
+  probe_manual_aim = std::getenv("SF2_PROBE_MANUAL_AIM") != nullptr;
+#endif
   for (std::uint32_t frame = 0U; frame < frames; ++frame) {
+    if (probe_chase_pitch) {
+      runtime.setPcChaseCameraPitchInput(8, true);
+    }
+    if (probe_manual_aim) {
+      runtime.setPcManualAimInput(16, 8, true);
+    }
     if (expected_scripted_movie_catalog_index &&
         frame == scripted_movie_probe_frame) {
       scripted_movie_probe_requested =
@@ -7884,6 +7931,14 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       if ((frame % 420U) < 4U) {
         pad.buttons = static_cast<std::uint16_t>(pad.buttons | 0x0001U);
       }
+    }
+    if (scope_probe_item && frame >= 1'000U) {
+      sf::game::PlayerInput input;
+      input.aim = true;
+      input.aim_sight_yaw = ((frame / 60U) & 1U) == 0U ? 0.35 : -0.35;
+      input.aim_sight_pitch = ((frame / 90U) & 1U) == 0U ? 0.2 : -0.2;
+      pad = sf::game::legacyPadStateFromPlayerInput(input);
+      ++scope_aim_frames;
     }
     if (objective_event && frame >= 800U) {
       if (!runtime.setPlayerHealthForProbe(1000U)) {
@@ -8384,6 +8439,58 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     maximum_sprite_commands =
         std::max(maximum_sprite_commands,
                  static_cast<std::size_t>(sprite_commands));
+    if (scope_probe_item && frame >= 1'000U &&
+        frame_diagnostics.player_equipped_item == *scope_probe_item) {
+      maximum_scope_sprite_commands =
+          std::max(maximum_scope_sprite_commands,
+                   static_cast<std::size_t>(sprite_commands));
+      if (static_cast<std::size_t>(sprite_commands) !=
+          last_scope_sprite_commands) {
+        last_scope_sprite_commands = static_cast<std::size_t>(sprite_commands);
+        if (scope_sprite_transitions.size() < 64U) {
+          scope_sprite_transitions.emplace_back(frame + 1U,
+                                                last_scope_sprite_commands);
+        }
+      }
+      auto segment_begin = std::size_t{};
+      for (auto segment = std::size_t{};
+           segment < published->submission_packet_ends.size(); ++segment) {
+        const auto segment_end = published->submission_packet_ends[segment];
+        auto segment_sprites = std::size_t{};
+        auto segment_tiles = std::size_t{};
+        auto segment_textured = std::size_t{};
+        auto segment_lines = std::size_t{};
+        for (auto packet_index = segment_begin;
+             packet_index < segment_end; ++packet_index) {
+          const auto &packet = published->packets[packet_index];
+          if (packet.gp0_words.empty()) {
+            continue;
+          }
+          const auto opcode = static_cast<std::uint8_t>(
+              packet.gp0_words.front() >> 24U);
+          const auto base = static_cast<std::uint8_t>(opcode & 0xfcU);
+          if (base == 0x64U || base == 0x74U || base == 0x7cU) {
+            ++segment_sprites;
+          } else if (base == 0x60U || base == 0x68U ||
+                     base == 0x70U || base == 0x78U) {
+            ++segment_tiles;
+          } else if (base == 0x24U || base == 0x2cU ||
+                     base == 0x34U || base == 0x3cU) {
+            ++segment_textured;
+          } else if (base == 0x40U || base == 0x50U) {
+            ++segment_lines;
+          }
+        }
+        if (segment < published->submission_roots.size()) {
+          auto &maximum = scope_roots[published->submission_roots[segment]];
+          maximum[0U] = std::max(maximum[0U], segment_sprites);
+          maximum[1U] = std::max(maximum[1U], segment_tiles);
+          maximum[2U] = std::max(maximum[2U], segment_textured);
+          maximum[3U] = std::max(maximum[3U], segment_lines);
+        }
+        segment_begin = segment_end;
+      }
+    }
     if (first_sprite_frame == 0U && sprite_commands != 0) {
       first_sprite_frame = frame + 1U;
     }
@@ -8667,7 +8774,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       std::cout << " [" << serial << "/"
                 << static_cast<unsigned int>(event.kind) << "@"
                 << event.guest_frame << "/" << event.system_clock << ":0x"
-                << std::hex << std::uppercase << event.arguments[0U] << "/"
+                << std::hex << std::uppercase << event.return_address << ":0x"
+                << event.arguments[0U] << "/"
                 << event.arguments[1U] << "/" << event.arguments[2U] << "/"
                 << event.arguments[3U] << std::dec << ":";
       for (const auto character : event.text) {
@@ -8699,6 +8807,8 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
       : objective_event
           ? "objective"
       : airbasex_route ? "airbasex"
+      : scope_probe_item && *scope_probe_item == 13U ? "h11scope"
+      : scope_probe_item ? "sniperscope"
       : combat       ? "combat"
       : forward      ? "forward"
       : crouch       ? "crouch"
@@ -8726,6 +8836,14 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << " pcm=" << pcm_frames
             << ":" << nonzero_pcm_frames << "/" << peak_pcm_sample
             << " pad-samples=" << runtime.inputSampleCount()
+            << (scope_probe_item
+                    ? ":scope=" +
+                          std::to_string(static_cast<unsigned int>(
+                              *scope_probe_item)) +
+                          "/aim=" + std::to_string(scope_aim_frames) +
+                          "/sprites=" +
+                          std::to_string(maximum_scope_sprite_commands)
+                    : std::string{})
             << " pad-caller=0x" << std::hex << std::uppercase
             << diagnostics.last_pad_caller << std::dec
             << " pad-index=" << diagnostics.last_pad_index
@@ -8755,7 +8873,14 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.player_x << "/" << diagnostics.player_y << "/"
             << diagnostics.player_z << ":forward="
             << diagnostics.player_forward_x << "/"
-            << diagnostics.player_forward_z << ":radar="
+            << diagnostics.player_forward_z << ":chase-pitch="
+            << diagnostics.pc_chase_pitch_hook_calls << "/0x" << std::hex
+            << diagnostics.pc_chase_camera_base << std::dec << "/"
+            << diagnostics.pc_chase_desired_pitch << "/"
+            << diagnostics.pc_chase_rendered_pitch << ":manual-aim="
+            << diagnostics.pc_manual_aim_hook_calls << "/"
+            << diagnostics.pc_manual_aim_yaw_command << "/"
+            << diagnostics.pc_manual_aim_pitch_command << ":radar="
             << static_cast<unsigned int>(diagnostics.radar_actor_count) << "/"
             << static_cast<unsigned int>(maximum_radar_actor_count)
             << ":actors=" << diagnostics.actor_instance_count << "/"
@@ -8827,6 +8952,18 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << " weapon-cycle=";
   for (const auto &[frame, item] : equipped_item_transitions) {
     std::cout << frame << ":" << item << "/";
+  }
+  if (scope_probe_item) {
+    std::cout << " scope-roots=";
+    for (const auto &[root, maximum] : scope_roots) {
+      std::cout << "0x" << std::hex << std::uppercase << root << std::dec
+                << ":" << maximum[0U] << "/" << maximum[1U] << "/"
+                << maximum[2U] << "/" << maximum[3U] << ",";
+    }
+    std::cout << " scope-sprites=";
+    for (const auto &[frame, count] : scope_sprite_transitions) {
+      std::cout << frame << ":" << count << "/";
+    }
   }
   std::cout << " shotgun-stress=" << shotgun_observed << "/"
             << shotgun_stress_frames << " room-fallbacks="
@@ -9086,10 +9223,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.script_program_dispatches << "/"
             << diagnostics.script_activations << "/0x" << std::hex
             << diagnostics.last_script_activation_program << std::dec
-            << "/newgame="
-            << diagnostics.airbasex_new_game_state_reads << ":"
+            << "/hard="
+            << diagnostics.airbasex_hard_difficulty_reads << ":"
             << static_cast<unsigned int>(
-                   diagnostics.airbasex_new_game_state)
+                   diagnostics.airbasex_hard_difficulty)
             << "/timers="
             << static_cast<unsigned int>(
                    diagnostics.active_script_timer_count) << ":";
@@ -9347,10 +9484,10 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
     return 10;
   }
   if (mission_index == 4U &&
-      (diagnostics.airbasex_new_game_state_reads == 0U ||
-       diagnostics.airbasex_new_game_state != 1U)) {
-    std::cerr << "SF2 AIRBASEX startup gate failed: retail New Game state "
-                 "was not consumed as 1\n";
+      (diagnostics.airbasex_hard_difficulty_reads == 0U ||
+       diagnostics.airbasex_hard_difficulty != 0U)) {
+    std::cerr << "SF2 AIRBASEX startup gate failed: Hard-difficulty state "
+                 "was not consumed as Normal (0)\n";
     return 10;
   }
   // The connected completion probe deliberately resumes TITLE after retail
@@ -13882,6 +14019,7 @@ int main(int argc, char **argv) {
           mode != "movies" &&
           mode != "airbasex" &&
           mode != "replay" &&
+          mode != "h11scope" && mode != "sniperscope" &&
           mode != "ui" &&
           mode != "uiobjective" &&
           mode != "quickstate" && mode != "quickobjective") {
@@ -13902,6 +14040,11 @@ int main(int argc, char **argv) {
           mode == "completeflow",
           mode == "airbasex",
           mode == "movies",
+          mode == "h11scope"
+              ? std::optional<std::uint8_t>{std::uint8_t{13U}}
+              : mode == "sniperscope"
+                    ? std::optional<std::uint8_t>{std::uint8_t{14U}}
+                    : std::nullopt,
           argc >= 6 ? parseSf2MissionIndex(argv[5]) : 2U,
           argc == 7 && mode == "movies" ? parseSf2MovieOrdinal(argv[6]) : 0U,
           argc == 7 && mode == "replay"

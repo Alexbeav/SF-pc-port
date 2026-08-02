@@ -1023,6 +1023,14 @@ void testGteGameplayMath() {
               sf::psx::GteRuntime::readControl(state, 31U) == 0U,
           "GTE RTPS result mismatch");
 
+  state.horizontal_projection_scale = 0xc000U;
+  require(sf::psx::GteRuntime::executeCommand(state, 0x4a180001U) &&
+              sf::psx::GteRuntime::readData(state, 14U) == 0xfffa0007U &&
+              sf::psx::GteRuntime::readData(state, 25U) == 100U &&
+              sf::psx::GteRuntime::readData(state, 26U) == 0xffffffceU,
+          "GTE native-wide horizontal projection changed Y or lost its "
+          "Q16 X scale");
+
   sf::psx::GteRuntime::writeData(state, 12U, 0U);
   sf::psx::GteRuntime::writeData(state, 13U, 1U);
   sf::psx::GteRuntime::writeData(state, 14U, 1U << 16U);

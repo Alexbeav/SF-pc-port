@@ -450,6 +450,17 @@ void testSf2PresentationFrameCapture() {
   require(mouse.x() == 384 && mouse.y() == -384,
           "SF2 sampled mouse motion escaped its bounded range");
 
+  require(sf::game::sf2FacingAngle(0, 1) ==
+              std::optional<std::uint16_t>{std::uint16_t{0U}} &&
+              sf::game::sf2FacingAngle(1, 0) ==
+                  std::optional<std::uint16_t>{std::uint16_t{0x400U}} &&
+              sf::game::sf2FacingAngle(0, -1) ==
+                  std::optional<std::uint16_t>{std::uint16_t{0x800U}} &&
+              sf::game::sf2FacingAngle(-1, 0) ==
+                  std::optional<std::uint16_t>{std::uint16_t{0xc00U}} &&
+              !sf::game::sf2FacingAngle(0, 0),
+          "SF2 target-facing conversion lost retail turn orientation");
+
   sf::game::Sf2WeaponSelectPulseQueue weapon_select{20U};
   weapon_select.enqueue(2U);
   require(weapon_select.update(20U) && weapon_select.pending() == 1U &&
@@ -488,6 +499,11 @@ void testSf2PresentationFrameCapture() {
   require(current_slot && *current_slot == 0U &&
               sf::game::sf2WeaponCyclePulseCount(weapon_cycle, -1) == 3U,
           "SF2 direct/current or previous selection pulse count mismatch");
+  weapon_cycle.player_owned_items[0U] |= (1U << 13U) | (1U << 17U);
+  weapon_cycle.player_equipped_item = 13U;
+  require(sf::game::sf2WeaponCyclePulseCount(weapon_cycle, 1) == 1U &&
+              sf::game::sf2WeaponCyclePulseCount(weapon_cycle, -1) == 5U,
+          "SF2 H11/crossbow escaped the retail selectable-item ring");
   weapon_cycle.player_owned_items = {};
   require(sf::game::sf2WeaponCyclePulseCount(weapon_cycle, 1) == 0U &&
               !sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 0U),

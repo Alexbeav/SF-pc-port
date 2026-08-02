@@ -151,6 +151,7 @@ struct Sf2GuestUiTextEvent {
   Sf2GuestUiTextEventKind kind{};
   std::uint64_t guest_frame{};
   std::uint32_t system_clock{};
+  std::uint32_t return_address{};
   // Create records carry template/text/width/style. Update and remove retain
   // the retail generation-tagged handle in argument zero.
   std::array<std::uint32_t, 4U> arguments{};
@@ -286,6 +287,13 @@ struct Sf2GuestRuntimeDiagnostics {
   std::int32_t player_z{};
   std::int16_t player_forward_x{};
   std::int16_t player_forward_z{4096};
+  std::uint64_t pc_chase_pitch_hook_calls{};
+  std::uint32_t pc_chase_camera_base{};
+  std::int32_t pc_chase_desired_pitch{};
+  std::int32_t pc_chase_rendered_pitch{};
+  std::uint64_t pc_manual_aim_hook_calls{};
+  std::int32_t pc_manual_aim_yaw_command{};
+  std::int32_t pc_manual_aim_pitch_command{};
   std::array<Sf2GuestRadarActor, 16U> radar_actors{};
   std::uint8_t radar_actor_count{};
   std::uint32_t object_record_count{};
@@ -485,8 +493,8 @@ struct Sf2GuestRuntimeDiagnostics {
   std::array<std::uint32_t, 2U> script_level_name_words{};
   std::array<std::uint32_t, 2U> script_lookup_name_words{};
   std::uint64_t script_level_starts{};
-  std::uint64_t airbasex_new_game_state_reads{};
-  std::uint8_t airbasex_new_game_state{};
+  std::uint64_t airbasex_hard_difficulty_reads{};
+  std::uint8_t airbasex_hard_difficulty{};
   std::uint64_t script_dispatches{};
   std::uint64_t script_event5_dispatches{};
   std::array<std::uint32_t, 2U> last_script_dispatch_arguments{};
@@ -753,6 +761,23 @@ public:
   [[nodiscard]] bool exerciseRawCdSyncWaitForProbe() noexcept;
   [[nodiscard]] bool
   setPlayerHealthForProbe(std::uint16_t health) noexcept;
+  // PC-control enhancement used only on the edge into manual aim. The
+  // authored target bearing is applied at the retail camera-angle boundary.
+  [[nodiscard]] bool alignPlayerAimToLockedTarget() noexcept;
+  // Supplies raw relative mouse motion directly to the sequel's manual-aim
+  // angle accumulator. This bypasses the original 20 Hz analog acceleration
+  // while leaving physical controller input on the retail path.
+  void setPcManualAimInput(std::int32_t yaw_delta,
+                           std::int32_t pitch_delta,
+                           bool enabled) noexcept;
+  // Supplies aftermarket third-person mouse pitch to the sequel camera hook.
+  // Delta is accumulated until the player's authored chase-camera update.
+  void setPcChaseCameraPitchInput(std::int32_t delta,
+                                  bool enabled) noexcept;
+  // Native-wide presentation moves the horizontal FOV expansion into the
+  // guest GTE. This lets retail's own visibility/render paths observe the
+  // wider cone instead of discovering geometry only after host rasterization.
+  void setPcHorizontalProjectionScale(std::uint32_t scale_q16) noexcept;
   [[nodiscard]] bool setObjectRecordHealthForProbe(
       std::uint16_t source_index, std::int16_t health) noexcept;
   [[nodiscard]] std::optional<Sf2GuestObjectProbeState>
@@ -805,6 +830,10 @@ private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// SF2 transform turn: 0 = +Z, 0x400 = +X, 0x800 = -Z.
+[[nodiscard]] std::optional<std::uint16_t>
+sf2FacingAngle(std::int64_t delta_x, std::int64_t delta_z) noexcept;
 
 [[nodiscard]] constexpr Sf2GuestRuntimeProfile
 sf2UsaGuestRuntimeProfile() noexcept {

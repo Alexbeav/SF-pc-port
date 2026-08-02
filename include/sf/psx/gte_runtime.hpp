@@ -8,6 +8,11 @@ namespace sf::psx {
 struct GteState {
     std::array<std::uint32_t, 32> data{};
     std::array<std::uint32_t, 32> control{};
+    // PC presentation extension.  0x10000 is retail-exact; values below it
+    // widen the horizontal camera cone by compressing only the projected X
+    // component around OFX.  Y and every non-projection GTE operation remain
+    // bit-exact.
+    std::uint32_t horizontal_projection_scale{0x10000U};
 };
 
 // Integer Geometry Transformation Engine state used by original gameplay math.

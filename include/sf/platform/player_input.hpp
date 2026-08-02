@@ -185,6 +185,15 @@ inline constexpr auto keyboard_mouse_action_count =
 
 struct KeyboardMouseBindings {
   std::array<KeyboardMouseInput, keyboard_mouse_action_count> values{};
+  // Runtime multipliers for relative mouse motion. These remain independent
+  // so wide/fast horizontal aim does not force an equally aggressive pitch.
+  // First-person/manual-aim relative mouse multipliers.
+  double mouse_yaw_sensitivity{2.0};
+  double mouse_pitch_sensitivity{1.0};
+  // Third-person chase-camera multipliers are independent because authored
+  // body turning and direct camera pitch have very different native scales.
+  double mouse_chase_yaw_sensitivity{6.0};
+  double mouse_chase_pitch_sensitivity{1.25};
 
   [[nodiscard]] KeyboardMouseInput
   operator[](KeyboardMouseAction action) const noexcept {

@@ -13181,7 +13181,8 @@ void PsyCrossCampaignSaveRenderer::drawLoadSlots(
 namespace {
 
 void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
-                        unsigned int texture_bank) {
+                        unsigned int texture_bank,
+                        bool native_wide_world) {
   const auto kind = game::sf2GpuCommandKind(packet);
   if (kind == game::Sf2GpuCommandKind::upload_vram) {
     const auto transfer = game::sf2GpuTransfer(packet);
@@ -13305,8 +13306,19 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
     // Ordering-table coordinates precede the retail GP0 E5 draw offset. The
     // same frame replays that packet below, so adding a host centre here
     // applies the offset twice and shifts half the scene out of view.
-    const auto x = [&words](std::size_t index) {
-      return static_cast<float>(packedScreenX(words[index]));
+    const auto world_presentation_scale = native_wide_world
+        ? std::max(PsyX_CalculatePresentationScale(
+                       g_windowWidth, g_windowHeight, g_cfg_aspectMode)
+                       .x,
+                   0.01F)
+        : 1.0F;
+    const auto x = [&words, world_presentation_scale](std::size_t index) {
+      // PsyCross applies its centred-4:3 squeeze after primitive decoding.
+      // Counter it for the world OT: SF2's GTE has already compressed X for
+      // the wider cone, while fixed SCRIM coordinates must cover the complete
+      // output rather than becoming a finite 4:3 island.
+      return static_cast<float>(packedScreenX(words[index])) /
+             world_presentation_scale;
     };
     const auto y = [&words](std::size_t index) {
       return static_cast<float>(packedScreenY(words[index]));
@@ -13459,42 +13471,12 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       if (polygon_span_rejected({1U, 2U, 3U, 4U})) {
         return;
       }
-      const auto minimum_x = std::min({packedScreenX(words[1U]),
-                                       packedScreenX(words[2U]),
-                                       packedScreenX(words[3U]),
-                                       packedScreenX(words[4U])});
-      const auto maximum_x = std::max({packedScreenX(words[1U]),
-                                       packedScreenX(words[2U]),
-                                       packedScreenX(words[3U]),
-                                       packedScreenX(words[4U])});
-      const auto minimum_y = std::min({packedScreenY(words[1U]),
-                                       packedScreenY(words[2U]),
-                                       packedScreenY(words[3U]),
-                                       packedScreenY(words[4U])});
-      const auto maximum_y = std::max({packedScreenY(words[1U]),
-                                       packedScreenY(words[2U]),
-                                       packedScreenY(words[3U]),
-                                       packedScreenY(words[4U])});
-      const auto full_width_black_overlay =
-          (words[0U] & 0x00ffffffU) == 0U &&
-          minimum_x == -screen_width / 2 &&
-          maximum_x == screen_width / 2 &&
-          (minimum_y == -screen_height / 2 ||
-           maximum_y == screen_height / 2);
-      auto horizontal_scale = 1.0F;
-      if (full_width_black_overlay) {
-        const auto presentation_scale = PsyX_CalculatePresentationScale(
-            g_windowWidth, g_windowHeight, g_cfg_aspectMode);
-        horizontal_scale = std::max(presentation_scale.x, 0.01F);
-      }
       POLY_F4 primitive{};
       setPolyF4(&primitive);
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
-      setXY4(&primitive, x(1U) / horizontal_scale, y(1U),
-             x(2U) / horizontal_scale, y(2U),
-             x(3U) / horizontal_scale, y(3U),
-             x(4U) / horizontal_scale, y(4U));
+      setXY4(&primitive, x(1U), y(1U), x(2U), y(2U), x(3U), y(3U),
+             x(4U), y(4U));
       DrawPrim(&primitive);
       return;
     }
@@ -13544,6 +13526,21 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
       setXY2(&primitive, x(1U), y(1U), x(2U), y(2U));
+      DrawPrim(&primitive);
+      return;
+    }
+    if (base_opcode == 0x50U && words.size() == 4U) {
+      if (has_disabled_vertex({1U, 3U})) {
+        return;
+      }
+      LINE_G2 primitive{};
+      setLineG2(&primitive);
+      primitive.code = opcode;
+      setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      setXY0(&primitive, x(1U), y(1U));
+      setPacketColor(words[2U], primitive.r1, primitive.g1, primitive.b1);
+      primitive.x1 = static_cast<short>(x(3U));
+      primitive.y1 = static_cast<short>(y(3U));
       DrawPrim(&primitive);
       return;
     }
@@ -13686,7 +13683,14 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
   GR_SetDepthState(0, 0);
   auto boundary = std::size_t{};
   for (auto index = std::size_t{}; index < frame.packets.size(); ++index) {
-    drawSf2GuestPacket(frame.packets[index], texture_bank);
+    // Gameplay's first submission is the authored world base. Its horizontal
+    // projection was widened in the guest GTE, so the generic PsyCross 4:3
+    // squeeze would apply that transform twice. Later submissions are retail
+    // HUD/radar/text and intentionally remain centred and unstretched.
+    const auto native_wide_world =
+        frame.application_state == 0U && boundary == 0U;
+    drawSf2GuestPacket(frame.packets[index], texture_bank,
+                       native_wide_world);
     if (boundary < frame.submission_packet_ends.size() &&
         index + 1U == frame.submission_packet_ends[boundary]) {
       DrawSync(0);
@@ -13978,10 +13982,25 @@ SceneViewerResult runSf2GuestScene(
     return SceneViewerResult{previous_buttons,
                              SceneExitReason::return_to_title};
   }
-  if (campaign_carry && !runtime.applyCampaignCarryState(*campaign_carry)) {
-    PsyX_Log_Error("SF2 campaign carry could not be applied to retail RAM\n");
-    return SceneViewerResult{previous_buttons,
-                             SceneExitReason::return_to_title};
+  const auto sf2_presentation_scale = PsyX_CalculatePresentationScale(
+      g_windowWidth, g_windowHeight, g_cfg_aspectMode);
+  const auto sf2_horizontal_scale_q16 = static_cast<std::uint32_t>(
+      std::clamp(std::lround(
+                     static_cast<double>(sf2_presentation_scale.x) *
+                     65536.0),
+                 1L, 65536L));
+  runtime.setPcHorizontalProjectionScale(sf2_horizontal_scale_q16);
+  PsyX_Log_Info("SF2 guest horizontal projection scale: %.4f (Q16=%u)\n",
+                sf2_presentation_scale.x, sf2_horizontal_scale_q16);
+  if (campaign_carry) {
+    // SF2 authors the playable character, health and loadout per mission.
+    // Applying the completed mission's live inventory to the next package
+    // armed Lian with Gabe's entire Mission 1 arsenal. Saves still retain the
+    // exact sequel block for compatibility/inspection, but a newly loaded
+    // mission starts from its retail package state.
+    PsyX_Log_Info(
+        "SF2 destination mission retained authored loadout; campaign carry "
+        "inventory was not injected\n");
   }
   // The guest VM owns draw commands but its emulated GPU intentionally drains
   // DMA without retaining a second framebuffer. Seed PsyCross with the same
@@ -14032,6 +14051,7 @@ SceneViewerResult runSf2GuestScene(
   auto previous_previous_weapon = false;
   auto previous_weapon_menu_previous = false;
   auto previous_weapon_menu_next = false;
+  auto previous_manual_aim = false;
   std::array<bool, quick_weapon_slot_count> previous_quick_weapon_keys{};
   game::Sf2WeaponSelectPulseQueue weapon_select{
       runtime.inputSampleCount()};
@@ -14521,6 +14541,32 @@ SceneViewerResult runSf2GuestScene(
       weapon_select.enqueue(count);
     };
     const auto weapon_state = runtime.diagnostics();
+    // Retail lock-on twists the upper body without changing the lower-body
+    // yaw copied into manual aim. Seed that transition once from the selected
+    // actor, then leave the mouse and retail controller fully authoritative.
+    if (raw.aim && !previous_manual_aim &&
+        weapon_state.player_target_active) {
+      static_cast<void>(runtime.alignPlayerAimToLockedTarget());
+    }
+    previous_manual_aim = raw.aim;
+    runtime.setPcManualAimInput(
+        static_cast<std::int32_t>(std::clamp(
+            std::llround(static_cast<double>(mouse_x) *
+                         input.mouse_yaw_sensitivity),
+            -512LL, 512LL)),
+        static_cast<std::int32_t>(std::clamp(
+            std::llround(static_cast<double>(mouse_y) *
+                         input.mouse_pitch_sensitivity),
+            -512LL, 512LL)),
+        raw.aim && weapon_state.application_state == 0U &&
+            weapon_state.player_health != 0U);
+    runtime.setPcChaseCameraPitchInput(
+        static_cast<std::int32_t>(std::clamp(
+            std::llround(static_cast<double>(mouse_y) *
+                         input.mouse_chase_pitch_sensitivity),
+            -96LL, 96LL)),
+        !raw.aim && weapon_state.application_state == 0U &&
+            weapon_state.player_health != 0U);
     auto direct_weapon_slot = std::optional<std::size_t>{};
     for (auto slot = std::size_t{}; slot < raw.quick_weapon_keys.size();
          ++slot) {
@@ -14572,27 +14618,41 @@ SceneViewerResult runSf2GuestScene(
     const auto pc_strafe =
         static_cast<double>(raw.strafe_right) -
         static_cast<double>(raw.strafe_left);
+    // Chase yaw remains on the authored locomotion path. Manual aim also gets
+    // the direct camera-angle feed above. Retain a reduced retail-axis signal
+    // as a compatibility fallback for weapon-specific aim controllers and
+    // keyboard/controller paths which do not visit the common angle hook.
+    constexpr double mouse_aim_yaw_counts_per_full_deflection = 48.0;
+    constexpr double mouse_aim_pitch_counts_per_full_deflection = 64.0;
+    constexpr double mouse_chase_yaw_counts_per_full_deflection = 72.0;
+    const auto aim_mouse_yaw = static_cast<double>(mouse_motion.x()) *
+                               input.mouse_yaw_sensitivity;
+    const auto chase_mouse_yaw = static_cast<double>(mouse_motion.x()) *
+                                 input.mouse_chase_yaw_sensitivity;
     auto guest_input = game::GameplayInput{
         .move = pc_move,
         .turn = std::clamp(
             pc_turn +
                 (raw.aim
                      ? 0.0
-                     : static_cast<double>(mouse_motion.x()) / 96.0),
+                     : chase_mouse_yaw /
+                           mouse_chase_yaw_counts_per_full_deflection),
             -1.0, 1.0),
         .run = !raw.run,
         .aim = raw.aim,
         .strafe = pc_strafe,
         .aim_sight_yaw =
             raw.aim
-                ? std::clamp(
-                      static_cast<double>(mouse_motion.x()) / 96.0,
-                      -1.0, 1.0)
+                ? std::clamp(aim_mouse_yaw /
+                                 mouse_aim_yaw_counts_per_full_deflection,
+                             -1.0, 1.0)
                 : 0.0,
         .aim_sight_pitch =
             raw.aim
                 ? std::clamp(
-                      static_cast<double>(mouse_motion.y()) / 96.0,
+                      (static_cast<double>(mouse_motion.y()) *
+                       input.mouse_pitch_sensitivity) /
+                          mouse_aim_pitch_counts_per_full_deflection,
                       -1.0, 1.0)
                 : 0.0,
         .fire_held = raw.fire,
@@ -15425,10 +15485,11 @@ SceneViewerResult runSf2GuestScene(
           const auto end = std::ranges::find(event.text, '\0');
           auto message = std::string{event.text.begin(), end};
           PsyX_Log_Info(
-              "SF2 UI text: serial=%llu guest=%llu template=%u text=\"%s\"\n",
+              "SF2 UI text: serial=%llu guest=%llu caller=0x%08X "
+              "template=%u text=\"%s\"\n",
               static_cast<unsigned long long>(serial),
               static_cast<unsigned long long>(event.guest_frame),
-              event.arguments[0U], message.c_str());
+              event.return_address, event.arguments[0U], message.c_str());
           last_ui_create_guest_frame =
               std::max(last_ui_create_guest_frame, event.guest_frame);
           ui_text_capture_pending =

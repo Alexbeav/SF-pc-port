@@ -5,6 +5,29 @@ pre-release tags rather than a stable semantic-versioning promise.
 
 ## Unreleased
 
+## 0.1.0-sf2-guest-alpha.9 - 2026-08-02
+
+### SF2 controls, campaign and widescreen
+
+- Added independent native mouse yaw/pitch control and sensitivity settings
+  for first-person aim and the enhanced third-person chase camera.
+- Widened SF2's guest GTE projection for the host aspect ratio so backgrounds,
+  world geometry, and NPCs remain present across the widescreen viewport.
+- Restored H11/crossbow selection and rendering of the H11's line-based optic.
+- Restored Normal difficulty for direct launches and prevented Gabe's health
+  and inventory from leaking into Lian during the Mission 1-to-2 handoff.
+- Serviced Mission 1's blocking post-C4 CD wait without replacing retail
+  mission logic.
+- Verified Missions 1-4 interactively with the new control and projection
+  paths; all 21 configured Release tests pass.
+- Documented the remaining Mission 1 parachute-death restart defect.
+
+### Release artifact
+
+- File: `SyphonFilterPC-0.1.0-sf2-guest-alpha.9-win64.zip`
+- Checksum: supplied in the accompanying `.zip.sha256` file.
+- Required discs: *Syphon Filter 2* USA Disc 1/Disc 2, BIN/CUE.
+
 ### SF2 cross-mission bring-up
 
 - Boot-validated all eight USA Disc 1 mission packages through the retail

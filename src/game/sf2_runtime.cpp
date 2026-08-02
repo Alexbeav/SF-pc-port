@@ -13,6 +13,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -21,6 +22,24 @@
 #include <string>
 
 namespace sf::game {
+
+std::optional<std::uint16_t>
+sf2FacingAngle(std::int64_t delta_x, std::int64_t delta_z) noexcept {
+  if (delta_x == 0 && delta_z == 0) {
+    return std::nullopt;
+  }
+  constexpr auto full_turn = 4096.0;
+  constexpr auto two_pi = 6.28318530717958647692;
+  auto angle = static_cast<std::int64_t>(std::llround(
+      std::atan2(static_cast<double>(delta_x),
+                 static_cast<double>(delta_z)) *
+      full_turn / two_pi));
+  angle %= 4096;
+  if (angle < 0) {
+    angle += 4096;
+  }
+  return static_cast<std::uint16_t>(angle);
+}
 
 Sf2GpuCommandKind
 sf2GpuCommandKind(const Sf2GpuPacket &packet) noexcept {
@@ -515,8 +534,14 @@ sf2SelectableItems(const Sf2GuestRuntimeDiagnostics &guest) noexcept {
     const auto owned =
         (guest.player_owned_items[item / 32U] &
          (std::uint32_t{1U} << (item % 32U))) != 0U;
-    if (!owned ||
-        !sf2WeaponForItem(static_cast<std::uint8_t>(item)).has_value()) {
+    // Selection is a retail inventory operation and must not depend on the
+    // optional projection into SF1's native WeaponId table. H11 (13) and the
+    // crossbow (17) have unique sequel presentation/controllers but are still
+    // ordinary selectable weapons in SF2's ascending owned-item ring.
+    const auto selectable_weapon =
+        sf2WeaponForItem(static_cast<std::uint8_t>(item)).has_value() ||
+        item == 13U || item == 17U;
+    if (!owned || !selectable_weapon) {
       continue;
     }
     result.items[result.count] = static_cast<std::uint8_t>(item);
@@ -912,6 +937,136 @@ public:
                                 controller) &&
            controller != 0U &&
            vm_.runtime().write16(controller + health_value_offset, health);
+  }
+  [[nodiscard]] bool alignPlayerAimToLockedTarget() noexcept {
+    // Retail's transition seeds manual aim from lower-body yaw. Preserve the
+    // selected actor bearing until 0x800539D0, where the completed retail
+    // camera angles are consumed; earlier transform/controller writes are
+    // overwritten during the transition itself.
+    constexpr std::uint32_t player_pointer = 0x8012a574U;
+    constexpr std::uint32_t application_state = 0x8011ee90U;
+    constexpr std::uint32_t object_records_pointer = 0x8011eef8U;
+    constexpr std::uint32_t object_count_address = 0x8011f564U;
+    constexpr std::uint32_t object_record_stride = 0x4cU;
+    constexpr std::uint32_t object_instance_offset = 0x34U;
+    constexpr std::uint32_t object_health_offset = 0x40U;
+    constexpr std::uint32_t instance_node_offset = 0x08U;
+    constexpr std::uint32_t instance_target_offset = 0x14U;
+    constexpr std::uint32_t target_slot_offset = 0U;
+    constexpr std::uint32_t node_matrix_offset = 0x0cU;
+    constexpr std::uint32_t matrix_translation_offset = 0x14U;
+    constexpr std::uint32_t maximum_objects = 1024U;
+
+    std::uint32_t state{};
+    std::uint32_t player{};
+    std::uint32_t player_node{};
+    std::uint32_t player_matrix{};
+    std::uint32_t target_controller{};
+    std::uint16_t target_slot_bits{};
+    std::uint32_t records{};
+    std::uint32_t count_bits{};
+    if (!ready_ || faulted_ ||
+        !vm_.runtime().read32(application_state, state) || state != 0U ||
+        !vm_.runtime().read32(player_pointer, player) || player == 0U ||
+        !vm_.runtime().read32(player + instance_node_offset, player_node) ||
+        player_node == 0U ||
+        !vm_.runtime().read32(player_node + node_matrix_offset,
+                              player_matrix) ||
+        player_matrix == 0U ||
+        !vm_.runtime().read32(player + instance_target_offset,
+                              target_controller) ||
+        target_controller == 0U ||
+        !vm_.runtime().read16(target_controller + target_slot_offset,
+                              target_slot_bits) ||
+        !vm_.runtime().read32(object_records_pointer, records) ||
+        records == 0U ||
+        !vm_.runtime().read32(object_count_address, count_bits)) {
+      return false;
+    }
+    const auto count = std::bit_cast<std::int32_t>(count_bits);
+    const auto target_slot = std::bit_cast<std::int16_t>(target_slot_bits);
+    if (count <= 0 || static_cast<std::uint32_t>(count) > maximum_objects ||
+        target_slot < 0 || target_slot >= count) {
+      return false;
+    }
+
+    const auto target_record =
+        records + static_cast<std::uint32_t>(target_slot) *
+                      object_record_stride;
+    std::uint16_t target_health_bits{};
+    std::uint32_t target_instance{};
+    std::uint32_t target_node{};
+    std::uint32_t target_matrix{};
+    std::uint32_t player_x_bits{};
+    std::uint32_t player_z_bits{};
+    std::uint32_t target_x_bits{};
+    std::uint32_t target_z_bits{};
+    if (!vm_.runtime().read16(target_record + object_health_offset,
+                              target_health_bits) ||
+        std::bit_cast<std::int16_t>(target_health_bits) <= 0 ||
+        !vm_.runtime().read32(target_record + object_instance_offset,
+                              target_instance) ||
+        target_instance == 0U || target_instance == player ||
+        !vm_.runtime().read32(target_instance + instance_node_offset,
+                              target_node) ||
+        target_node == 0U ||
+        !vm_.runtime().read32(target_node + node_matrix_offset,
+                              target_matrix) ||
+        target_matrix == 0U ||
+        !vm_.runtime().read32(player_matrix + matrix_translation_offset,
+                              player_x_bits) ||
+        !vm_.runtime().read32(player_matrix + matrix_translation_offset + 8U,
+                              player_z_bits) ||
+        !vm_.runtime().read32(target_matrix + matrix_translation_offset,
+                              target_x_bits) ||
+        !vm_.runtime().read32(target_matrix + matrix_translation_offset + 8U,
+                              target_z_bits)) {
+      return false;
+    }
+    const auto bearing = sf2FacingAngle(
+        static_cast<std::int64_t>(std::bit_cast<std::int32_t>(target_x_bits)) -
+            std::bit_cast<std::int32_t>(player_x_bits),
+        static_cast<std::int64_t>(std::bit_cast<std::int32_t>(target_z_bits)) -
+            std::bit_cast<std::int32_t>(player_z_bits));
+    if (!bearing) {
+      return false;
+    }
+    pc_manual_aim_snap_yaw_ = static_cast<std::int32_t>(*bearing);
+    return true;
+  }
+  void setPcManualAimInput(std::int32_t yaw_delta,
+                           std::int32_t pitch_delta,
+                           bool enabled) noexcept {
+    pc_manual_aim_enabled_ = enabled;
+    if (!enabled) {
+      pc_manual_aim_yaw_pending_ = 0;
+      pc_manual_aim_pitch_pending_ = 0;
+      pc_manual_aim_snap_yaw_.reset();
+      return;
+    }
+    pc_manual_aim_yaw_pending_ = std::clamp(
+        pc_manual_aim_yaw_pending_ + yaw_delta, -1024, 1024);
+    pc_manual_aim_pitch_pending_ = std::clamp(
+        pc_manual_aim_pitch_pending_ + pitch_delta, -1024, 1024);
+  }
+  void setPcChaseCameraPitchInput(std::int32_t delta,
+                                  bool enabled) noexcept {
+    pc_chase_pitch_enabled_ = enabled;
+    if (!enabled) {
+      pc_chase_pitch_pending_ = 0;
+      pc_chase_pitch_valid_ = false;
+      pc_chase_camera_base_ = 0U;
+      return;
+    }
+    pc_chase_pitch_pending_ = std::clamp<std::int32_t>(
+        pc_chase_pitch_pending_ + delta, -96, 96);
+  }
+
+  void setPcHorizontalProjectionScale(std::uint32_t scale_q16) noexcept {
+    // Do not permit a zero or magnifying projection through this surface.
+    // 4:3 is 1.0; wider outputs supply a smaller positive Q16 factor.
+    vm_.runtime().setGteHorizontalProjectionScale(
+        std::clamp(scale_q16, 1U, 0x10000U));
   }
   [[nodiscard]] bool setObjectRecordHealthForProbe(
       std::uint16_t source_index, std::int16_t health) noexcept {
@@ -1611,6 +1766,13 @@ public:
     result.global_pointer = state.gpr[28U];
     result.last_pad_caller = last_pad_caller_;
     result.last_pad_index = last_pad_index_;
+    result.pc_chase_pitch_hook_calls = pc_chase_pitch_hook_calls_;
+    result.pc_chase_camera_base = pc_chase_camera_base_;
+    result.pc_chase_desired_pitch = pc_chase_pitch_target_;
+    result.pc_chase_rendered_pitch = pc_chase_rendered_pitch_;
+    result.pc_manual_aim_hook_calls = pc_manual_aim_hook_calls_;
+    result.pc_manual_aim_yaw_command = pc_manual_aim_yaw_command_;
+    result.pc_manual_aim_pitch_command = pc_manual_aim_pitch_command_;
     readPlayerState(result.player_instance, result.player_x, result.player_y,
                     result.player_z, result.player_health,
                     result.player_armor);
@@ -2049,9 +2211,9 @@ public:
       }
     }
     result.script_level_starts = script_level_starts_;
-    result.airbasex_new_game_state_reads =
-        airbasex_new_game_state_reads_;
-    result.airbasex_new_game_state = airbasex_new_game_state_;
+    result.airbasex_hard_difficulty_reads =
+        airbasex_hard_difficulty_reads_;
+    result.airbasex_hard_difficulty = airbasex_hard_difficulty_;
     result.script_dispatches = script_dispatches_;
     result.script_event5_dispatches = script_event5_dispatches_;
     result.last_script_dispatch_arguments =
@@ -3954,6 +4116,20 @@ private:
     vm_.machine().setCdRomMedia(&cdrom_media_);
     vm_.bindPsxBiosCoreVector(true);
     installExceptionBridge();
+    // Exact instruction-aligned counterpart of SF1's proven 0x80037B08
+    // mouse camera/facing boundary. Unlike the structurally similar
+    // 0x80049940 routine, this path is live in ordinary player gameplay.
+    vm_.bindHostCall(
+        0x80053464U, [this](LegacyHostCallContext &context) {
+          applyPcChaseCameraPitch();
+          applyPcManualAimVector(context);
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x800539d0U, [this](LegacyHostCallContext &context) {
+          applyPcManualAim(context);
+          context.continueGuestInstruction();
+        });
     vm_.bindHostCall(
         0x801669ccU, [this](LegacyHostCallContext &context) {
           constexpr std::uint32_t source123_physics = 0x801a70a4U;
@@ -4587,13 +4763,10 @@ private:
         });
     vm_.bindHostCall(
         0x800b3d34U, [this](LegacyHostCallContext &context) {
-          if (script_level_starts_ == 0U) {
-            // The retail TITLE New Game callback sets this state byte
-            // immediately before the mission loader starts LEVEL.
-            // Direct --mission construction bypasses that callback, and the
-            // loader clears any earlier host-side seed during initialization.
-            static_cast<void>(context.write8(0x8011f638U, 1U));
-          }
+          // 0x8011f638 is the retail Hard-difficulty predicate, not a New Game
+          // latch. The direct bootstrap already inherits TITLE's Normal
+          // default; writing one here silently selected Hard mission branches
+          // (including Falkan's shortened helicopter escape).
           ++script_level_starts_;
           context.continueGuestInstruction();
         });
@@ -4630,7 +4803,7 @@ private:
         0x800aff4cU, // action 0x79: NPC resource lifecycle
         0x800b03bcU, // predicate 0x04: program variable equals
         0x800b07a4U, // predicate 0x16: object node flag
-        0x800b0a14U, // predicate 0x1e: retail New Game state
+        0x800b0a14U, // predicate 0x1e: Hard difficulty
         0x800b0c30U, // action 0x06: clear scripted inactive bit
         0x800b0e20U, // action 0x42: actor activation/state
         0x800b1030U, // action 0x13: actor relationship
@@ -4644,9 +4817,9 @@ private:
           handler, [this, handler](LegacyHostCallContext &context) {
             if (mission_index_ == 4U) {
               if (handler == 0x800b0a14U) {
-                ++airbasex_new_game_state_reads_;
+                ++airbasex_hard_difficulty_reads_;
                 static_cast<void>(context.read8(
-                    0x8011f638U, airbasex_new_game_state_));
+                    0x8011f638U, airbasex_hard_difficulty_));
               }
               auto &event = script_handler_events_[
                   script_handler_event_count_ %
@@ -5250,6 +5423,119 @@ private:
                      [](LegacyHostCallContext &context) {
                        context.continueGuestInstruction();
                      });
+  }
+
+  void applyPcManualAim(LegacyHostCallContext &context) noexcept {
+    if (!pc_manual_aim_enabled_ || !pc_manual_aim_snap_yaw_) {
+      return;
+    }
+    constexpr std::uint32_t yaw_offset = 0x14U;
+    const auto stack = context.registerValue(29U);
+    const auto normalize = [](std::int32_t angle) {
+      angle &= 0xfff;
+      return angle > 0x7ff ? angle - 0x1000 : angle;
+    };
+    const auto yaw = normalize(*pc_manual_aim_snap_yaw_);
+    static_cast<void>(context.write32(
+        stack + yaw_offset, std::bit_cast<std::uint32_t>(yaw)));
+    pc_manual_aim_snap_yaw_.reset();
+  }
+
+  void applyPcManualAimVector(LegacyHostCallContext &context) noexcept {
+    if (!pc_manual_aim_enabled_) {
+      return;
+    }
+    // SF1's accepted 0x80037B08 hook writes the processed mouse vector to
+    // controller +0xCC/+0xD4. SF2 0x80053464 is instruction-identical; its
+    // controller is preserved in s2 at this boundary.
+    constexpr std::uint32_t horizontal_offset = 0xccU;
+    constexpr std::uint32_t middle_offset = 0xd0U;
+    constexpr std::uint32_t vertical_offset = 0xd4U;
+    constexpr std::int32_t fixed_one = 4096;
+    const auto controller = context.registerValue(18U);
+    const auto yaw = std::clamp(pc_manual_aim_yaw_pending_, -256, 256);
+    const auto pitch = std::clamp(pc_manual_aim_pitch_pending_, -96, 96);
+    if (controller == 0U ||
+        !context.write32(controller + horizontal_offset,
+                         std::bit_cast<std::uint32_t>(yaw * fixed_one)) ||
+        !context.write32(controller + middle_offset, 0U) ||
+        !context.write32(controller + vertical_offset,
+                         std::bit_cast<std::uint32_t>(pitch * fixed_one))) {
+      return;
+    }
+    ++pc_manual_aim_hook_calls_;
+    pc_manual_aim_yaw_command_ = yaw;
+    pc_manual_aim_pitch_command_ = pitch;
+    pc_manual_aim_yaw_pending_ = 0;
+    pc_manual_aim_pitch_pending_ = 0;
+  }
+
+  void applyPcChaseCameraPitch() noexcept {
+    // SF1's proven desired/rendered pitch pair (+0x954/+0x984) maps through
+    // the structurally matched SF2 camera routine to +0x8E8/+0x918. The
+    // wrapper/base indirection is authored by 0x80049940 itself.
+    constexpr std::uint32_t player_pointer = 0x8012a574U;
+    constexpr std::uint32_t instance_player_state_offset = 0x20U;
+    constexpr std::uint32_t player_state_camera_offset = 0xe0U;
+    constexpr std::uint32_t camera_wrapper_base_offset = 0xa4U;
+    constexpr std::uint32_t camera_desired_pitch_offset = 0x8e8U;
+    constexpr std::uint32_t camera_rendered_pitch_offset = 0x918U;
+    constexpr std::int32_t maximum_pitch = 512;
+
+    std::uint32_t player{};
+    std::uint32_t player_state{};
+    std::uint32_t camera_wrapper{};
+    std::uint32_t camera_base{};
+    if (!pc_chase_pitch_enabled_ ||
+        !vm_.runtime().read32(player_pointer, player) || player == 0U ||
+        !vm_.runtime().read32(player + instance_player_state_offset,
+                              player_state) ||
+        player_state == 0U ||
+        !vm_.runtime().read32(player_state + player_state_camera_offset,
+                              camera_wrapper) ||
+        camera_wrapper == 0U ||
+        !vm_.runtime().read32(camera_wrapper + camera_wrapper_base_offset,
+                              camera_base) ||
+        camera_base == 0U) {
+      pc_chase_pitch_valid_ = false;
+      pc_chase_camera_base_ = 0U;
+      return;
+    }
+    ++pc_chase_pitch_hook_calls_;
+
+    const auto normalize_angle = [](std::uint32_t value) {
+      auto angle = static_cast<std::int32_t>(value & 0xfffU);
+      if (angle > 0x7ff) {
+        angle -= 0x1000;
+      }
+      return angle;
+    };
+    if (!pc_chase_pitch_valid_ || pc_chase_camera_base_ != camera_base) {
+      std::uint32_t authored_pitch{};
+      if (!vm_.runtime().read32(camera_base + camera_desired_pitch_offset,
+                                authored_pitch)) {
+        return;
+      }
+      pc_chase_camera_base_ = camera_base;
+      pc_chase_pitch_target_ = std::clamp(
+          normalize_angle(authored_pitch), -maximum_pitch, maximum_pitch);
+      pc_chase_pitch_valid_ = true;
+    }
+    pc_chase_pitch_target_ = std::clamp(
+        pc_chase_pitch_target_ + pc_chase_pitch_pending_,
+        -maximum_pitch, maximum_pitch);
+    pc_chase_pitch_pending_ = 0;
+    static_cast<void>(vm_.runtime().write32(
+        camera_base + camera_desired_pitch_offset,
+        static_cast<std::uint32_t>(pc_chase_pitch_target_)));
+    static_cast<void>(vm_.runtime().write32(
+        camera_base + camera_rendered_pitch_offset,
+        static_cast<std::uint32_t>(pc_chase_pitch_target_)));
+    std::uint32_t rendered_pitch{};
+    if (vm_.runtime().read32(camera_base + camera_rendered_pitch_offset,
+                             rendered_pitch)) {
+      pc_chase_rendered_pitch_ = normalize_angle(rendered_pitch);
+    }
   }
 
   void installExceptionBridge() {
@@ -6154,6 +6440,7 @@ private:
     Sf2GuestUiTextEvent event;
     event.kind = kind;
     event.guest_frame = guest_frame_;
+    event.return_address = context.returnAddress();
     static_cast<void>(vm_.runtime().read32(
         profile_.system_clock, event.system_clock));
     for (auto index = std::size_t{}; index < event.arguments.size(); ++index) {
@@ -6306,6 +6593,20 @@ private:
   std::uint32_t pending_archive_callback_return_{};
   std::array<std::byte, 0x240U> catalog_copy_{};
   LegacyHostPadState host_pad_{};
+  bool pc_manual_aim_enabled_{};
+  std::int32_t pc_manual_aim_yaw_pending_{};
+  std::int32_t pc_manual_aim_pitch_pending_{};
+  std::optional<std::int32_t> pc_manual_aim_snap_yaw_;
+  std::uint64_t pc_manual_aim_hook_calls_{};
+  std::int32_t pc_manual_aim_yaw_command_{};
+  std::int32_t pc_manual_aim_pitch_command_{};
+  bool pc_chase_pitch_enabled_{};
+  bool pc_chase_pitch_valid_{};
+  std::int32_t pc_chase_pitch_pending_{};
+  std::int32_t pc_chase_pitch_target_{};
+  std::uint32_t pc_chase_camera_base_{};
+  std::uint64_t pc_chase_pitch_hook_calls_{};
+  std::int32_t pc_chase_rendered_pitch_{};
   std::shared_ptr<const Sf2PresentationFrame> presentation_frame_;
   std::optional<Sf2PresentationFrame> pending_presentation_;
   std::uint32_t pending_presentation_clock_{};
@@ -6453,8 +6754,8 @@ private:
   std::array<std::uint32_t, 8U> last_pickup_text_words_{};
   std::array<char, 64U> last_pickup_text_bytes_{};
   std::uint64_t script_level_starts_{};
-  std::uint64_t airbasex_new_game_state_reads_{};
-  std::uint8_t airbasex_new_game_state_{};
+  std::uint64_t airbasex_hard_difficulty_reads_{};
+  std::uint8_t airbasex_hard_difficulty_{};
   std::uint16_t script_program_count_at_start_{};
   std::uint64_t script_start_guest_frame_{};
   std::uint16_t script_active_programs_at_start_check_{};
@@ -6652,6 +6953,26 @@ bool Sf2GuestMissionRuntime::exerciseRawCdSyncWaitForProbe() noexcept {
 bool Sf2GuestMissionRuntime::setPlayerHealthForProbe(
     std::uint16_t health) noexcept {
   return impl_->setPlayerHealthForProbe(health);
+}
+
+bool Sf2GuestMissionRuntime::alignPlayerAimToLockedTarget() noexcept {
+  return impl_->alignPlayerAimToLockedTarget();
+}
+
+void Sf2GuestMissionRuntime::setPcManualAimInput(
+    std::int32_t yaw_delta, std::int32_t pitch_delta,
+    bool enabled) noexcept {
+  impl_->setPcManualAimInput(yaw_delta, pitch_delta, enabled);
+}
+
+void Sf2GuestMissionRuntime::setPcChaseCameraPitchInput(
+    std::int32_t delta, bool enabled) noexcept {
+  impl_->setPcChaseCameraPitchInput(delta, enabled);
+}
+
+void Sf2GuestMissionRuntime::setPcHorizontalProjectionScale(
+    std::uint32_t scale_q16) noexcept {
+  impl_->setPcHorizontalProjectionScale(scale_q16);
 }
 
 bool Sf2GuestMissionRuntime::setObjectRecordHealthForProbe(

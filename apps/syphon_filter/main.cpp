@@ -9,6 +9,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -50,6 +51,17 @@ std::optional<int> parseInteger(std::string_view text) {
   const auto result =
       std::from_chars(text.data(), text.data() + text.size(), value);
   if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<double> parseSensitivity(std::string_view text) {
+  double value{};
+  const auto result =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+      !std::isfinite(value) || value <= 0.0 || value > 10.0) {
     return std::nullopt;
   }
   return value;
@@ -134,6 +146,14 @@ void printUsage() {
       << "Mission aliases: --mission=N --level=N (retail mission number; "
          "SF1 has 20, SF2 has 21)\n"
       << "Gameplay test option: --all-weapons-test\n"
+      << "Mouse options: --mouse-sensitivity=0.1..10 "
+         "--mouse-yaw-sensitivity=0.1..10 "
+         "--mouse-pitch-sensitivity=0.1..10\n"
+      << "Mode-specific mouse options: "
+         "--mouse-aim-yaw-sensitivity=0.1..10 "
+         "--mouse-aim-pitch-sensitivity=0.1..10 "
+         "--mouse-chase-yaw-sensitivity=0.1..10 "
+         "--mouse-chase-pitch-sensitivity=0.1..10\n"
       << "SF2 movie diagnostic: --sf2-pre-menu-movie=NAME.STR\n"
       << "Graphics options: --fullscreen --no-launcher "
          "--resolution=WIDTHxHEIGHT "
@@ -174,6 +194,71 @@ int main(int argc, char **argv) {
         retail_cheats.all_weapons = true;
       } else if (argument == "--no-launcher") {
         show_launcher = false;
+      } else if (argument.starts_with("--mouse-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_yaw_sensitivity = *sensitivity;
+        input.mouse_pitch_sensitivity = *sensitivity;
+        input.mouse_chase_yaw_sensitivity = *sensitivity;
+        input.mouse_chase_pitch_sensitivity = *sensitivity;
+      } else if (argument.starts_with("--mouse-yaw-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-yaw-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_yaw_sensitivity = *sensitivity;
+        input.mouse_chase_yaw_sensitivity = *sensitivity;
+      } else if (argument.starts_with("--mouse-pitch-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-pitch-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_pitch_sensitivity = *sensitivity;
+        input.mouse_chase_pitch_sensitivity = *sensitivity;
+      } else if (argument.starts_with(
+                     "--mouse-aim-yaw-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-aim-yaw-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_yaw_sensitivity = *sensitivity;
+      } else if (argument.starts_with(
+                     "--mouse-aim-pitch-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-aim-pitch-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_pitch_sensitivity = *sensitivity;
+      } else if (argument.starts_with(
+                     "--mouse-chase-yaw-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-chase-yaw-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_chase_yaw_sensitivity = *sensitivity;
+      } else if (argument.starts_with(
+                     "--mouse-chase-pitch-sensitivity=")) {
+        const auto sensitivity = parseSensitivity(argument.substr(
+            std::string_view{"--mouse-chase-pitch-sensitivity="}.size()));
+        if (!sensitivity) {
+          printUsage();
+          return 64;
+        }
+        input.mouse_chase_pitch_sensitivity = *sensitivity;
       } else if (argument.starts_with("--sf2-pre-menu-movie=")) {
         const auto name = argument.substr(
             std::string_view{"--sf2-pre-menu-movie="}.size());

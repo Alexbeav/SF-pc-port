@@ -121,6 +121,9 @@ public:
     void completeHostCall() noexcept;
     void settleLoadDelay() noexcept;
     void setRegister(std::uint8_t reg, std::uint32_t value) noexcept;
+    void setGteHorizontalProjectionScale(std::uint32_t scale_q16) noexcept {
+        state_.gte.horizontal_projection_scale = scale_q16;
+    }
     void attachMmioBus(R3000MmioBus* bus) noexcept { mmio_bus_ = bus; }
     void setExternalInterrupt(bool active) noexcept;
     void setExecutionObserver(ExecutionObserver observer) {

@@ -639,7 +639,10 @@ void perspectiveTransformVector(
         state,
         state.control[26] & 0xffffU,
         state.data[19] & 0xffffU);
-    const auto screen_x = static_cast<std::int64_t>(quotient) * signedHalf(state.data[9]) +
+    const auto projected_x =
+        static_cast<std::int64_t>(quotient) * signedHalf(state.data[9]);
+    const auto screen_x =
+        (projected_x * state.horizontal_projection_scale >> 16U) +
         signedWord(state.control[24]);
     const auto screen_y = static_cast<std::int64_t>(quotient) * signedHalf(state.data[10]) +
         signedWord(state.control[25]);
