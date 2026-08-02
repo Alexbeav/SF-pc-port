@@ -14196,6 +14196,9 @@ SceneViewerResult runSf2GuestScene(
   const auto pin_recording_health =
       (input_record_path || input_replay_path) &&
       diagnostic_frame("SF2_PIN_HEALTH").value_or(0U) != 0U;
+  const auto ignored_health_pin =
+      !input_record_path && !input_replay_path &&
+      diagnostic_frame("SF2_PIN_HEALTH").value_or(0U) != 0U;
   const auto trace_presentation =
       diagnostic_frame("SF2_TRACE_PRESENTATION").value_or(0U) != 0U;
   const auto disable_retail_auxiliary_ui =
@@ -14267,6 +14270,12 @@ SceneViewerResult runSf2GuestScene(
       diagnostic_frame("SF2_EXIT_ON_CAPTURE").value_or(0U) != 0U;
   auto automatic_quick_save_completed = false;
   auto automatic_quick_load_completed = false;
+  auto combat_diagnostics = runtime.diagnostics();
+  if (ignored_health_pin) {
+    PsyX_Log_Info(
+        "SF2 health pin ignored: SF2_PIN_HEALTH is restricted to input "
+        "recording/replay\n");
+  }
   std::array<psx::SpuPcmFrame, 4096U> pcm{};
 
   const auto disc_number =
@@ -14778,6 +14787,30 @@ SceneViewerResult runSf2GuestScene(
         mouse_capture.set(false);
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
+      }
+      {
+        const auto current = runtime.diagnostics();
+        if (current.damage_events != combat_diagnostics.damage_events ||
+            current.player_damage_events !=
+                combat_diagnostics.player_damage_events ||
+            current.player_health != combat_diagnostics.player_health ||
+            current.player_armor != combat_diagnostics.player_armor) {
+          PsyX_Log_Info(
+              "SF2 guest combat: clock=%u health=%u armor=%u "
+              "damage=%llu player-damage=%llu caller=0x%08X/0x%08X "
+              "request=%08X/%08X/%08X/%08X\n",
+              current.system_clock,
+              static_cast<unsigned int>(current.player_health),
+              static_cast<unsigned int>(current.player_armor),
+              static_cast<unsigned long long>(current.damage_events),
+              static_cast<unsigned long long>(current.player_damage_events),
+              current.last_damage_caller, current.last_player_damage_caller,
+              current.last_player_damage_request[0U],
+              current.last_player_damage_request[1U],
+              current.last_player_damage_request[2U],
+              current.last_player_damage_request[3U]);
+        }
+        combat_diagnostics = current;
       }
       if (runtime.missionCompleteRequested()) {
         const auto carry =
