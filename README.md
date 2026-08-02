@@ -14,6 +14,14 @@ policy.
 The fork is not affiliated with or endorsed by Madxbio97, Sony Interactive
 Entertainment, Bend Studio or any other rights holder.
 
+## SF3 PC port workstream
+
+This worktree is the retail-correct *Syphon Filter 3* bring-up stream on branch
+`research/sf3-full-bringup`, forked from the validated SF2 Guest Runtime Alpha
+10 shared foundation. Read [SF3 PC Port](docs/SF3_PC_PORT.md) before changing
+the SF3 executable profile, guest machine, mission mapping, presentation,
+audio, controls, campaign, or saves.
+
 ## Status
 
 The current branch is the sanitized upstream baseline. It intentionally has no

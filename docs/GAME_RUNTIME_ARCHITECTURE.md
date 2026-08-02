@@ -12,7 +12,7 @@ Shared foundation
                   |
         explicit runtime selection
           /          |          \
-   SF1 guest     SF2 guest    future SF3 guest
+   SF1 guest     SF2 guest      SF3 guest
 ```
 
 The repository remains unified so proven low-level fixes do not drift between
@@ -35,7 +35,10 @@ by the upstream SF1 port; SF2 must follow it.
   actor choreography, item/drop translation, interactions, and approximate
   combat. These may serve as assertions while the guest bridge is built, but
   are not an alternative gameplay implementation.
-- **Deferred:** SF3 gameplay compatibility beyond shared low-level fixes.
+- **Dedicated branch:** SF3 gameplay compatibility is developed in
+  `research/sf3-full-bringup`. The guest/native ownership rule remains the
+  same, but no SF2 address or gameplay compatibility hook is inherited without
+  independent SF3 evidence.
 
 Native SF2 scaffolding stays isolated until equivalent guest checkpoints are
 working, so useful observations are not discarded prematurely. It must not be

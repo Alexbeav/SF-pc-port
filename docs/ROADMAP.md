@@ -98,6 +98,22 @@ the final confirmation for that fix.
 
 The older native-port milestones below are retained as implementation history.
 
+## Syphon Filter 3 product roadmap
+
+SF3 has a dedicated correctness worktree at `I:\Projects\SF3-PC-Port` on
+branch `research/sf3-full-bringup`. It shares the proven machine, disc,
+renderer, audio and platform foundation, but SF3 retains explicit ownership of
+its executable addresses, overlays, mission ABI, geometry strides, object
+classes, inventory, camera, campaign and saves. It must not silently inherit
+SF2 compatibility hooks.
+
+The initial baseline recognizes `SCUS-94640`, maps all 19 missions, constructs
+all 19 native mission packages, parses all 360 compiled mission programs, and
+contains 2,917 executable/resident function seeds plus 2,111 unique structural
+SF2-to-SF3 matches. The retail guest executable currently reaches its BIOS
+event/SPU setup and then enters an uninitialized target. Closing that bootstrap
+boundary is the first milestone. See [`SF3_PC_PORT.md`](SF3_PC_PORT.md).
+
 ## M0: input and build foundation
 
 - Validate the exact NTSC-U 1.1 executable.
