@@ -34,13 +34,13 @@ constexpr int screen_center_x = screen_width / 2;
 constexpr int screen_center_y = screen_height / 2;
 constexpr int retail_line_height = 8;
 constexpr std::uint32_t surround_transition_ticks = 12U;
-constexpr std::uint32_t surround_frame_elements = 17U;
+constexpr std::uint32_t surround_frame_elements = 21U;
 constexpr std::uint32_t surround_grid_lines = 43U;
 
 // FUN_80084698 installs the authored 384x240 briefing surround before
-// INIT.OVL creates its text region.  The original surround is geometry, not a
-// TIM in INTRFACE.HOG, so keep its coordinates in the same UI space as the
-// retail text objects.
+// INIT.OVL creates its text region. The surround combines live-generated
+// texture strips, line geometry and a scan-line gauge; it is not a static TIM
+// in INTRFACE.HOG. Keep it in the same UI space as the retail text objects.
 struct Point {
   int x{};
   int y{};
@@ -57,12 +57,21 @@ struct LineSegment {
   Point second;
 };
 
-constexpr Rgb panel_fill{12U, 20U, 68U};
-constexpr Rgb panel_outline{64U, 75U, 148U};
-constexpr Rgb panel_inner_outline{42U, 52U, 121U};
-constexpr Rgb panel_grid{17U, 11U, 48U};
+struct FrameStrip {
+  Point points[4U];
+  std::uint8_t u[4U];
+  std::uint8_t v[4U];
+};
+
+constexpr Rgb panel_outline{90U, 100U, 180U};
+constexpr Rgb panel_grid{48U, 44U, 92U};
 constexpr Rgb panel_progress{87U, 175U, 230U};
 
+// Convex native fallback for the concave briefing surround.  Retail's packet
+// vertices below are preserved as the effect overlay, but their GP0 winding
+// is not the ordering expected by PsyCross's setXY4 helper.  These spans are
+// the already-proven presentation base and must remain visible independently
+// of the animated texture path.
 constexpr std::array outer_panel{
     Point{31, 7},    Point{353, 7},   Point{365, 20},  Point{365, 190},
     Point{353, 203}, Point{280, 203}, Point{270, 214}, Point{114, 214},
@@ -74,6 +83,34 @@ constexpr std::array inner_panel{
     Point{344, 193}, Point{276, 193}, Point{268, 201}, Point{116, 201},
     Point{108, 193}, Point{40, 193},  Point{29, 181},  Point{29, 32},
 };
+
+// Stable state-8 INIT.OVL captures publish these 21 textured strips. The
+// coordinates are the authored 384x240 positions after E5 draw offset. Each
+// strip samples the same live 10x32 effect surface, rotating its UVs at the
+// frame's corners exactly as the retail packet stream does.
+constexpr std::array<FrameStrip, surround_frame_elements> retail_frame_strips{{
+    {{{188, 209}, {200, 197}, {179, 193}, {195, 185}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{195, 185}, {200, 197}, {247, 185}, {252, 197}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{247, 185}, {252, 197}, {299, 185}, {302, 197}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{299, 185}, {302, 197}, {351, 185}, {352, 197}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{352, 197}, {364, 185}, {351, 185}, {359, 177}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{359, 177}, {364, 185}, {359, 110}, {364, 100}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{359, 110}, {364, 100}, {359, 36}, {364, 25}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{359, 36}, {364, 25}, {350, 27}, {354, 15}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{354, 15}, {288, 15}, {350, 27}, {292, 27}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{292, 27}, {288, 15}, {250, 27}, {240, 15}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{250, 27}, {240, 15}, {192, 27}, {192, 15}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{192, 15}, {144, 15}, {192, 27}, {134, 27}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{144, 15}, {96, 15}, {134, 27}, {92, 27}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{96, 15}, {30, 15}, {92, 27}, {34, 27}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{30, 15}, {20, 25}, {34, 27}, {25, 36}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{20, 25}, {20, 185}, {25, 36}, {25, 177}}, {9, 9, 0, 0}, {0, 31, 0, 31}},
+    {{{25, 177}, {20, 185}, {33, 185}, {32, 197}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{33, 185}, {32, 197}, {49, 193}, {56, 209}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{49, 193}, {56, 209}, {89, 193}, {98, 209}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{89, 193}, {98, 209}, {132, 193}, {138, 209}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+    {{{132, 193}, {138, 209}, {179, 193}, {188, 209}}, {0, 9, 0, 9}, {0, 0, 31, 31}},
+}};
 
 constexpr Rgb briefing_color{
     assets::RetailBriefingLayout::red,
@@ -140,6 +177,125 @@ void drawSolidQuad(Point top_left, Point top_right, Point bottom_left,
   DrawPrim(&polygon);
 }
 
+// Retail state 8 selects TPAGE 0x9c (8-bit, x=768, y=256), samples UV
+// (0..9,160..191), and uses CLUT 0x7fc0 (x=0,y=511).  The corresponding A0
+// transfer is therefore five 16-bit words by 32 rows at VRAM (768,416).
+constexpr short frame_texture_x = 768;
+constexpr short frame_texture_y = 416;
+constexpr short frame_texture_pixel_width = 10;
+constexpr short frame_texture_word_width = 5;
+constexpr short frame_texture_height = 32;
+constexpr short frame_palette_x = 0;
+constexpr short frame_palette_y = 511;
+
+std::uint16_t packFrameColor(int intensity) noexcept {
+  intensity = std::clamp(intensity, 0, 255);
+  int red{};
+  int green{};
+  int blue{};
+  if (intensity <= 64) {
+    red = intensity;
+    green = intensity * 74 / 64;
+    blue = intensity * 164 / 64;
+  } else if (intensity <= 160) {
+    red = 65;
+    green = 74 + (intensity - 64) * 90 / 96;
+    blue = 164 - (intensity - 64) * 90 / 96;
+  } else if (intensity <= 192) {
+    red = 65 + (intensity - 160) * 99 / 32;
+    green = 164;
+    blue = 74;
+  } else {
+    red = 164 + (intensity - 192) * 91 / 63;
+    green = red;
+    blue = 74 - (intensity - 192) * 74 / 63;
+  }
+  return static_cast<std::uint16_t>((red >> 3U) | ((green >> 3U) << 5U) |
+                                    ((blue >> 3U) << 10U));
+}
+
+struct BriefingFrameTexture {
+  int page{};
+  int clut{};
+};
+
+BriefingFrameTexture uploadBriefingFrameTexture(std::uint32_t retail_tick) {
+  std::array<std::uint16_t, 256U> palette{};
+  for (auto index = std::size_t{}; index < palette.size(); ++index) {
+    palette[index] = packFrameColor(static_cast<int>(index));
+  }
+  std::array<u_long, palette.size() / 2U> packed_palette{};
+  for (std::size_t index = 0; index < palette.size(); ++index) {
+    packed_palette[index / 2U] |=
+        static_cast<u_long>(palette[index]) << ((index & 1U) * 16U);
+  }
+  RECT16 palette_rect{frame_palette_x, frame_palette_y, 256, 1};
+  LoadImage(&palette_rect, packed_palette.data());
+
+  std::array<std::uint16_t,
+             static_cast<std::size_t>(frame_texture_word_width) *
+                 frame_texture_height>
+      indexed_words{};
+  const auto time = static_cast<double>(retail_tick);
+  for (auto y = 0; y < frame_texture_height; ++y) {
+    for (auto x = 0; x < frame_texture_pixel_width; ++x) {
+      // INIT.OVL refreshes a tiny indexed plasma/noise surface every frame and
+      // bends it around the frame. Recreate that observed signal rather than
+      // treating the surround as flat or vertex-shaded geometry.
+      const auto first = std::sin(static_cast<double>(x) * 0.82 +
+                                  static_cast<double>(y) * 0.18 + time * 0.17);
+      const auto second = std::sin(static_cast<double>(x) * 1.91 -
+                                   static_cast<double>(y) * 0.25 - time * 0.11);
+      const auto third = std::sin(static_cast<double>(y) * 0.53 + time * 0.07);
+      const auto intensity = static_cast<int>(
+          std::lround(62.0 + first * 28.0 + second * 19.0 + third * 15.0));
+      const auto palette_index = static_cast<std::uint8_t>(
+          std::clamp(intensity * 2, 0, 255));
+      auto &word = indexed_words[static_cast<std::size_t>(y) *
+                                     frame_texture_word_width +
+                                 static_cast<std::size_t>(x / 2)];
+      word |= static_cast<std::uint16_t>(palette_index)
+              << static_cast<unsigned int>((x & 1) * 8);
+    }
+  }
+  RECT16 rect{frame_texture_x, frame_texture_y, frame_texture_word_width,
+              frame_texture_height};
+  std::array<u_long, indexed_words.size() / 2U> packed{};
+  for (std::size_t index = 0; index < indexed_words.size(); ++index) {
+    packed[index / 2U] |=
+        static_cast<u_long>(indexed_words[index]) << ((index & 1U) * 16U);
+  }
+  LoadImage(&rect, packed.data());
+  DrawSync(0);
+  return {GetTPage(1, 0, frame_texture_x, 256),
+          GetClut(frame_palette_x, frame_palette_y)};
+}
+
+void drawBriefingFrameStrip(const FrameStrip &strip,
+                            BriefingFrameTexture texture,
+                            bool semi_transparent = false,
+                            Rgb color = {128U, 128U, 128U}) {
+  POLY_FT4 polygon{};
+  setPolyFT4(&polygon);
+  setSemiTrans(&polygon, semi_transparent ? 1 : 0);
+  setRGB0(&polygon, color.red, color.green, color.blue);
+  polygon.tpage = static_cast<u_short>(texture.page);
+  polygon.clut = static_cast<u_short>(texture.clut);
+  setXY4(&polygon, static_cast<float>(strip.points[0].x),
+         static_cast<float>(strip.points[0].y),
+         static_cast<float>(strip.points[1].x),
+         static_cast<float>(strip.points[1].y),
+         static_cast<float>(strip.points[2].x),
+         static_cast<float>(strip.points[2].y),
+         static_cast<float>(strip.points[3].x),
+         static_cast<float>(strip.points[3].y));
+  setUV4(&polygon, strip.u[0], static_cast<u_char>(strip.v[0] + 160U),
+         strip.u[1], static_cast<u_char>(strip.v[1] + 160U), strip.u[2],
+         static_cast<u_char>(strip.v[2] + 160U), strip.u[3],
+         static_cast<u_char>(strip.v[3] + 160U));
+  DrawPrim(&polygon);
+}
+
 void drawLine(Point first, Point second, Rgb color) {
   LINE_F2 line{};
   setLineF2(&line);
@@ -167,23 +323,39 @@ void drawBriefingSurround(std::uint32_t retail_tick,
   const auto visible_grid = static_cast<std::size_t>(
       transition_tick * surround_grid_lines / surround_transition_ticks);
 
-  // Lay down the concave authored silhouette as four convex spans.
   if (visible_frame != 0U) {
-    drawSolidQuad({31, 7}, {353, 7}, {19, 20}, {365, 20}, panel_fill);
-    drawSolidRect(19, 20, 346, 170, panel_fill);
-    drawSolidQuad({19, 190}, {365, 190}, {31, 203}, {353, 203}, panel_fill);
-    drawSolidQuad({104, 203}, {280, 203}, {114, 214}, {270, 214}, panel_fill);
+    const auto shimmer = static_cast<int>(std::lround(
+        10.0 * std::sin(static_cast<double>(retail_tick) * 0.13)));
+    const auto fill = Rgb{
+        static_cast<std::uint8_t>(std::clamp(14 + shimmer / 4, 0, 255)),
+        static_cast<std::uint8_t>(std::clamp(22 + shimmer / 2, 0, 255)),
+        static_cast<std::uint8_t>(std::clamp(70 + shimmer, 0, 255))};
 
-    // Cut the display aperture back out. Its lower edge has the retail centre
-    // step which the old black-only bridge lost.
+    // Lay down the concave silhouette as four non-self-intersecting spans.
+    drawSolidQuad({31, 7}, {353, 7}, {19, 20}, {365, 20}, fill);
+    drawSolidRect(19, 20, 346, 170, fill);
+    drawSolidQuad({19, 190}, {365, 190}, {31, 203}, {353, 203}, fill);
+    drawSolidQuad({104, 203}, {280, 203}, {114, 214}, {270, 214}, fill);
+
+    // Restore the display aperture after filling the surround.
     drawSolidQuad({40, 21}, {344, 21}, {29, 32}, {355, 32}, {});
     drawSolidRect(29, 32, 326, 149, {});
     drawSolidQuad({29, 181}, {355, 181}, {40, 193}, {344, 193}, {});
     drawSolidQuad({108, 193}, {276, 193}, {116, 201}, {268, 201}, {});
+
+    const auto visible_outline =
+        visible_frame * (outer_panel.size() + inner_panel.size()) /
+        surround_frame_elements;
+    const auto visible_outer = std::min(visible_outline, outer_panel.size());
+    const auto visible_inner = visible_outline > outer_panel.size()
+                                   ? visible_outline - outer_panel.size()
+                                   : 0U;
+    drawOutlinePrefix(outer_panel, visible_outer, panel_outline);
+    drawOutlinePrefix(inner_panel, visible_inner, panel_outline);
   }
 
-  // INIT.OVL authors 27 vertical and 16 horizontal primitives.  Mode 6
-  // publishes floor(tick * 43 / 12) of them and highlights the leading edge.
+  // The settled retail packet stream owns 27 vertical and 17 horizontal
+  // lines, followed by both edges of every textured frame strip.
   std::array<LineSegment, surround_grid_lines> grid{};
   auto grid_index = std::size_t{};
   for (auto index = 0; index < 27; ++index) {
@@ -203,36 +375,47 @@ void drawBriefingSurround(std::uint32_t retail_tick,
              panel_progress);
   }
 
-  constexpr auto outline_segments = outer_panel.size() + inner_panel.size();
-  const auto visible_outline =
-      visible_frame * outline_segments / surround_frame_elements;
-  const auto visible_outer = std::min(visible_outline, outer_panel.size());
-  const auto visible_inner = visible_outline > outer_panel.size()
-                                 ? visible_outline - outer_panel.size()
-                                 : 0U;
-  drawOutlinePrefix(outer_panel, visible_outer, panel_outline);
-  drawOutlinePrefix(inner_panel, visible_inner, panel_inner_outline);
-  if (visible_outer < outer_panel.size()) {
-    drawLine(outer_panel[visible_outer],
-             outer_panel[(visible_outer + 1U) % outer_panel.size()],
-             panel_progress);
-  } else if (visible_inner < inner_panel.size()) {
-    drawLine(inner_panel[visible_inner],
-             inner_panel[(visible_inner + 1U) % inner_panel.size()],
-             panel_progress);
+  // Draw the textured surround after the grid.  Retail OT ordering lets the
+  // inner frame edge mask the ends of grid lines; reversing those layers is
+  // what made the native grid visibly pierce the border.
+  const auto frame_texture = BriefingFrameTexture{
+      GetTPage(1, 0, frame_texture_x, 256),
+      GetClut(frame_palette_x, frame_palette_y)};
+  DR_TPAGE page{};
+  SetDrawTPage(&page, 0, 0, frame_texture.page);
+  DrawPrim(&page);
+  for (std::size_t index = 0; index < visible_frame; ++index) {
+    drawBriefingFrameStrip(retail_frame_strips[index], frame_texture);
   }
 
-  // The three permanent INIT.OVL primitives form the briefing gauge. Its
-  // fill follows the text-object reveal rather than unrelated host I/O.
-  drawSolidRect(139, 202, 106, 10, {});
-  drawLine({139, 202}, {245, 202}, panel_outline);
-  drawLine({245, 202}, {245, 212}, panel_outline);
-  drawLine({245, 212}, {139, 212}, panel_outline);
-  drawLine({139, 212}, {139, 202}, panel_outline);
+  for (std::size_t index = 0; index < visible_frame; ++index) {
+    const auto &strip = retail_frame_strips[index];
+    const auto color = index + 1U == visible_frame &&
+                               visible_frame < retail_frame_strips.size()
+                           ? panel_progress
+                           : panel_outline;
+    drawLine(strip.points[0], strip.points[2], color);
+    drawLine(strip.points[1], strip.points[3], color);
+  }
+
+  // Retail's permanent lower gauge is another sample of the live frame
+  // texture with five semi-transparent scan lines over it.
+  constexpr FrameStrip gauge{{{63, 197}, {63, 206}, {170, 197}, {170, 206}},
+                             {0, 9, 0, 9},
+                             {0, 0, 31, 31}};
+  drawSolidQuad(gauge.points[0], gauge.points[1], gauge.points[2],
+                gauge.points[3], {18U, 31U, 72U});
+  drawBriefingFrameStrip(gauge, frame_texture, true, {64U, 64U, 64U});
   const auto progress_width = static_cast<int>(std::lround(
-      std::clamp(animation_progress, 0.0, 1.0) * 94.0));
+      std::clamp(animation_progress, 0.0, 1.0) * 100.0));
   if (progress_width > 0) {
-    drawSolidRect(145, 205, progress_width, 3, panel_progress);
+    constexpr std::array<Rgb, 5U> gauge_scanline_colors{{
+        {20U, 60U, 100U}, {45U, 111U, 100U}, {44U, 108U, 100U},
+        {40U, 100U, 100U}, {20U, 60U, 100U}}};
+    for (auto row = 0; row < 5; ++row) {
+      drawLine({66, 199 + row}, {66 + progress_width, 199 + row},
+               gauge_scanline_colors[static_cast<std::size_t>(row)]);
+    }
   }
 }
 
@@ -576,12 +759,23 @@ PsyCrossRetailBriefing::PsyCrossRetailBriefing(
 
 PsyCrossRetailBriefing::~PsyCrossRetailBriefing() = default;
 
+void PsyCrossRetailBriefing::prepare(double retail_time) const {
+  const auto retail_tick = static_cast<std::uint32_t>(
+      std::max(std::floor(retail_time), 0.0));
+  static_cast<void>(uploadBriefingFrameTexture(retail_tick));
+}
+
 bool PsyCrossRetailBriefing::draw(const assets::MissionBriefing &briefing,
                                   double retail_time) const {
   const auto retail_tick = static_cast<std::uint32_t>(
       std::max(std::floor(retail_time), 0.0));
   GR_SetBlendMode(BM_NONE);
   GR_EnableDepth(0);
+  DRAWENV native_environment{};
+  SetDefDrawEnv(&native_environment, 0, 0, screen_width, screen_height);
+  native_environment.dtd = 0;
+  native_environment.dfe = 1;
+  PutDrawEnv(&native_environment);
   drawSolidRect(0, 0, screen_width, screen_height, {});
 
   const auto left = screen_center_x + assets::RetailBriefingLayout::region_x;

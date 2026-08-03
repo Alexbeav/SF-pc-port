@@ -1495,7 +1495,10 @@ void LegacyGameplayVm::bindPsxVideoTimingCall(
     const auto mode = std::bit_cast<std::int32_t>(context.argument(0));
     if (mode < 0) {
       // VSync(-1) is a pure query. Presented guest frames advance the
-      // software VBlank counter explicitly at the renderer boundary.
+      // software VBlank counter through the owning runtime's guest-cycle event
+      // scheduler. Keep the count as diagnostics; device progress must never
+      // depend on recognizing this particular polling call.
+      ++video_timing_poll_count_;
       context.setReturnValue(counter);
       return;
     }
@@ -7213,6 +7216,11 @@ LegacyGameplayVm::resumeCurrentPcClockNeutral(std::uint64_t execution_budget) {
   return runExecutionPump(std::nullopt, execution_budget, false);
 }
 
+LegacyGameplayVmResult LegacyGameplayVm::resumeCurrentPcHardwareClocked(
+    std::uint64_t execution_budget) {
+  return runExecutionPump(std::nullopt, execution_budget, true, false);
+}
+
 LegacyGameplayVmResult LegacyGameplayVm::runCurrentPcUntilHostBoundary(
     std::uint32_t boundary_address, std::uint64_t execution_budget) {
   return runExecutionPump(boundary_address, execution_budget);
@@ -7225,9 +7233,16 @@ LegacyGameplayVm::runCurrentPcUntilHostBoundaryClockNeutral(
 }
 
 LegacyGameplayVmResult
+LegacyGameplayVm::runCurrentPcUntilHostBoundaryHardwareClocked(
+    std::uint32_t boundary_address, std::uint64_t execution_budget) {
+  return runExecutionPump(boundary_address, execution_budget, true, false);
+}
+
+LegacyGameplayVmResult
 LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
                                    std::uint64_t execution_budget,
-                                   bool advance_guest_clock) {
+                                   bool advance_guest_clock,
+                                   bool deliver_guest_interrupts) {
   std::uint64_t instructions{};
   std::uint64_t host_calls{};
   const auto boundary_result = [&]() {
@@ -7248,6 +7263,12 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
   };
   const auto step_guest = [&]() {
     if (advance_guest_clock) {
+      if (!deliver_guest_interrupts) {
+        // Device events remain observable through MMIO and the host-owned
+        // callback scheduler, but this execution mode must not enter a guest
+        // exception vector between two HLE lifecycle boundaries.
+        runtime_.setExternalInterrupt(false);
+      }
       return machine_.step();
     }
     // Bootstrap/profile callbacks execute before guest exception tables are
@@ -7288,7 +7309,8 @@ LegacyGameplayVm::runExecutionPump(std::optional<std::uint32_t> host_boundary,
       };
     }
 
-    if (advance_guest_clock && runtime_.interruptPending()) {
+    if (advance_guest_clock && deliver_guest_interrupts &&
+        runtime_.interruptPending()) {
       auto execution = machine_.step();
       if (service_bios_syscall(execution)) {
         continue;

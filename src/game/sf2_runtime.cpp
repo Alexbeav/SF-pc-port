@@ -899,12 +899,12 @@ public:
         !vm_.runtime().write32(raw_cd_callback, 0U)) {
       return false;
     }
-    const auto slices_before = raw_cd_sync_scheduler_slices_;
+    const auto slices_before = device_wait_scheduler_slices_;
     const std::array arguments{0U, 0U};
     const auto synchronized = invokeNested(0x800f7704U, arguments);
     if ((!synchronized.completed() &&
          !synchronized.stoppedAtHostBoundary()) ||
-        raw_cd_sync_scheduler_slices_ == slices_before) {
+        device_wait_scheduler_slices_ == slices_before) {
       const auto hex = [](std::uint32_t value) {
         constexpr char digits[] = "0123456789ABCDEF";
         std::string text(8U, '0');
@@ -918,11 +918,49 @@ public:
                 std::string{psx::toString(synchronized.execution.reason)} +
                 " pc=0x" + hex(synchronized.execution.pc) + " ra=0x" +
                 hex(vm_.runtime().state().gpr[31U]) + " slices=" +
-                std::to_string(raw_cd_sync_scheduler_slices_ -
-                               slices_before));
+                 std::to_string(device_wait_scheduler_slices_ -
+                                slices_before));
       return false;
     }
     return true;
+  }
+  [[nodiscard]] bool exerciseCleanMissionRestartForProbe() noexcept {
+    if (!ready_ || faulted_ || checkpoint_captured_) {
+      return false;
+    }
+    const auto restart =
+        invokeNested(0x800ad9f4U, std::span<const std::uint32_t>{});
+    return restart.yieldedAfterHostCall() && mission_restart_requested_;
+  }
+  [[nodiscard]] bool exerciseOpeningMissionRestartForProbe() noexcept {
+    if (!ready_ || faulted_ || checkpoint_captured_ ||
+        !initial_checkpoint_deferred_by_opening_event_ ||
+        script_level_starts_ == 0U) {
+      return false;
+    }
+    const auto restart =
+        invokeNested(0x800b3d34U, std::span<const std::uint32_t>{});
+    return restart.yieldedAfterHostCall() && mission_restart_requested_;
+  }
+  [[nodiscard]] bool
+  exercisePauseMenuLifecycleForProbe(bool save_and_quit) noexcept {
+    constexpr std::uint32_t menu_save_and_quit_callback = 0x80143568U;
+    constexpr std::uint32_t menu_restart_mission_callback = 0x80143624U;
+    std::uint32_t application_state{};
+    if (!ready_ || faulted_ ||
+        !vm_.runtime().read32(profile_.application_state,
+                              application_state) ||
+        application_state != 7U) {
+      return false;
+    }
+    const std::array arguments{1U};
+    const auto result = invokeNested(
+        save_and_quit ? menu_save_and_quit_callback
+                      : menu_restart_mission_callback,
+        arguments);
+    return result.yieldedAfterHostCall() &&
+           (save_and_quit ? quit_to_title_requested_
+                          : mission_restart_requested_);
   }
   [[nodiscard]] bool
   setPlayerHealthForProbe(std::uint16_t health) noexcept {
@@ -1573,6 +1611,10 @@ public:
       static_cast<void>(vm_.restoreSnapshot(snapshot));
       return false;
     }
+    if (!checkpointStateReady()) {
+      static_cast<void>(vm_.restoreSnapshot(snapshot));
+      return false;
+    }
     // A failure restart must return to the carried chapter state rather than
     // the package's standalone defaults captured during bootstrap.
     checkpoint_captured_ = true;
@@ -1616,6 +1658,8 @@ public:
           menu_gameplay_vram_setup_packets_;
       state.previous_application_state = previous_application_state_;
       state.menu_transition_active = menu_transition_active_;
+      state.pause_menu_lifecycle_active = pause_menu_lifecycle_active_;
+      state.pause_menu_player_was_present = pause_menu_player_was_present_;
       state.pending_immediate_gpu_packets = pending_immediate_gpu_packets_;
       state.presentation_frame = presentation_frame_;
       state.pending_presentation = pending_presentation_;
@@ -1634,6 +1678,16 @@ public:
       state.scripts_started = scripts_started_;
       state.loading_confirm_sent = loading_confirm_sent_;
       state.checkpoint_captured = checkpoint_captured_;
+      state.checkpoint_capture_frame = checkpoint_capture_frame_;
+      state.retail_checkpoint_capture_calls =
+          retail_checkpoint_capture_calls_;
+      state.retail_checkpoint_capture_pending =
+          retail_checkpoint_capture_pending_;
+      state.mission_restart_requested = mission_restart_requested_;
+      state.quit_to_title_requested = quit_to_title_requested_;
+      state.scripted_camera_observed = scripted_camera_observed_;
+      state.initial_checkpoint_deferred_by_opening_event =
+          initial_checkpoint_deferred_by_opening_event_;
       state.retail_restore_active = retail_restore_active_;
       state.retail_restore_start_frame = retail_restore_start_frame_;
       state.xa_absolute_disc_active = xa_absolute_disc_active_;
@@ -1693,6 +1747,10 @@ public:
           quick_state_->menu_gameplay_vram_setup_packets;
       previous_application_state_ = quick_state_->previous_application_state;
       menu_transition_active_ = quick_state_->menu_transition_active;
+      pause_menu_lifecycle_active_ =
+          quick_state_->pause_menu_lifecycle_active;
+      pause_menu_player_was_present_ =
+          quick_state_->pause_menu_player_was_present;
       pending_immediate_gpu_packets_.swap(pending_immediate_gpu_packets);
       active_script_programs_.swap(active_script_programs);
       gpu_gp0_scan_ = quick_state_->gpu_gp0_scan;
@@ -1713,6 +1771,17 @@ public:
       scripts_started_ = quick_state_->scripts_started;
       loading_confirm_sent_ = quick_state_->loading_confirm_sent;
       checkpoint_captured_ = quick_state_->checkpoint_captured;
+      checkpoint_capture_frame_ = quick_state_->checkpoint_capture_frame;
+      retail_checkpoint_capture_calls_ =
+          quick_state_->retail_checkpoint_capture_calls;
+      retail_checkpoint_capture_pending_ =
+          quick_state_->retail_checkpoint_capture_pending;
+      mission_restart_requested_ =
+          quick_state_->mission_restart_requested;
+      quit_to_title_requested_ = quick_state_->quit_to_title_requested;
+      scripted_camera_observed_ = quick_state_->scripted_camera_observed;
+      initial_checkpoint_deferred_by_opening_event_ =
+          quick_state_->initial_checkpoint_deferred_by_opening_event;
       retail_restore_active_ = quick_state_->retail_restore_active;
       retail_restore_start_frame_ =
           quick_state_->retail_restore_start_frame;
@@ -1788,6 +1857,21 @@ public:
     readPlayerState(result.player_instance, result.player_x, result.player_y,
                     result.player_z, result.player_health,
                     result.player_armor);
+    if (readPlayerCameraOwnership(result.player_instance,
+                                  result.player_camera_wrapper,
+                                  result.player_camera_owner)) {
+      result.player_owns_camera =
+          result.player_camera_owner == result.player_instance;
+    }
+    result.checkpoint_captured = checkpoint_captured_;
+    result.checkpoint_capture_frame = checkpoint_capture_frame_;
+    result.retail_checkpoint_capture_calls =
+        retail_checkpoint_capture_calls_;
+    result.mission_restart_requested = mission_restart_requested_;
+    result.quit_to_title_requested = quit_to_title_requested_;
+    result.scripted_camera_observed = scripted_camera_observed_;
+    result.initial_checkpoint_deferred_by_opening_event =
+        initial_checkpoint_deferred_by_opening_event_;
     std::uint32_t collision_owner_handle{};
     std::uint32_t collision_owner{};
     if (vm_.runtime().read32(0x8012a654U, collision_owner_handle) &&
@@ -2442,7 +2526,7 @@ public:
     result.async_file_services = async_file_services_;
     result.async_file_completions = async_file_completions_;
     result.last_async_completion_caller = last_async_completion_caller_;
-    result.raw_cd_sync_scheduler_slices = raw_cd_sync_scheduler_slices_;
+    result.device_wait_scheduler_slices = device_wait_scheduler_slices_;
     result.input_samples = host_pad_samples_;
     result.checkpoint_restores = alpha_checkpoint_restores_;
     result.checkpoint_audio_discarded_frames =
@@ -2497,7 +2581,8 @@ public:
     // caller that missed the handoff to run MOVIE.OVL ahead of native STR
     // playback; completeScriptedMovie() is the only operation that releases
     // this boundary.
-    if (scripted_movie_host_yielded_) {
+    if (scripted_movie_host_yielded_ || mission_restart_requested_ ||
+        quit_to_title_requested_) {
       return true;
     }
     observeMissionOutcomeState();
@@ -2519,6 +2604,9 @@ public:
       if (scripted_movie_host_yielded_) {
         return true;
       }
+      if (mission_restart_requested_ || quit_to_title_requested_) {
+        return true;
+      }
       observeMissionOutcomeState();
       if (mission_complete_requested_) {
         return true;
@@ -2533,6 +2621,13 @@ public:
 
   [[nodiscard]] bool missionCompleteRequested() const noexcept {
     return mission_complete_requested_;
+  }
+
+  [[nodiscard]] bool missionRestartRequested() const noexcept {
+    return mission_restart_requested_;
+  }
+  [[nodiscard]] bool quitToTitleRequested() const noexcept {
+    return quit_to_title_requested_;
   }
 
 private:
@@ -2664,6 +2759,8 @@ private:
       const auto parsed = std::strtoull(value.c_str(), &end, 10);
       return end != value.c_str() && *end == '\0' ? parsed : fallback;
     };
+    ui_instruction_trace_control_flow_only_ =
+        environment_unsigned("SF2_UI_TRACE_CONTROL_FLOW_ONLY", 0U) != 0U;
     ui_instruction_trace_begin_clock_ = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(environment_unsigned(
                                     "SF2_UI_TRACE_BEGIN_CLOCK", 0U),
@@ -2713,8 +2810,15 @@ private:
   void recordUiInstructionTrace(const psx::R3000State &state,
                                 std::uint32_t pc,
                                 std::uint32_t instruction) {
+    const auto opcode = instruction >> 26U;
+    const auto function = instruction & 0x3fU;
+    const auto is_control_flow =
+        opcode == 0x02U || opcode == 0x03U ||
+        (opcode >= 0x04U && opcode <= 0x07U) || opcode == 0x01U ||
+        (opcode == 0U &&
+         (function == 0x08U || function == 0x09U || function == 0x0cU ||
+          function == 0x0dU));
     const auto writes_traced_ordering_table = [&] {
-      const auto opcode = instruction >> 26U;
       if (opcode != 0x28U && opcode != 0x29U && opcode != 0x2aU &&
           opcode != 0x2bU && opcode != 0x2eU) {
         return false;
@@ -2725,11 +2829,28 @@ private:
       const auto address = state.gpr[base_register] + displacement;
       return address >= 0x801f8c60U && address < 0x801f8cb0U;
     }();
-    const auto relevant = instruction == 0xffffffffU ||
+    const auto in_menu_overlay = pc >= 0x80142150U && pc < 0x8014b6b0U;
+    const auto in_menu_outcome_region =
+        (pc >= 0x801435c0U && pc < 0x80143680U) ||
+        (pc >= 0x80145000U && pc < 0x80145a00U);
+    const auto menu_overlay_relevant =
+        in_menu_overlay &&
+        (!ui_instruction_trace_control_flow_only_ ||
+         (guest_frame_ != 0U && (is_control_flow || in_menu_outcome_region)));
+    const auto raw_relevant = instruction == 0xffffffffU ||
         writes_traced_ordering_table ||
         (pc >= 0x80012000U && pc < 0x8001f000U) ||
         (pc >= 0x800a5000U && pc < 0x800a9000U) ||
+        // MENU.OVL owns pause confirmation dispatch, including the indirect
+        // Save-and-Quit callback path.  Keep this whole small overlay range so
+        // a trace can distinguish a missed host boundary from a callback that
+        // enters and then blocks in its retail teardown.
+        menu_overlay_relevant ||
         (pc >= 0x80150000U && pc < 0x80170000U);
+    const auto relevant = ui_instruction_trace_control_flow_only_
+        ? guest_frame_ != 0U && in_menu_overlay &&
+              (is_control_flow || in_menu_outcome_region)
+        : raw_relevant;
     if (!relevant || !ui_instruction_trace_) {
       return;
     }
@@ -2843,6 +2964,26 @@ private:
     const auto signed_armor = std::bit_cast<std::int16_t>(armor_bits);
     health = signed_health > 0 ? static_cast<std::uint16_t>(signed_health) : 0U;
     armor = signed_armor > 0 ? static_cast<std::uint16_t>(signed_armor) : 0U;
+  }
+
+  [[nodiscard]] bool readPlayerCameraOwnership(
+      std::uint32_t player, std::uint32_t &camera_wrapper,
+      std::uint32_t &camera_owner) const noexcept {
+    constexpr std::uint32_t instance_player_state_offset = 0x20U;
+    constexpr std::uint32_t player_state_camera_offset = 0xe0U;
+    constexpr std::uint32_t camera_wrapper_owner_offset = 0xdcU;
+    std::uint32_t player_state{};
+    camera_wrapper = 0U;
+    camera_owner = 0U;
+    return player != 0U &&
+           vm_.runtime().read32(player + instance_player_state_offset,
+                                player_state) &&
+           player_state != 0U &&
+           vm_.runtime().read32(player_state + player_state_camera_offset,
+                                camera_wrapper) &&
+           camera_wrapper != 0U &&
+           vm_.runtime().read32(camera_wrapper + camera_wrapper_owner_offset,
+                                camera_owner);
   }
 
   void readPlayerHudState(
@@ -3536,6 +3677,17 @@ private:
       vm_.runtime().clearWriteWatchHit();
     }
     if (boundary.yieldedAfterHostCall() &&
+        (mission_restart_requested_ || quit_to_title_requested_)) {
+      // No GPU boundary belongs to a retired mission generation. A retail
+      // checkpoint-without-state request and MENU's Restart Mission / Save and
+      // Quit callbacks all publish an explicit outer-lifecycle request before
+      // yielding. Treat that semantic request—not a particular host-call
+      // address—as the boundary contract so the product can reconstruct the
+      // package or return to TITLE without misreporting a guest execution
+      // fault.
+      return true;
+    }
+    if (boundary.yieldedAfterHostCall() &&
         boundary.yielded_host_call == 0x80142e60U &&
         pending_scripted_movie_catalog_index_) {
       // The decoder-init replacement deliberately yields before MOVIE.OVL's
@@ -3652,6 +3804,15 @@ private:
     if (application_state == 7U && menu_gameplay_vram_setup_packets_) {
       menu_transition_active_ = true;
     }
+    std::uint32_t player_instance{};
+    const auto player_state_available =
+        vm_.runtime().read32(0x8012a574U, player_instance) &&
+        player_instance != 0U;
+    if (application_state == 7U) {
+      pause_menu_lifecycle_active_ = true;
+      pause_menu_player_was_present_ =
+          pause_menu_player_was_present_ || player_state_available;
+    }
     if (application_state == 0U && previous_application_state_ != 0U &&
         menu_gameplay_vram_setup_packets_) {
       if (menu_transition_active_) {
@@ -3661,6 +3822,13 @@ private:
       }
       menu_gameplay_vram_setup_packets_.reset();
       menu_transition_active_ = false;
+    }
+    if (application_state == 0U && previous_application_state_ != 0U) {
+      // Returning to gameplay without invoking the quit transition closes the
+      // pause lifecycle. Save and Quit calls the shared transition before a
+      // state-0 presentation boundary, so the latch remains live there.
+      pause_menu_lifecycle_active_ = false;
+      pause_menu_player_was_present_ = false;
     }
     previous_application_state_ = application_state;
     if (retail_restore_active_ && application_state == 0U &&
@@ -3821,34 +3989,86 @@ private:
       markFault("could not retire SF2 GPU submission");
       return false;
     }
-    // Guest execution is clock-neutral after the authored transition. The
-    // host display boundary is the hardware clock: utility DrawOTag calls do
-    // not consume an additional video interval, while each published frame
-    // advances exactly one 60 Hz slice.
+    // Guest gameplay execution is atomic. A published display frame advances
+    // one authored 60 Hz interval; utility DrawOTag submissions consume no
+    // additional hardware/audio time.
+    // Guest execution consumes CPU-domain time in complete scheduler quanta
+    // inside runUntilBoundary(). A display submission waits only for the next
+    // 60 Hz event after those cycles; it must not add a second full retrace.
+    // Ordinary frames which never exhaust a quantum retain the exact previous
+    // one-retrace cadence, while long code and device waits can naturally miss
+    // one or more VBlanks without recognizing their PC or polling function.
     const auto scheduler_ticks =
-        realtime_display_clock_
-            ? (display_submitted ? retrace_period_ : 0U)
-            : (display_submitted &&
-                       boundary.execution.instructions < retrace_period_
-                   ? retrace_period_ - boundary.execution.instructions +
-                         retired.execution.instructions
-                   : retired.execution.instructions);
-    if (!serviceScheduler(scheduler_ticks)) {
+        !display_submitted
+            ? 0U
+            : retrace_ticks_ == 0U ? retrace_period_
+                                   : retrace_period_ - retrace_ticks_;
+    if (!serviceScheduler(scheduler_ticks, scheduler_ticks)) {
       markFault("SF2 device callback scheduler failed");
       return false;
     }
     if (!startMissionScriptsIfReady()) {
       return false;
     }
-    if (application_state == 0U && !checkpoint_captured_) {
+    // Observe completion of a checkpoint capture initiated by retail mission
+    // logic. This is deliberately independent of a frame/camera threshold:
+    // the checkpoint-present flag and serializer command stream are the
+    // authoritative lifecycle state.
+    if (!checkpoint_captured_ && retail_checkpoint_capture_pending_ &&
+        checkpointStateReady()) {
+      checkpoint_captured_ = true;
+      checkpoint_capture_frame_ = guest_frame_;
+      retail_checkpoint_capture_pending_ = false;
+    }
+
+    // Camera ownership remains presentation/input evidence only. Observe it
+    // independently from checkpoint creation so an authored scripted camera
+    // cannot move the replaced frontend's baseline past one-shot LEVEL events.
+    if (!scripted_camera_observed_ && scripts_started_ &&
+        application_state == 0U) {
+      std::uint32_t player{};
+      std::int32_t player_x{};
+      std::int32_t player_y{};
+      std::int32_t player_z{};
+      std::uint16_t player_health{};
+      std::uint16_t player_armor{};
+      std::uint32_t camera_wrapper{};
+      std::uint32_t camera_owner{};
+      readPlayerState(player, player_x, player_y, player_z, player_health,
+                      player_armor);
+      if (readPlayerCameraOwnership(player, camera_wrapper, camera_owner) &&
+          camera_owner != 0U && camera_owner != player) {
+        scripted_camera_observed_ = true;
+      }
+    }
+
+    // The direct TITLE-to-mission bridge replaces a frontend handoff which
+    // normally supplies an initial restart state. The serializer is not ready
+    // at bootstrap, and capturing after an authored opening object event would
+    // persist that one-shot side effect as already consumed. Only manufacture
+    // the baseline when no opening event has run. Otherwise death/restart owns
+    // a clean same-package reconstruction until retail creates a checkpoint.
+    // Observe the first authored script interval before deciding whether a
+    // replacement-frontend baseline is legal. TRAIN's 0x62 transfer arrives
+    // at guest frame 13 and COLO's 0x72 transfer at frame 22; committing at
+    // the historical frame-16 boundary raced both semantics.
+    constexpr auto initial_checkpoint_observation_frames = std::uint64_t{32U};
+    if (!checkpoint_captured_ && scripts_started_ && application_state == 0U &&
+        guest_frame_ >= initial_checkpoint_observation_frames &&
+        !initial_checkpoint_deferred_by_opening_event_) {
       const auto checkpoint =
           invokeNested(0x800ad48cU, std::span<const std::uint32_t>{});
       if (!checkpoint.completed() && !checkpoint.stoppedAtHostBoundary()) {
-        markFault("SF2 initial checkpoint capture failed");
+        markFault("SF2 initial retail checkpoint capture failed");
         return false;
       }
-      checkpoint_captured_ = checkpointStateReady();
+      if (checkpointStateReady()) {
+        checkpoint_captured_ = true;
+        checkpoint_capture_frame_ = guest_frame_;
+        retail_checkpoint_capture_pending_ = false;
+      }
     }
+
     return true;
   }
 
@@ -3856,8 +4076,7 @@ private:
     constexpr std::uint32_t state = 0x8013b27cU;
     constexpr std::uint32_t size = 0x848U;
     std::uint32_t first{};
-    if (!vm_.runtime().read32(state, first) ||
-        (first & 0x8000U) == 0U) {
+    if (!vm_.runtime().read32(state, first) || (first & 0x8000U) == 0U) {
       return false;
     }
     for (auto offset = std::uint32_t{}; offset < size;
@@ -3966,6 +4185,8 @@ private:
     std::uint32_t previous_application_state{
         std::numeric_limits<std::uint32_t>::max()};
     bool menu_transition_active{};
+    bool pause_menu_lifecycle_active{};
+    bool pause_menu_player_was_present{};
     std::vector<Sf2GpuPacket> pending_immediate_gpu_packets;
     std::shared_ptr<const Sf2PresentationFrame> presentation_frame;
     std::optional<Sf2PresentationFrame> pending_presentation;
@@ -3984,6 +4205,13 @@ private:
     bool scripts_started{};
     bool loading_confirm_sent{};
     bool checkpoint_captured{};
+    std::uint64_t checkpoint_capture_frame{};
+    std::uint64_t retail_checkpoint_capture_calls{};
+    bool retail_checkpoint_capture_pending{};
+    bool mission_restart_requested{};
+    bool quit_to_title_requested{};
+    bool scripted_camera_observed{};
+    bool initial_checkpoint_deferred_by_opening_event{};
     bool retail_restore_active{};
     std::uint64_t retail_restore_start_frame{};
     bool xa_absolute_disc_active{};
@@ -4253,7 +4481,27 @@ private:
                        context.setReturnValue(0U);
                      });
     vm_.bindHostCall(
+        0x800ad48cU, [this](LegacyHostCallContext &context) {
+          ++retail_checkpoint_capture_calls_;
+          retail_checkpoint_capture_pending_ = true;
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
         0x800ad9f4U, [this](LegacyHostCallContext &context) {
+          constexpr std::uint32_t checkpoint_present = 0x8011f61cU;
+          std::uint32_t present{};
+          if (!context.read32(checkpoint_present, present) || present == 0U ||
+              !checkpoint_captured_ || !checkpointStateReady()) {
+            // Retail distinguishes Restart Mission from Restart at Last
+            // Checkpoint by clearing this flag. A death before the first real
+            // checkpoint has the same clean-restart ownership. Yield before
+            // entering the restore loader so the host can reconstruct only
+            // the active mission package (no title, SOL, or briefing replay).
+            mission_restart_requested_ = true;
+            context.setReturnValue(0U);
+            context.yieldAfterHostCall();
+            return;
+          }
           last_restore_caller_ = context.registerValue(31U);
           std::uint32_t player{};
           std::uint16_t armor{};
@@ -4274,6 +4522,24 @@ private:
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
+        0x8002c8a0U, [this](LegacyHostCallContext &context) {
+          constexpr std::uint32_t menu_restart_mission_caller = 0x80143654U;
+          if (context.registerValue(31U) == menu_restart_mission_caller) {
+            // MENU.OVL's Restart Mission callback tears down the current
+            // menu state before this call and then immediately reopens its
+            // retail mission index. The architectural return address is the
+            // authored discriminator; application state is intentionally no
+            // longer 7 here. The outer native campaign host owns the package
+            // boundary, so yield before mission teardown and reconstruct the
+            // same mission without replaying SOL or the briefing.
+            mission_restart_requested_ = true;
+            context.setReturnValue(0U);
+            context.yieldAfterHostCall();
+            return;
+          }
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
         0x8002d6d8U, [this](LegacyHostCallContext &context) {
           ++mission_success_events_;
           mission_success_pending_ = true;
@@ -4285,6 +4551,27 @@ private:
           // Both outcomes later request application state 3. A failure must
           // explicitly cancel a pending success before that shared handoff.
           mission_success_pending_ = false;
+          context.continueGuestInstruction();
+        });
+    vm_.bindHostCall(
+        0x80143568U, [this](LegacyHostCallContext &context) {
+          // MENU.OVL invokes this callback only after presenting the authored
+          // Save and Quit confirmation. Argument zero is the selected answer:
+          // zero returns to MENU, while one transfers ownership to the
+          // memory-card frontend. Some live overlay paths wait before reaching
+          // the later shared application transition, so hand the affirmative
+          // result directly to the native campaign/save owner at this first
+          // unambiguous retail boundary. The negative path remains retail.
+          std::uint32_t application_state{};
+          const auto menu_overlay_active =
+              context.read32(profile_.application_state, application_state) &&
+              application_state == 7U;
+          if (menu_overlay_active && context.argument(0U) != 0U) {
+            quit_to_title_requested_ = true;
+            context.setReturnValue(0U);
+            context.yieldAfterHostCall();
+            return;
+          }
           context.continueGuestInstruction();
         });
     vm_.bindHostCall(
@@ -4560,6 +4847,17 @@ private:
         });
     vm_.bindHostCall(
         0x80042cf4U, [this](LegacyHostCallContext &context) {
+          // Retail's opening-transfer events create resources and attachments
+          // which are not represented by a baseline captured afterward. Keep
+          // those packages checkpoint-free until the authored serializer runs.
+          // The policy follows event semantics rather than mission identity:
+          // 0x72 transfers parachute ownership; 0x62 starts an authored opening
+          // vehicle/actor sequence (including TRAIN's helicopter flyby).
+          const auto event_id = context.argument(1U);
+          if (!checkpoint_captured_ &&
+              (event_id == 0x62U || event_id == 0x72U)) {
+            initial_checkpoint_deferred_by_opening_event_ = true;
+          }
           auto &event = object_event_dispatches_[
               object_event_dispatch_count_ % object_event_dispatches_.size()];
           event.guest_frame = guest_frame_;
@@ -4779,6 +5077,18 @@ private:
           // latch. The direct bootstrap already inherits TITLE's Normal
           // default; writing one here silently selected Hard mission branches
           // (including Falkan's shortened helicopter escape).
+          if (script_level_starts_ != 0U && !checkpoint_captured_ &&
+              initial_checkpoint_deferred_by_opening_event_) {
+            // A second LEVEL start in a generation which could not safely
+            // capture its frontend baseline would retain one-shot opening
+            // flags and resource ownership. Yield before ResetAndStartLevel so
+            // the outer host can construct the same package from a clean guest
+            // generation instead.
+            mission_restart_requested_ = true;
+            context.setReturnValue(0U);
+            context.yieldAfterHostCall();
+            return;
+          }
           ++script_level_starts_;
           context.continueGuestInstruction();
         });
@@ -5549,6 +5859,17 @@ private:
       return angle;
     };
     if (!pc_chase_pitch_valid_ || pc_chase_camera_base_ != camera_base) {
+      // Do not seize a newly returned retail chase camera merely because the
+      // PC pitch feature is enabled.  At an in-engine-cutscene handoff the
+      // authored camera can still carry the outgoing shot's pitch for one or
+      // more guest ticks; caching and rewriting that value with no mouse
+      // command freezes the transient angle and produces a visible snap.  Let
+      // retail finish the handoff, and only establish the aftermarket pitch
+      // target when the player actually moves the mouse vertically.
+      if (pc_chase_pitch_pending_ == 0) {
+        pc_chase_camera_base_ = 0U;
+        return;
+      }
       std::uint32_t authored_pitch{};
       if (!vm_.runtime().read32(camera_base + camera_desired_pitch_offset,
                                 authored_pitch)) {
@@ -5880,9 +6201,11 @@ private:
         });
   }
 
-  [[nodiscard]] bool serviceScheduler(std::uint64_t ticks) noexcept {
-    if (suppress_interrupts_) {
-      vm_.machine().advanceHardwareTicks(ticks);
+  [[nodiscard]] bool serviceScheduler(
+      std::uint64_t ticks,
+      std::uint64_t unexecuted_hardware_ticks = 0U) noexcept {
+    if (unexecuted_hardware_ticks != 0U) {
+      vm_.machine().advanceHardwareTicks(unexecuted_hardware_ticks);
     }
     retrace_ticks_ += ticks;
     const auto retraces = retrace_ticks_ / retrace_period_;
@@ -6012,6 +6335,9 @@ private:
     }
     auto remaining = execution_budget_;
     auto total = std::uint64_t{};
+    std::array<std::uint32_t, 256U> exhausted_slice_pcs{};
+    auto exhausted_slice_pc_count = std::size_t{};
+    auto exhausted_slice_pc_cursor = std::size_t{};
     scheduler_fault_detail_.clear();
     LegacyGameplayVmResult result;
     for (;;) {
@@ -6021,49 +6347,43 @@ private:
                                                                    slice)
                    : vm_.runCurrentPcUntilHostBoundary(address, slice);
       total += result.execution.instructions;
-      const auto synchronous_wait =
+      const auto exhausted_slice =
           realtime_display_clock_ &&
-          result.execution.reason == psx::R3000StopReason::instruction_budget &&
-          retail_restore_active_;
-      // Mission failure waits for two asynchronous retraces by polling
-      // VSync(-1) at 0x80014D8C..0x80014DBC. No DrawOTag is submitted while
-      // that loop is active, so the product-owned display clock must advance
-      // from instruction slices or the retail transition can never reach the
-      // checkpoint loader.
-      const auto lifecycle_vsync_wait =
-          realtime_display_clock_ &&
-          result.execution.reason ==
-              psx::R3000StopReason::instruction_budget &&
-          result.execution.pc >= 0x80014d8cU &&
-          result.execution.pc <= 0x80014dc0U;
-      // Retail RawCdSync (0x800F7704) also polls completion without
-      // publishing a GPU boundary. Mission 1 reaches this path after the C4
-      // tunnel transition; withholding the host scheduler leaves its raw-CD
-      // callback state unchanged until the global instruction budget expires
-      // around 0x800F7778. Advance only while execution is inside that exact
-      // synchronization routine so the authored request/callback owns the
-      // result and ordinary gameplay pacing remains display-driven.
-      const auto raw_cd_sync_vsync_return =
-          vm_.runtime().state().gpr[31U] == 0x800f773cU ||
-          vm_.runtime().state().gpr[31U] == 0x800f776cU;
-      const auto raw_cd_sync_wait =
-          realtime_display_clock_ &&
-          result.execution.reason ==
-              psx::R3000StopReason::instruction_budget &&
-          ((result.execution.pc >= 0x800f7704U &&
-            result.execution.pc < 0x800f77d8U) ||
-           (result.execution.pc >= 0x800f48f0U &&
-            result.execution.pc < 0x800f4a68U &&
-            raw_cd_sync_vsync_return));
-      if (raw_cd_sync_wait) {
-        ++raw_cd_sync_scheduler_slices_;
+          result.execution.reason == psx::R3000StopReason::instruction_budget;
+      const auto repeated_execution =
+          exhausted_slice &&
+          std::find(exhausted_slice_pcs.begin(),
+                    exhausted_slice_pcs.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            exhausted_slice_pc_count),
+                    result.execution.pc) !=
+              exhausted_slice_pcs.begin() +
+                  static_cast<std::ptrdiff_t>(exhausted_slice_pc_count);
+      if (exhausted_slice) {
+        exhausted_slice_pcs[exhausted_slice_pc_cursor] = result.execution.pc;
+        exhausted_slice_pc_cursor =
+            (exhausted_slice_pc_cursor + 1U) % exhausted_slice_pcs.size();
+        exhausted_slice_pc_count = std::min(
+            exhausted_slice_pc_count + 1U, exhausted_slice_pcs.size());
       }
+      // A complete quantum alone can be ordinary instruction-heavy gameplay;
+      // charging all such work made audio/device time scene-dependent. A PC
+      // recurring at a quantum boundary within this one host-boundary search
+      // proves that guest execution has entered a cycle. Advance every device
+      // by the retired guest cycles until hardware state lets that cycle exit.
+      // This recognizes no function, return address, MMIO register or display
+      // poll, so card events, CD/DMA completion, timers and future device waits
+      // share one deterministic rule. A boundary reached inside a quantum
+      // remains atomic and is padded to its next VBlank by the caller.
       const auto scheduler_ticks =
-          !realtime_display_clock_ || synchronous_wait ||
-                  lifecycle_vsync_wait || raw_cd_sync_wait
+          !realtime_display_clock_ || repeated_execution
               ? result.execution.instructions
               : 0U;
-      if (!serviceScheduler(scheduler_ticks)) {
+      if (scheduler_ticks != 0U) {
+        ++device_wait_scheduler_slices_;
+      }
+      if (!serviceScheduler(scheduler_ticks,
+                            suppress_interrupts_ ? scheduler_ticks : 0U)) {
         result.execution.reason = psx::R3000StopReason::memory_fault;
         break;
       }
@@ -6109,7 +6429,10 @@ private:
             : 0U;
     return retired.execution.reason ==
                psx::R3000StopReason::instruction_budget &&
-           serviceScheduler(retired.execution.instructions + padding);
+           serviceScheduler(retired.execution.instructions + padding,
+                            suppress_interrupts_
+                                ? retired.execution.instructions + padding
+                                : 0U);
   }
 
   [[nodiscard]] bool bootstrap() {
@@ -6117,7 +6440,7 @@ private:
     const auto state_loop =
         vm_.runCurrentPcUntilHostBoundary(profile_.state_loop_entry,
                                            execution_budget_);
-    if (!state_loop.stoppedAtHostBoundary() || !serviceScheduler(0U)) {
+    if (!state_loop.stoppedAtHostBoundary() || !serviceScheduler(0U, 0U)) {
       return false;
     }
     suppress_interrupts_ = true;
@@ -6605,6 +6928,7 @@ private:
   LegacyGameplayVm vm_;
   std::ofstream ui_instruction_trace_;
   std::vector<UiInstructionTraceRecord> ui_instruction_trace_buffer_;
+  bool ui_instruction_trace_control_flow_only_{};
   std::uint64_t ui_instruction_trace_events_{};
   std::uint64_t ui_instruction_trace_max_bytes_{};
   std::uint32_t ui_instruction_trace_begin_clock_{};
@@ -6664,6 +6988,8 @@ private:
   std::uint32_t previous_application_state_{
       std::numeric_limits<std::uint32_t>::max()};
   bool menu_transition_active_{};
+  bool pause_menu_lifecycle_active_{};
+  bool pause_menu_player_was_present_{};
   std::uint64_t menu_vram_snapshots_{};
   std::uint64_t menu_vram_restores_{};
   std::vector<Sf2GpuPacket> pending_immediate_gpu_packets_;
@@ -6886,7 +7212,7 @@ private:
   std::uint64_t async_file_services_{};
   std::uint64_t async_file_completions_{};
   std::uint32_t last_async_completion_caller_{};
-  std::uint64_t raw_cd_sync_scheduler_slices_{};
+  std::uint64_t device_wait_scheduler_slices_{};
   std::uint32_t xa_status_source_{};
   std::uint32_t xa_status_result_{};
   std::optional<QuickState> quick_state_;
@@ -6897,6 +7223,13 @@ private:
   bool scripts_started_{};
   bool loading_confirm_sent_{};
   bool checkpoint_captured_{};
+  std::uint64_t checkpoint_capture_frame_{};
+  std::uint64_t retail_checkpoint_capture_calls_{};
+  bool retail_checkpoint_capture_pending_{};
+  bool mission_restart_requested_{};
+  bool quit_to_title_requested_{};
+  bool scripted_camera_observed_{};
+  bool initial_checkpoint_deferred_by_opening_event_{};
   bool retail_restore_active_{};
   std::uint64_t retail_restore_start_frame_{};
   std::uint64_t alpha_checkpoint_restores_{};
@@ -6990,6 +7323,19 @@ bool Sf2GuestMissionRuntime::setPlayerRoomForProbe(
 
 bool Sf2GuestMissionRuntime::exerciseRawCdSyncWaitForProbe() noexcept {
   return impl_->exerciseRawCdSyncWaitForProbe();
+}
+
+bool Sf2GuestMissionRuntime::exerciseCleanMissionRestartForProbe() noexcept {
+  return impl_->exerciseCleanMissionRestartForProbe();
+}
+
+bool Sf2GuestMissionRuntime::exerciseOpeningMissionRestartForProbe() noexcept {
+  return impl_->exerciseOpeningMissionRestartForProbe();
+}
+
+bool Sf2GuestMissionRuntime::exercisePauseMenuLifecycleForProbe(
+    bool save_and_quit) noexcept {
+  return impl_->exercisePauseMenuLifecycleForProbe(save_and_quit);
 }
 
 bool Sf2GuestMissionRuntime::setPlayerHealthForProbe(
@@ -7088,6 +7434,14 @@ bool Sf2GuestMissionRuntime::advanceHostUpdate() noexcept {
 
 bool Sf2GuestMissionRuntime::missionCompleteRequested() const noexcept {
   return impl_->missionCompleteRequested();
+}
+
+bool Sf2GuestMissionRuntime::missionRestartRequested() const noexcept {
+  return impl_->missionRestartRequested();
+}
+
+bool Sf2GuestMissionRuntime::quitToTitleRequested() const noexcept {
+  return impl_->quitToTitleRequested();
 }
 
 const std::shared_ptr<const Sf2PresentationFrame> &

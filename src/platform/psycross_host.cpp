@@ -362,11 +362,12 @@ runCampaignSaveMenu(const game::MissionPackage &mission,
                     const game::TitleSaveSlots &slots, PADRAW &pad,
                     std::uint16_t &previous_buttons,
                     detail::PsyCrossUiAudio &ui_audio,
-                    const KeyboardMouseBindings &bindings) {
+                    const KeyboardMouseBindings &bindings,
+                    detail::CampaignSavePurpose purpose) {
   // Gameplay already owns the correct 384x240 presentation target. Reuse its
   // original font/ACD renderer instead of switching to the debug-font movie
   // target whose VRAM page has been overwritten by the mission renderer.
-  detail::PsyCrossCampaignSaveRenderer renderer{mission, bindings};
+  detail::PsyCrossCampaignSaveRenderer renderer{mission, bindings, purpose};
   PsyX_Log_Info("Campaign save UI entered\n");
   game::CampaignSaveMenu menu;
   auto analog_direction = 0;
@@ -641,8 +642,9 @@ public:
     bool title_next_was_down{};
     detail::PsyCrossUiAudio ui_audio{cue_path_};
     detail::PsyCrossMoviePlayer movie_player;
-    detail::PsyCrossCampaignSaveRenderer title_load_renderer{initial_mission_,
-                                                              input_};
+    detail::PsyCrossCampaignSaveRenderer title_load_renderer{
+        initial_mission_, input_,
+        detail::CampaignSavePurpose::mission_complete};
     const detail::MovieOverlayCallbacks overlay{
         [this, &pad, &ui_audio, &title_cheat_latched,
          &title_keyboard_initialized, &title_interact_was_down,
@@ -822,6 +824,7 @@ public:
       std::optional<game::MissionPackage> loaded_mission;
       auto campaign_cue_path = cue_path_;
       auto exit_application = false;
+      auto restart_active_mission = false;
       while (campaign->active()) {
         const auto mission_index = campaign->missionIndex();
         if (initial_mission_.gameId() == game::GameId::syphon_filter_2) {
@@ -888,17 +891,23 @@ public:
           }
           continue;
         }
-        if (campaign->openingMovieRequired(mission->definition())) {
-          previous_buttons = movie_player.playStandalone(
-              mission->openingMovie(), pad, previous_buttons);
+        if (!restart_active_mission) {
+          if (campaign->openingMovieRequired(mission->definition())) {
+            previous_buttons = movie_player.playStandalone(
+                mission->openingMovie(), pad, previous_buttons);
+          }
+          campaign->markOpeningMovieHandled();
+          // Every campaign entry owns a mission-start loading boundary. DLFs
+          // with authored directive text use it verbatim; continuation maps
+          // use their catalog title instead of silently skipping briefing UI.
+          previous_buttons =
+              mission_start.run(*mission, pad, previous_buttons, input_,
+                                campaign_carry);
+        } else {
+          PsyX_Log_Info("Restarting active mission package: mission=%u\n",
+                        mission_index + 1U);
         }
-        campaign->markOpeningMovieHandled();
-        // Every campaign entry owns a mission-start loading boundary. DLFs
-        // with authored directive text use it verbatim; continuation maps use
-        // their catalog title instead of silently skipping the briefing UI.
-        previous_buttons =
-            mission_start.run(*mission, pad, previous_buttons, input_,
-                              campaign_carry);
+        restart_active_mission = false;
 
         const auto &definition = mission->definition();
         std::cout << "Starting mission " << (definition.index + 1U) << ": "
@@ -915,6 +924,48 @@ public:
                              mission_start.takePreloadedAudio(),
                              campaign_carry);
         previous_buttons = scene_result.previous_buttons;
+        if (scene_result.reason ==
+            detail::SceneExitReason::save_and_return_to_title) {
+          // Retail MENU has already confirmed Save and Quit and released its
+          // gameplay package. The absent frontend would now offer memory-card
+          // slots. Reuse the native durable slot owner, saving the current
+          // mission cursor rather than staging a mission-completion advance.
+          const auto save_result = runCampaignSaveMenu(
+              *mission, save_slots, pad, previous_buttons, ui_audio, input_,
+              detail::CampaignSavePurpose::save_and_quit);
+          if (save_result.decision == game::CampaignSaveDecision::save &&
+              save_result.slot) {
+            auto candidate_campaign = *campaign;
+            auto candidate_slots = save_slots;
+            if (!candidate_campaign.saveCurrentMissionInSlot(
+                    candidate_slots, *save_result.slot,
+                    scene_result.carry)) {
+              PsyX_Log_Error("Save-and-quit transaction rejected state\n");
+              break;
+            }
+            const auto store_decision = storeTitleSaveSlotsWithRecovery(
+                save_path, candidate_slots, campaign_mission_count, pad,
+                previous_buttons, input_);
+            if (store_decision == SaveStoreDecision::stored) {
+              *campaign = std::move(candidate_campaign);
+              save_slots = std::move(candidate_slots);
+              PsyX_Log_Info(
+                  "Saved current campaign mission before returning to title: "
+                  "slot=%zu mission=%u\n",
+                  *save_result.slot + 1U, mission_index + 1U);
+            }
+          }
+          break;
+        }
+        if (scene_result.reason == detail::SceneExitReason::restart_mission) {
+          // Retail Restart Mission and a failure before the first checkpoint
+          // rebuild the current package. Keep campaign position/carry, but do
+          // not replay the SOL movie or briefing which belong to campaign
+          // entry rather than the in-mission restart lifecycle.
+          restart_active_mission = true;
+          loaded_mission.reset();
+          continue;
+        }
         if (scene_result.reason == detail::SceneExitReason::mission_selected &&
             scene_result.selected_mission) {
           const auto selected = *scene_result.selected_mission;
@@ -969,8 +1020,9 @@ public:
           const auto save_result =
               replaying_unlocked_mission
                   ? game::CampaignSaveResult{}
-                  : runCampaignSaveMenu(*mission, save_slots, pad,
-                                        previous_buttons, ui_audio, input_);
+                  : runCampaignSaveMenu(
+                        *mission, save_slots, pad, previous_buttons, ui_audio,
+                        input_, detail::CampaignSavePurpose::mission_complete);
           auto candidate_campaign = *campaign;
           auto candidate_slots = save_slots;
           auto advance = game::CampaignAdvance::invalid;
@@ -1096,17 +1148,34 @@ public:
       preloaded_gameplay = std::make_unique<game::GameplaySession>(mission_);
     }
     detail::PsyCrossSceneViewer scene_viewer{input_, cheats_};
-    const auto result = scene_viewer.run(mission_, pad, previous_buttons,
-                                         cue_path_, mission_.definition().index,
-                                         std::move(preloaded_gameplay),
-                                         std::move(preloaded_audio));
-    if (result.reason == detail::SceneExitReason::mission_complete &&
-        !mission_.endingMovie().path.empty()) {
-      static_cast<void>(movie_player.playStandalone(mission_.endingMovie(), pad,
-                                                    result.previous_buttons,
-                                                    endingMovieSkipPolicy(
-                                                        mission_.gameId(),
-                                                        mission_.definition())));
+    for (;;) {
+      const auto result = scene_viewer.run(
+          mission_, pad, previous_buttons, cue_path_,
+          mission_.definition().index, std::move(preloaded_gameplay),
+          std::move(preloaded_audio));
+      previous_buttons = result.previous_buttons;
+      if (result.reason == detail::SceneExitReason::restart_mission) {
+        // Scene-test is also the public direct-mission launcher. A clean
+        // restart yield therefore has the same ownership contract as the
+        // campaign host: discard every scene-local guest/audio/presentation
+        // object and construct a new runtime for the same package, without
+        // replaying its opening STR or briefing. Returning from run() here
+        // made a successful retail death/restart look like an application
+        // crash even though the guest had yielded cleanly.
+        PsyX_Log_Info("Restarting scene-test mission package: mission=%u\n",
+                      mission_.definition().index + 1U);
+        preloaded_gameplay =
+            std::make_unique<game::GameplaySession>(mission_);
+        preloaded_audio.reset();
+        continue;
+      }
+      if (result.reason == detail::SceneExitReason::mission_complete &&
+          !mission_.endingMovie().path.empty()) {
+        previous_buttons = movie_player.playStandalone(
+            mission_.endingMovie(), pad, previous_buttons,
+            endingMovieSkipPolicy(mission_.gameId(), mission_.definition()));
+      }
+      break;
     }
     PadStopCom();
   }

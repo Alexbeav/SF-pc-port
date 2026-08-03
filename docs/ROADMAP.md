@@ -7,9 +7,9 @@ hardware-documentation work. Generic fixes, deterministic tests, diagnostic
 tools, and independently verified documentation corrections that can help an
 upstream project should be separated from Syphon Filter-specific material and
 prepared for contribution upstream. Follow
-`I:\Projects\PSX-References\COMMUNITY_CONTRIBUTION_POLICY.md`; never include
-retail data, private research, personal paths, or license-incompatible code in
-a public report or patch.
+[the repository contribution policy](../CONTRIBUTING.md); never include retail
+data, private research, personal paths, or license-incompatible code in a
+public report or patch.
 
 ## Retail gameplay completion
 
@@ -57,13 +57,17 @@ Mission 1 introduction, checkpoint restart, and in-session F5/F9 are stable in
 the tested routes. A reproducible 42-route matrix now passes 3,000-update
 quick-state and combat/restart coverage for Missions 1--21 across both discs
 with no collision-residency gap or renderer containment. Connected campaign
-save/carry/disc/movie handoff is implemented and deterministically reaches the
-Mission 3-to-4 boundary. Retail-indexed in-mission FMVs are also bridged for
+save/disc/movie handoff is implemented and has interactive coverage through
+the Disc 1-to-2 seam. Newly loaded SF2 guest packages retain their authored
+character, vitals and loadout; the exact sequel carry block remains durable
+save metadata and is deliberately not injected into the destination runtime.
+All 21 forced success-shell routes now reject the former cross-character
+inventory leak. Retail-indexed in-mission FMVs are also bridged for
 AIRBASE (`3_2`/`3_3`) and AIRBASEX (`6_3`). Retail success-shell tracing now
 maps every authored EOL selection on both discs, including Mission 21's
 `21_2.STR` and the post-campaign `Z17_1.STR`; all mapped ranges decode strictly.
-The final interactive Mission 3-to-4 handoff and broader natural completion
-playthroughs remain the release gate.
+Consecutive natural completion through Missions 8--21 and the finale remains
+the release gate.
 
 Mission 5's missing opening actors and vehicle choreography were traced to
 nested `NPC.HOG` resources whose retail synchronous completion path was not
@@ -95,9 +99,13 @@ the final confirmation for that fix.
 4. **All-mission validation** — complete all 21 missions while auditing
    objectives, conversations, failure conditions, bosses, special mechanics,
    checkpoints, mission-specific audio/resources, and end-of-level transitions.
-5. **Connected SF2 campaign** — integrate title/menu selection, natural
-   mission-to-mission progression, persistent saves, cinematic handoffs,
-   Disc 1-to-Disc 2 transition, final completion/credits, and launcher support.
+5. **Connected SF2 campaign and frontend** — integrate title/menu selection,
+   including retail's `New Game -> One Player / Two Players` hierarchy,
+   natural mission-to-mission progression, persistent saves, cinematic
+   handoffs, Disc 1-to-Disc 2 transition, final completion/credits, and
+   launcher support. One Player owns the campaign route already under test;
+   Two Players additionally requires arena selection, two-pad ownership, and
+   split-screen presentation before it may be advertised as supported.
 6. **Audio, input, and PC polish** — validate music and dialogue interruption
    across the campaign, tune mouse aiming, expose original/modern control
    options, complete controller testing, and polish quick-state presentation.

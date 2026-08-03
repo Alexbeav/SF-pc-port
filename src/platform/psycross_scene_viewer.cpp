@@ -25,6 +25,7 @@
 #include "sf/game/supported_games.hpp"
 #include "sf/platform/player_input.hpp"
 #include "sf/platform/retail_scope_text_policy.hpp"
+#include "sf/platform/sf2_widescreen_policy.hpp"
 #include "sf/platform/stable_frame_vector.hpp"
 
 #include <PsyX/PsyX_globals.h>
@@ -13039,23 +13040,37 @@ bool drawPauseMenu(const game::PauseMenu &menu,
 } // namespace
 
 struct PsyCrossCampaignSaveRenderer::State {
-  State(const game::MissionPackage &mission, KeyboardMouseBindings input)
-      : textures{mission}, input{input}, game_id{mission.gameId()} {}
+  State(const game::MissionPackage &mission, KeyboardMouseBindings input,
+        CampaignSavePurpose purpose)
+      : textures{mission}, input{input}, game_id{mission.gameId()},
+        purpose{purpose} {}
 
   HudTextureAtlas textures;
   KeyboardMouseBindings input;
   game::GameId game_id{game::GameId::syphon_filter};
+  CampaignSavePurpose purpose{CampaignSavePurpose::mission_complete};
   std::uint64_t animation_tick{};
 };
 
 PsyCrossCampaignSaveRenderer::PsyCrossCampaignSaveRenderer(
-    const game::MissionPackage &mission, KeyboardMouseBindings input)
-    : state_{std::make_unique<State>(mission, input)} {}
+    const game::MissionPackage &mission, KeyboardMouseBindings input,
+    CampaignSavePurpose purpose)
+    : state_{std::make_unique<State>(mission, input, purpose)} {}
 
 PsyCrossCampaignSaveRenderer::~PsyCrossCampaignSaveRenderer() = default;
 
 void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
                                         const game::TitleSaveSlots &slots) {
+  // Retail MENU leaves its authored display-page offset and drawing clip live
+  // when it hands Save and Quit to the native slot owner.  Native ACD
+  // coordinates are already absolute 384x240 screen coordinates, so inheriting
+  // that E3/E4/E5 state shifts the complete menu down and right.  Establish a
+  // fresh screen-space target at the ownership boundary on every frame.
+  DRAWENV native_environment{};
+  SetDefDrawEnv(&native_environment, 0, 0, screen_width, screen_height);
+  native_environment.dtd = 0;
+  native_environment.dfe = 1;
+  PutDrawEnv(&native_environment);
   GR_SetBlendMode(BM_NONE);
   GR_SetPolygonOffset(0.0F, 0.0F);
   GR_SetDepthState(0, 0);
@@ -13077,7 +13092,10 @@ void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
                  state_->input);
   };
 
-  text("Mission Complete", {52, 35, 165, 10}, selected);
+  const auto save_and_quit =
+      state_->purpose == CampaignSavePurpose::save_and_quit;
+  text(save_and_quit ? "Save and Quit" : "Mission Complete",
+       {52, 35, 165, 10}, selected);
   if (menu.phase() == game::CampaignSavePhase::prompt) {
     text("Save Mission?", {52, 76, 165, 12}, normal,
          game::PauseTextAlignment::center);
@@ -13089,7 +13107,9 @@ void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
          game::PauseTextAlignment::center);
     text("No", {144, 106, 58, 9}, menu.saveSelected() ? normal : selected,
          game::PauseTextAlignment::center);
-    text("Save completed mission data", {236, 44, 109, 48});
+    text(save_and_quit ? "Save current mission progress"
+                       : "Save completed mission data",
+         {236, 44, 109, 48});
     text("%x select", game::PauseAcdLayout::hint, normal);
   } else {
     text("Memory Card", {52, 54, 165, 10}, selected,
@@ -13127,6 +13147,11 @@ void PsyCrossCampaignSaveRenderer::draw(const game::CampaignSaveMenu &menu,
 
 void PsyCrossCampaignSaveRenderer::drawLoadSlots(
     const game::TitleSaveSlots &slots, std::size_t selection) {
+  DRAWENV native_environment{};
+  SetDefDrawEnv(&native_environment, 0, 0, screen_width, screen_height);
+  native_environment.dtd = 0;
+  native_environment.dfe = 1;
+  PutDrawEnv(&native_environment);
   GR_SetBlendMode(BM_NONE);
   GR_SetPolygonOffset(0.0F, 0.0F);
   GR_SetDepthState(0, 0);
@@ -13323,6 +13348,35 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
     const auto y = [&words](std::size_t index) {
       return static_cast<float>(packedScreenY(words[index]));
     };
+    const auto authored_bounds = [&words](
+                                     std::initializer_list<std::size_t>
+                                         coordinate_indices) {
+      auto minimum_x = std::numeric_limits<std::int16_t>::max();
+      auto maximum_x = std::numeric_limits<std::int16_t>::min();
+      auto minimum_y = std::numeric_limits<std::int16_t>::max();
+      auto maximum_y = std::numeric_limits<std::int16_t>::min();
+      for (const auto index : coordinate_indices) {
+        minimum_x = std::min(minimum_x, packedScreenX(words[index]));
+        maximum_x = std::max(maximum_x, packedScreenX(words[index]));
+        minimum_y = std::min(minimum_y, packedScreenY(words[index]));
+        maximum_y = std::max(maximum_y, packedScreenY(words[index]));
+      }
+      return Sf2PrimitiveBounds{minimum_x, minimum_y, maximum_x, maximum_y};
+    };
+    const auto auxiliary_fullscreen_scale = [&](
+                                                 std::initializer_list<
+                                                     std::size_t>
+                                                     coordinate_indices) {
+      if (native_wide_world ||
+          !sf2AuxiliaryPrimitiveOwnsFullWidth(
+              authored_bounds(coordinate_indices))) {
+        return 1.0F;
+      }
+      return std::max(PsyX_CalculatePresentationScale(
+                          g_windowWidth, g_windowHeight, g_cfg_aspectMode)
+                          .x,
+                      0.01F);
+    };
     // SF2 disables preallocated primitives by placing vertices at
     // (-1024,-1024). Polygon projection near the camera can produce the same
     // large raw-coordinate spans. The PS1 rejects polygons spanning 1024
@@ -13362,8 +13416,12 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       setPacketColor(words[3U], primitive.r1, primitive.g1, primitive.b1);
       setPacketColor(words[6U], primitive.r2, primitive.g2, primitive.b2);
       setPacketColor(words[9U], primitive.r3, primitive.g3, primitive.b3);
-      setXY4(&primitive, x(1U), y(1U), x(4U), y(4U), x(7U), y(7U),
-             x(10U), y(10U));
+      const auto fullscreen_scale =
+          auxiliary_fullscreen_scale({1U, 4U, 7U, 10U});
+      setXY4(&primitive, x(1U) / fullscreen_scale, y(1U),
+             x(4U) / fullscreen_scale, y(4U),
+             x(7U) / fullscreen_scale, y(7U),
+             x(10U) / fullscreen_scale, y(10U));
       setUV4(&primitive, static_cast<std::uint8_t>(words[2U]),
              static_cast<std::uint8_t>(words[2U] >> 8U),
              static_cast<std::uint8_t>(words[5U]),
@@ -13393,8 +13451,12 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       setPacketColor(words[2U], primitive.r1, primitive.g1, primitive.b1);
       setPacketColor(words[4U], primitive.r2, primitive.g2, primitive.b2);
       setPacketColor(words[6U], primitive.r3, primitive.g3, primitive.b3);
-      setXY4(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U),
-             x(7U), y(7U));
+      const auto fullscreen_scale =
+          auxiliary_fullscreen_scale({1U, 3U, 5U, 7U});
+      setXY4(&primitive, x(1U) / fullscreen_scale, y(1U),
+             x(3U) / fullscreen_scale, y(3U),
+             x(5U) / fullscreen_scale, y(5U),
+             x(7U) / fullscreen_scale, y(7U));
       DrawPrim(&primitive);
       return;
     }
@@ -13447,8 +13509,12 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       setPolyFT4(&primitive);
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
-      setXY4(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U),
-             x(7U), y(7U));
+      const auto fullscreen_scale =
+          auxiliary_fullscreen_scale({1U, 3U, 5U, 7U});
+      setXY4(&primitive, x(1U) / fullscreen_scale, y(1U),
+             x(3U) / fullscreen_scale, y(3U),
+             x(5U) / fullscreen_scale, y(5U),
+             x(7U) / fullscreen_scale, y(7U));
       setUV4(&primitive, static_cast<std::uint8_t>(words[2U]),
              static_cast<std::uint8_t>(words[2U] >> 8U),
              static_cast<std::uint8_t>(words[4U]),
@@ -13471,14 +13537,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       if (polygon_span_rejected({1U, 2U, 3U, 4U})) {
         return;
       }
-      const auto minimum_y = std::min({packedScreenY(words[1U]),
-                                       packedScreenY(words[2U]),
-                                       packedScreenY(words[3U]),
-                                       packedScreenY(words[4U])});
-      const auto maximum_y = std::max({packedScreenY(words[1U]),
-                                       packedScreenY(words[2U]),
-                                       packedScreenY(words[3U]),
-                                       packedScreenY(words[4U])});
+      const auto bounds = authored_bounds({1U, 2U, 3U, 4U});
       // Retail animates its cinematic mattes as black F4 quads attached to
       // the top and bottom edges.  Auxiliary OTs retain their authored 4:3
       // coordinates, so widen those quads continuously as their Y edges
@@ -13487,11 +13546,11 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       // snap into place.  World OTs already receive the same compensation
       // through world_presentation_scale and must not be scaled twice.
       const auto animated_cinematic_matte =
-          (words[0U] & 0x00ffffffU) == 0U &&
-          (minimum_y <= -screen_height / 2 ||
-           maximum_y >= screen_height / 2);
+          sf2AnimatedCinematicMatteOwnsFullWidth(bounds, words[0U]);
       const auto horizontal_scale =
-          animated_cinematic_matte && !native_wide_world
+          !native_wide_world &&
+                  (animated_cinematic_matte ||
+                   sf2AuxiliaryPrimitiveOwnsFullWidth(bounds))
               ? std::max(PsyX_CalculatePresentationScale(
                              g_windowWidth, g_windowHeight, g_cfg_aspectMode)
                              .x,
@@ -13595,9 +13654,33 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       // zero-length primitive.
       primitive.code = static_cast<std::uint8_t>(opcode & 0xfeU);
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
-      setXY0(&primitive, x(1U), y(1U));
-      setWH(&primitive, static_cast<std::uint16_t>(words[2U]),
-            static_cast<std::uint16_t>(words[2U] >> 16U));
+      const auto width = static_cast<std::uint16_t>(words[2U]);
+      const auto height = static_cast<std::uint16_t>(words[2U] >> 16U);
+      const auto left = packedScreenX(words[1U]);
+      const auto top = packedScreenY(words[1U]);
+      const auto bounds = Sf2PrimitiveBounds{
+          left, top,
+          static_cast<std::int16_t>(static_cast<std::int32_t>(left) + width),
+          static_cast<std::int16_t>(static_cast<std::int32_t>(top) + height)};
+      const auto owns_full_width =
+          sf2AuxiliaryPrimitiveOwnsFullWidth(bounds);
+      const auto auxiliary_scale =
+          owns_full_width && !native_wide_world
+              ? std::max(PsyX_CalculatePresentationScale(
+                             g_windowWidth, g_windowHeight,
+                             g_cfg_aspectMode)
+                             .x,
+                         0.01F)
+              : 1.0F;
+      const auto width_scale = owns_full_width
+                                   ? (native_wide_world
+                                          ? world_presentation_scale
+                                          : auxiliary_scale)
+                                   : 1.0F;
+      setXY0(&primitive, x(1U) / auxiliary_scale, y(1U));
+      setWH(&primitive,
+            static_cast<std::uint16_t>(std::lround(width / width_scale)),
+            height);
       DrawPrim(&primitive);
       return;
     }
@@ -14087,6 +14170,11 @@ SceneViewerResult runSf2GuestScene(
       runtime.inputSampleCount()};
   auto hud_input_sample = runtime.inputSampleCount();
   auto checkpoint_restores = runtime.diagnostics().checkpoint_restores;
+  // The retail terminal/menu callback may dismantle the live inventory table
+  // on the same update that yields to the native campaign owner. Retain the
+  // newest coherent projection from the preceding gameplay boundary.
+  auto latest_campaign_carry =
+      game::sf2CampaignCarryState(runtime.diagnostics());
   auto guest_room = runtime.diagnostics().guest_current_room;
   auto collision_room_record =
       runtime.diagnostics().guest_collision_room_record;
@@ -14862,8 +14950,10 @@ SceneViewerResult runSf2GuestScene(
       }
       if (!runtime.advanceHostUpdate()) {
         if (runtime.missionCompleteRequested()) {
-          const auto carry =
-              game::sf2CampaignCarryState(runtime.diagnostics());
+          auto carry = game::sf2CampaignCarryState(runtime.diagnostics());
+          if (!carry) {
+            carry = latest_campaign_carry;
+          }
           runtime.clearPcm();
           mouse_capture.set(false);
           PsyX_Log_Info("SF2 retail mission completion handoff\n");
@@ -14878,7 +14968,31 @@ SceneViewerResult runSf2GuestScene(
         return SceneViewerResult{previous_buttons,
                                  SceneExitReason::return_to_title};
       }
+      if (runtime.missionRestartRequested()) {
+        runtime.clearPcm();
+        audio.reset("sf2-clean-mission-restart");
+        mouse_capture.set(false);
+        PsyX_Log_Info("SF2 retail clean mission restart handoff\n");
+        return SceneViewerResult{previous_buttons,
+                                 SceneExitReason::restart_mission};
+      }
+      if (runtime.quitToTitleRequested()) {
+        runtime.clearPcm();
+        audio.reset("sf2-retail-quit-to-title");
+        mouse_capture.set(false);
+        PsyX_Log_Info("SF2 retail save-and-quit handoff\n");
+        return SceneViewerResult{previous_buttons,
+                                 SceneExitReason::save_and_return_to_title,
+                                 std::nullopt, latest_campaign_carry};
+      }
       const auto post_update_diagnostics = runtime.diagnostics();
+      if (post_update_diagnostics.player_instance != 0U &&
+          post_update_diagnostics.player_health != 0U) {
+        if (auto carry =
+                game::sf2CampaignCarryState(post_update_diagnostics)) {
+          latest_campaign_carry = std::move(carry);
+        }
+      }
       {
         const auto &current = post_update_diagnostics;
         if (current.damage_events != combat_diagnostics.damage_events ||
@@ -14945,8 +15059,10 @@ SceneViewerResult runSf2GuestScene(
         }
       }
       if (runtime.missionCompleteRequested()) {
-        const auto carry =
-            game::sf2CampaignCarryState(runtime.diagnostics());
+        auto carry = game::sf2CampaignCarryState(runtime.diagnostics());
+        if (!carry) {
+          carry = latest_campaign_carry;
+        }
         runtime.clearPcm();
         mouse_capture.set(false);
         PsyX_Log_Info("SF2 retail mission completion handoff\n");

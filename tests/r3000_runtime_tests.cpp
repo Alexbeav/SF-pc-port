@@ -106,6 +106,58 @@ void testBranchDelay() {
   require(runtime.state().gpr[3] == 5U, "JR did not execute its delay slot");
 }
 
+void testJalrLinkRegister() {
+  // SF2 uses descriptor trampolines such as `jalr $a1,$t0`. Preserve the
+  // encoded link register instead of treating every indirect call as the
+  // conventional `jalr $ra,rs` form.
+  sf::psx::R3000Runtime runtime;
+  constexpr auto target = code_address + 24U;
+  constexpr auto continuation = code_address + 16U;
+  constexpr std::array words{
+      encodeI(0x0fU, 0U, 8U, static_cast<std::uint16_t>(target >> 16U)),
+      encodeI(0x0dU, 8U, 8U, static_cast<std::uint16_t>(target)),
+      encodeR(8U, 0U, 5U, 0U, 0x09U),
+      encodeI(0x09U, 0U, 2U, 7U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+      encodeR(5U, 0U, 3U, 0U, 0x21U),
+      encodeR(5U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  loadCode(runtime, words);
+  const auto result = runtime.call(code_address);
+  require(result.reason == sf::psx::R3000StopReason::returned,
+          "Non-ra JALR program did not return");
+  require(runtime.state().gpr[5] == continuation &&
+              runtime.state().gpr[3] == continuation,
+          "JALR did not write the encoded link register");
+  require(runtime.state().gpr[2] == 7U,
+          "JALR did not execute its delay slot");
+
+  // rd=0 is a linkless indirect jump. If an implementation rewrites it to
+  // $ra, the target returns into the deliberately invalid fallthrough word
+  // instead of crossing the host-call return boundary.
+  sf::psx::R3000Runtime linkless_runtime;
+  constexpr auto linkless_target = code_address + 20U;
+  constexpr std::array linkless_words{
+      encodeI(0x0fU, 0U, 8U,
+              static_cast<std::uint16_t>(linkless_target >> 16U)),
+      encodeI(0x0dU, 8U, 8U, static_cast<std::uint16_t>(linkless_target)),
+      encodeR(8U, 0U, 0U, 0U, 0x09U),
+      encodeI(0x09U, 0U, 2U, 1U),
+      0xffffffffU,
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      encodeI(0x09U, 0U, 3U, 2U),
+  };
+  loadCode(linkless_runtime, linkless_words);
+  const auto linkless_result = linkless_runtime.call(code_address);
+  require(linkless_result.reason == sf::psx::R3000StopReason::returned,
+          "Linkless JALR fabricated an ra continuation");
+  require(linkless_runtime.state().gpr[2] == 1U &&
+              linkless_runtime.state().gpr[3] == 2U,
+          "Linkless JALR delay slot or target did not execute");
+}
+
 void testLoadDelay() {
   sf::psx::R3000Runtime runtime;
   constexpr std::array words{
@@ -126,6 +178,34 @@ void testLoadDelay() {
           "Delayed load never became visible");
   require(runtime.state().gpr[5] == 9U,
           "Register write did not cancel an incoming load");
+
+  // Unaligned word loads are normally emitted as an adjacent LWL/LWR pair.
+  // The second instruction must merge with the first instruction's pending
+  // value, while an immediate consumer after the pair still observes the old
+  // architectural register until the final delayed load commits.
+  sf::psx::R3000Runtime partial_runtime;
+  constexpr std::array partial_words{
+      encodeI(0x0fU, 0U, 8U, 0x8001U),
+      encodeI(0x0fU, 0U, 10U, 0xdeadU),
+      encodeI(0x0dU, 10U, 10U, 0xbeefU),
+      encodeI(0x22U, 8U, 10U, 0x0204U),
+      encodeI(0x26U, 8U, 10U, 0x0201U),
+      encodeR(10U, 0U, 11U, 0U, 0x21U),
+      encodeR(10U, 0U, 12U, 0U, 0x21U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  loadCode(partial_runtime, partial_words);
+  require(partial_runtime.write32(0x80010200U, 0x44332211U) &&
+              partial_runtime.write32(0x80010204U, 0x88776655U),
+          "Could not seed partial-load data");
+  const auto partial_result = partial_runtime.call(code_address);
+  require(partial_result.reason == sf::psx::R3000StopReason::returned,
+          "Partial-load delay program did not return");
+  require(partial_runtime.state().gpr[11] == 0xdeadbeefU,
+          "LWL/LWR result was visible one instruction too early");
+  require(partial_runtime.state().gpr[12] == 0x55443322U,
+          "Adjacent LWL/LWR did not merge through delayed-load state");
 
   constexpr std::array return_load_words{
       encodeI(0x0fU, 0U, 8U, 0x8001U),
@@ -1723,14 +1803,6 @@ void testLegacyGameplayVmBoundary() {
   const auto result = vm.invoke(overlay_address, arguments);
   require(result.completed() && result.return_value == 42U,
           "Legacy VM did not execute an overlay function");
-  require(vm.runtime().beginCall(overlay_address, arguments),
-          "Could not prepare clock-neutral guest execution");
-  vm.runtime().setExternalInterrupt(true);
-  const auto clock_neutral_result = vm.resumeCurrentPcClockNeutral();
-  require(clock_neutral_result.completed() &&
-              clock_neutral_result.return_value == 42U,
-          "Clock-neutral guest execution entered an unowned interrupt vector");
-
   std::uint32_t pass_through_calls{};
   vm.bindHostCall(
       overlay_address,
@@ -6456,6 +6528,69 @@ void testLegacyGameplayVmBoundary() {
           "Retail SUBWAY source-30 MOVIE handoff was mistaken for INTRO");
 }
 
+void testLegacyGameplayVmClockOwnership() {
+  constexpr std::array initial_words{
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  const auto initial_code = instructionBytes(initial_words);
+  std::vector<std::byte> executable_bytes(2048U + initial_code.size());
+  constexpr std::string_view signature{"PS-X EXE"};
+  std::ranges::transform(signature, executable_bytes.begin(), [](char value) {
+    return static_cast<std::byte>(value);
+  });
+  writeLe32(executable_bytes, 0x10U, code_address);
+  writeLe32(executable_bytes, 0x18U, code_address);
+  writeLe32(executable_bytes, 0x1cU,
+            static_cast<std::uint32_t>(initial_code.size()));
+  std::ranges::copy(initial_code, executable_bytes.begin() + 2048);
+
+  const auto executable = sf::psx::Executable::parse(executable_bytes);
+  sf::game::LegacyGameplayVm vm{executable};
+  constexpr std::uint32_t overlay_address = 0x80020000U;
+  constexpr std::array overlay_words{
+      encodeI(0x09U, 4U, 2U, 1U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U),
+      0U,
+  };
+  require(vm.loadOverlay(overlay_address, instructionBytes(overlay_words)),
+          "Could not prepare clock-ownership fixture");
+  const std::array arguments{41U};
+
+  require(vm.runtime().beginCall(overlay_address, arguments),
+          "Could not prepare clock-neutral guest execution");
+  vm.runtime().setExternalInterrupt(true);
+  const auto clock_neutral_result = vm.resumeCurrentPcClockNeutral();
+  require(clock_neutral_result.completed() &&
+              clock_neutral_result.return_value == 42U,
+          "Clock-neutral guest execution entered an unowned interrupt vector");
+
+  require(vm.runtime().beginCall(overlay_address, arguments),
+          "Could not prepare interrupt-suppressed hardware-clocked execution");
+  const auto hardware_tick_before = vm.machine().currentTick();
+  vm.runtime().setExternalInterrupt(true);
+  const auto hardware_clocked_result = vm.resumeCurrentPcHardwareClocked();
+  require(hardware_clocked_result.completed() &&
+              hardware_clocked_result.return_value == 42U &&
+              vm.machine().currentTick() > hardware_tick_before,
+          "Hardware-clocked guest execution lost device time or entered an "
+          "unowned interrupt vector");
+
+  constexpr std::uint32_t semantic_retrace_address = 0x80030000U;
+  require(vm.runtime().write32(semantic_retrace_address, 73U),
+          "Could not seed semantic VSync poll fixture");
+  vm.bindPsxVideoTimingCall(overlay_address, semantic_retrace_address);
+  const auto video_polls_before = vm.videoTimingPollCount();
+  const auto video_poll =
+      vm.invokeClockNeutral(overlay_address, std::array{0xffffffffU});
+  const auto video_wait =
+      vm.invokeClockNeutral(overlay_address, std::array{1U});
+  require(video_poll.completed() && video_poll.return_value == 73U &&
+              video_wait.completed() &&
+              vm.videoTimingPollCount() == video_polls_before + 1U,
+          "VSync query did not expose an exact semantic scheduler signal");
+}
+
 void testLegacyGameplayVmContinuousPump() {
   constexpr std::array loop_words{
       encodeI(0x09U, 8U, 8U, 1U),
@@ -6705,6 +6840,7 @@ void testWriteWatchSuppression() {
 int main() {
   try {
     testBranchDelay();
+    testJalrLinkRegister();
     testLoadDelay();
     testMultiplyAndDivide();
     testCop0Status();
@@ -6723,6 +6859,7 @@ int main() {
     testLegacyVirtualCd();
     testGuestPadBridge();
     testLegacyGameplayVmBoundary();
+    testLegacyGameplayVmClockOwnership();
     testLegacyGameplayVmContinuousPump();
     testWriteWatchSuppression();
     std::cout << "R3000 runtime tests passed\n";

@@ -1,4 +1,5 @@
 #include "PsyX/PsyX_public.h"
+#include "sf/platform/sf2_widescreen_policy.hpp"
 
 #include <cmath>
 #include <iostream>
@@ -76,6 +77,24 @@ void testInvalidSizeIsBounded() {
         "Viewport dimensions were not bounded to one pixel");
 }
 
+void testSf2FullscreenEffectOwnership() {
+    using sf::platform::Sf2PrimitiveBounds;
+    require(sf::platform::sf2AuxiliaryPrimitiveOwnsFullWidth(
+                Sf2PrimitiveBounds{-192, -120, 192, 120}),
+            "SF2 full-frame effect lost adaptive-width ownership");
+    require(sf::platform::sf2AuxiliaryPrimitiveOwnsFullWidth(
+                Sf2PrimitiveBounds{-192, 70, 192, 120}),
+            "SF2 cinematic bar lost adaptive-width ownership");
+    require(!sf::platform::sf2AuxiliaryPrimitiveOwnsFullWidth(
+                Sf2PrimitiveBounds{-64, -32, 64, 32}),
+            "Centered SF2 HUD primitive was mistaken for a fullscreen effect");
+    require(sf::platform::sf2AnimatedCinematicMatteOwnsFullWidth(
+                Sf2PrimitiveBounds{-160, -120, 160, -104}, 0U) &&
+                !sf::platform::sf2AnimatedCinematicMatteOwnsFullWidth(
+                    Sf2PrimitiveBounds{-160, -120, 160, -104}, 0x202020U),
+            "SF2 animated matte policy accepted a non-black UI primitive");
+}
+
 } // namespace
 
 int main() {
@@ -84,6 +103,7 @@ int main() {
         testAdaptiveUsesEntireDrawable();
         testAdaptivePreservesPixelAspect();
         testInvalidSizeIsBounded();
+        testSf2FullscreenEffectOwnership();
         std::cout << "Aspect ratio tests passed\n";
         return 0;
     } catch (const std::exception& error) {

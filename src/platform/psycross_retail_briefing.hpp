@@ -24,6 +24,10 @@ public:
   PsyCrossRetailBriefing(const PsyCrossRetailBriefing &) = delete;
   PsyCrossRetailBriefing &operator=(const PsyCrossRetailBriefing &) = delete;
 
+  // Dynamic VRAM writes must complete before PsyX_BeginScene so the scene's
+  // first textured split samples the newly authoritative VRAM texture.
+  void prepare(double retail_time) const;
+
   [[nodiscard]] bool draw(const assets::MissionBriefing &briefing,
                           double retail_time) const;
 

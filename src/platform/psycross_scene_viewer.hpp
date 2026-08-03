@@ -22,8 +22,15 @@ class PsyCrossAudioOutput;
 enum class SceneExitReason {
   exit_application,
   return_to_title,
+  save_and_return_to_title,
+  restart_mission,
   mission_complete,
   mission_selected,
+};
+
+enum class CampaignSavePurpose {
+  mission_complete,
+  save_and_quit,
 };
 
 struct SceneViewerResult {
@@ -39,7 +46,8 @@ struct SceneViewerResult {
 class PsyCrossCampaignSaveRenderer final {
 public:
   PsyCrossCampaignSaveRenderer(const game::MissionPackage &mission,
-                               KeyboardMouseBindings input);
+                               KeyboardMouseBindings input,
+                               CampaignSavePurpose purpose);
   ~PsyCrossCampaignSaveRenderer();
 
   PsyCrossCampaignSaveRenderer(const PsyCrossCampaignSaveRenderer &) = delete;

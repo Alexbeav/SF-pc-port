@@ -976,6 +976,9 @@ public:
   void bindPsxVideoTimingCall();
   void bindPsxVideoTimingCall(std::uint32_t vsync_address,
                               std::uint32_t retrace_counter_address);
+  [[nodiscard]] std::uint64_t videoTimingPollCount() const noexcept {
+    return video_timing_poll_count_;
+  }
   void bindPsxCdPendingCommandCall(std::uint32_t address,
                                    std::uint32_t state_address,
                                    std::uint32_t response_pointer_address,
@@ -1157,6 +1160,13 @@ public:
   // scheduler-owned boundary.
   [[nodiscard]] LegacyGameplayVmResult
   resumeCurrentPcClockNeutral(std::uint64_t execution_budget = 1'000'000U);
+  // Advance CPU-domain hardware time for each retired instruction while
+  // deliberately withholding guest exception entry. Hybrid runtimes use this
+  // after taking ownership of the platform callback/IRQ lifecycle: CD, DMA,
+  // SPU and timers must continue in guest-cycle time even though their retail
+  // interrupt dispatcher is not safe to enter asynchronously.
+  [[nodiscard]] LegacyGameplayVmResult
+  resumeCurrentPcHardwareClocked(std::uint64_t execution_budget = 1'000'000U);
   // Stop before executing boundary_address. When the address has a bound
   // host call, a later resumeCurrentPc() observes and dispatches it normally;
   // an unbound address is also useful as an exact guest continuation fence.
@@ -1164,6 +1174,10 @@ public:
   runCurrentPcUntilHostBoundary(std::uint32_t boundary_address,
                                 std::uint64_t execution_budget = 1'000'000U);
   [[nodiscard]] LegacyGameplayVmResult runCurrentPcUntilHostBoundaryClockNeutral(
+      std::uint32_t boundary_address,
+      std::uint64_t execution_budget = 1'000'000U);
+  [[nodiscard]] LegacyGameplayVmResult
+  runCurrentPcUntilHostBoundaryHardwareClocked(
       std::uint32_t boundary_address,
       std::uint64_t execution_budget = 1'000'000U);
   [[nodiscard]] LegacyGameplayVmResult
@@ -1249,7 +1263,8 @@ private:
   [[nodiscard]] LegacyGameplayVmResult
   runExecutionPump(std::optional<std::uint32_t> host_boundary,
                    std::uint64_t execution_budget,
-                   bool advance_guest_clock = true);
+                   bool advance_guest_clock = true,
+                   bool deliver_guest_interrupts = true);
   [[nodiscard]] bool
   issueCdRomCommand(std::uint8_t command,
                     std::span<const std::uint8_t> parameters,
@@ -1281,6 +1296,9 @@ private:
   std::shared_ptr<LegacyVirtualCd> virtual_cd_;
   std::uint32_t executable_initial_pc_{};
   std::uint32_t video_timing_baseline_{};
+  // Monotonic diagnostic signal. It is intentionally outside VM snapshots and
+  // must not be used as a device-scheduling discriminator.
+  std::uint64_t video_timing_poll_count_{};
   std::uint32_t cd_ready_callback_address_{0x80114cc4U};
   std::uint32_t cd_ready_result_address_{0x80125450U};
   std::uint32_t cd_ready_state_address_{0x80114f9dU};
