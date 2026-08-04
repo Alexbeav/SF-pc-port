@@ -1395,15 +1395,9 @@ SceneViewerResult PsyCrossSceneViewer::run(
         const auto relative = simulation_updates_this_frame == 0U
                                   ? latched_chase_look.consumeForGuestTick()
                                   : sf::platform::PlayerLookSample{};
-        // Keep body, animation and collision aligned by feeding horizontal
-        // motion through retail's normal turn axis. Vertical motion is a
-        // camera-only extension guarded by GameplaySession's camera locks.
-        simulation_input.turn = std::clamp(
-            simulation_input.turn +
-                relative.yaw /
-                    static_cast<double>(
-                        game::PlayerController::turn_units_per_update),
-            -1.0, 1.0);
+        // Mouse yaw is an angular delta applied atomically to Gabe and the
+        // chase orbit. Keyboard/controller turning keeps the retail axis.
+        simulation_input.look_yaw += relative.yaw;
         simulation_input.look_pitch += relative.pitch * 0.35;
       }
       latched_gameplay_input = {};

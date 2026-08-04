@@ -1597,6 +1597,19 @@ void testChaseCamera() {
                   epsilon,
           "Optional chase pitch moved the eye or escaped its clamp");
 
+  const auto look_right =
+      sf::game::applyChaseCameraYaw(behind_north, 1024.0);
+  require(std::abs(look_right.x -
+                   (behind_north.target_x -
+                    (behind_north.target_z - behind_north.z))) < epsilon &&
+              std::abs(look_right.z - behind_north.target_z) < epsilon &&
+              look_right.y == behind_north.y &&
+              look_right.target_x == behind_north.target_x &&
+              look_right.target_y == behind_north.target_y &&
+              look_right.target_z == behind_north.target_z &&
+              look_right.projection == behind_north.projection,
+          "Optional chase yaw did not preserve the authored orbit");
+
   const auto project_player_y = [&](double world_y) {
     constexpr auto native_screen_center_y = 120.0;
     constexpr auto native_projection = 320.0;

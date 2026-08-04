@@ -91,6 +91,21 @@ CameraState applyChaseCameraPitch(CameraState camera, double pitch) noexcept {
   return camera;
 }
 
+CameraState applyChaseCameraYaw(CameraState camera, double yaw) noexcept {
+  if (!std::isfinite(yaw)) {
+    return camera;
+  }
+  const auto radians =
+      yaw * (2.0 * std::numbers::pi / static_cast<double>(heading_angle_units));
+  const auto cosine = std::cos(radians);
+  const auto sine = std::sin(radians);
+  const auto offset_x = camera.x - camera.target_x;
+  const auto offset_z = camera.z - camera.target_z;
+  camera.x = camera.target_x + cosine * offset_x + sine * offset_z;
+  camera.z = camera.target_z - sine * offset_x + cosine * offset_z;
+  return camera;
+}
+
 ChaseCamera::ChaseCamera(ChaseCameraConfiguration configuration) noexcept
     : configuration_(configuration) {}
 

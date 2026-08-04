@@ -26,8 +26,9 @@ physical keyboard scancodes or mouse inputs and are saved in
 
 Mouse movement controls the sight while Aim is held. The optional **Mouse look
 in chase mode** checkbox in Input Configuration also captures the mouse during
-normal gameplay: horizontal motion turns Gabe through the retail turn path,
-while vertical motion pitches the unlocked chase camera. Scripted and locked
+normal gameplay: horizontal motion rotates Gabe and the chase-camera orbit as
+one proportional motion, while vertical motion pitches the unlocked camera.
+Scripted and locked
 cameras retain ownership. Separate horizontal and vertical sensitivity values
 are available beside the checkbox and accept values from 0.10 to 20.00. Crouch
 plus movement is the stealth locomotion path; Roll plus Strafe selects a side

@@ -1670,6 +1670,7 @@ void GameplaySession::reset() {
   host_manual_aim_strafe_ = 0.0;
   host_manual_aim_body_heading_.reset();
   host_free_look_active_ = false;
+  host_free_look_yaw_ = 0.0;
   host_free_look_pitch_ = 0.0;
   pending_host_aim_heading_restore_.reset();
   legacy_manual_aim_neutral_camera_.reset();
@@ -1923,6 +1924,7 @@ bool GameplaySession::restartCheckpoint() {
   host_manual_aim_strafe_ = 0.0;
   host_manual_aim_body_heading_.reset();
   host_free_look_active_ = false;
+  host_free_look_yaw_ = 0.0;
   host_free_look_pitch_ = 0.0;
   pending_host_aim_heading_restore_.reset();
   legacy_manual_aim_neutral_camera_.reset();
@@ -3933,6 +3935,7 @@ void GameplaySession::stageNativeChaseFreelook(const GameplayInput &input) {
       !legacy_first_mission_->openingFinished()) {
     if (input.aim) {
       host_free_look_active_ = false;
+      host_free_look_yaw_ = 0.0;
       host_free_look_pitch_ = 0.0;
     }
     return;
@@ -3942,11 +3945,31 @@ void GameplaySession::stageNativeChaseFreelook(const GameplayInput &input) {
       bridge->player.control_locked || bridge->camera.scripted ||
       bridge->camera.locked) {
     host_free_look_active_ = false;
+    host_free_look_yaw_ = 0.0;
     host_free_look_pitch_ = 0.0;
     return;
   }
 
   host_free_look_active_ = true;
+  if (std::abs(input.look_yaw) > 0.0001) {
+    const auto current_heading = headingFromDirection(
+        static_cast<double>(bridge->player.guest_rotation[2]),
+        static_cast<double>(bridge->player.guest_rotation[8]));
+    const auto yaw_delta = static_cast<std::int64_t>(std::clamp(
+        std::llround(input.look_yaw),
+        static_cast<long long>(std::numeric_limits<std::int32_t>::min()),
+        static_cast<long long>(std::numeric_limits<std::int32_t>::max())));
+    const auto target_heading = normalizeHeading(
+        static_cast<std::int64_t>(current_heading) + yaw_delta);
+    if (!legacy_first_mission_->restoreHostPlayerHeading(target_heading)) {
+      legacy_runtime_faulted_ = true;
+      mission_failed_ = true;
+      return;
+    }
+    host_free_look_yaw_ = std::remainder(
+        host_free_look_yaw_ + static_cast<double>(yaw_delta),
+        static_cast<double>(heading_angle_units));
+  }
   host_free_look_pitch_ =
       std::clamp(host_free_look_pitch_ + input.look_pitch, -512.0, 512.0);
 }
@@ -6430,8 +6453,9 @@ CameraState GameplaySession::camera() const noexcept {
     };
     if (host_free_look_active_ && !bridge.player.control_locked &&
         !camera.scripted && !camera.locked) {
-      native_chase =
-          applyChaseCameraPitch(native_chase, host_free_look_pitch_);
+      native_chase = applyChaseCameraYaw(native_chase, host_free_look_yaw_);
+      native_chase = applyChaseCameraPitch(native_chase,
+                                           host_free_look_pitch_);
     }
     return native_chase;
   }
