@@ -1338,7 +1338,6 @@ private:
   double host_manual_aim_strafe_{};
   std::optional<std::int32_t> host_manual_aim_body_heading_;
   bool host_free_look_active_{};
-  double host_free_look_yaw_{};
   double host_free_look_pitch_{};
   std::optional<std::int32_t> pending_host_aim_heading_restore_;
   std::optional<LegacyCameraBridgeState> legacy_manual_aim_neutral_camera_;
