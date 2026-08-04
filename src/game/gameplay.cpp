@@ -3931,6 +3931,9 @@ GameplayInput GameplaySession::admittedFirstPersonAimInput(
 void GameplaySession::stageNativeChaseFreelook(const GameplayInput &input) {
   if (input.aim || !playerAlive() || !legacyMissionAuthoritative() ||
       !legacy_first_mission_->openingFinished()) {
+    if (legacy_first_mission_ != nullptr) {
+      legacy_first_mission_->setHostChaseMouseYawInput(0, false);
+    }
     if (input.aim) {
       host_free_look_active_ = false;
       host_free_look_pitch_ = 0.0;
@@ -3941,12 +3944,19 @@ void GameplaySession::stageNativeChaseFreelook(const GameplayInput &input) {
   if (bridge == nullptr || !bridge->player.resident ||
       bridge->player.control_locked || bridge->camera.scripted ||
       bridge->camera.locked) {
+    legacy_first_mission_->setHostChaseMouseYawInput(0, false);
     host_free_look_active_ = false;
     host_free_look_pitch_ = 0.0;
     return;
   }
 
   host_free_look_active_ = true;
+  legacy_first_mission_->setHostChaseMouseYawInput(
+      static_cast<std::int32_t>(std::clamp(
+          std::llround(input.look_yaw),
+          static_cast<long long>(std::numeric_limits<std::int32_t>::min()),
+          static_cast<long long>(std::numeric_limits<std::int32_t>::max()))),
+      true);
   host_free_look_pitch_ =
       std::clamp(host_free_look_pitch_ + input.look_pitch, -512.0, 512.0);
 }
