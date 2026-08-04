@@ -185,6 +185,9 @@ inline constexpr auto keyboard_mouse_action_count =
 
 struct KeyboardMouseBindings {
   std::array<KeyboardMouseInput, keyboard_mouse_action_count> values{};
+  // Opt-in modern chase control. Disabled preserves the original RMB-only
+  // relative mouse capture and retail tank controls.
+  bool mouse_chase_look{};
 
   [[nodiscard]] KeyboardMouseInput
   operator[](KeyboardMouseAction action) const noexcept {
@@ -341,6 +344,9 @@ struct PlayerInputConfiguration {
 // would make identical physical travel depend on presentation refresh.
 inline constexpr double first_person_mouse_yaw_sensitivity = 3.0;
 inline constexpr double first_person_mouse_pitch_sensitivity = 2.75;
+// Chase motion uses independent tuning so first-person aim remains unchanged.
+inline constexpr double chase_mouse_yaw_sensitivity = 3.75;
+inline constexpr double chase_mouse_pitch_sensitivity = 1.5;
 
 struct PlayerActionState {
   bool held{};

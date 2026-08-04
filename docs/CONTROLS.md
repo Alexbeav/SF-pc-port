@@ -24,6 +24,10 @@ physical keyboard scancodes or mouse inputs and are saved in
 | Pause menu | Escape | Open or close pause |
 | Quick weapon 1..10 | 1..9, 0 | Equip the corresponding available quick slot |
 
-Mouse movement controls the sight only while Aim is held. Crouch plus movement
-is the stealth locomotion path; Roll plus Strafe selects a side roll. These are
-composed states, not separate bindable actions.
+Mouse movement controls the sight while Aim is held. The optional **Mouse look
+in chase mode** checkbox in Input Configuration also captures the mouse during
+normal gameplay: horizontal motion turns Gabe through the retail turn path,
+while vertical motion pitches the unlocked chase camera. Scripted and locked
+cameras retain ownership. Crouch plus movement is the stealth locomotion path;
+Roll plus Strafe selects a side roll. These are composed states, not separate
+bindable actions.

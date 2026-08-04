@@ -57,6 +57,7 @@ constexpr int change_binding_control_id = 2002;
 constexpr int clear_binding_control_id = 2003;
 constexpr int default_bindings_control_id = 2004;
 constexpr int close_bindings_control_id = 2005;
+constexpr int mouse_chase_look_control_id = 2006;
 constexpr int previous_dossier_control_id = 3001;
 constexpr int next_dossier_control_id = 3002;
 constexpr int close_dossier_control_id = 3003;
@@ -109,6 +110,7 @@ struct ControlsState {
   HWND list{};
   HWND change_button{};
   HWND status{};
+  HWND mouse_chase_look{};
   HFONT title_font{};
   HFONT heading_font{};
   HFONT ui_font{};
@@ -282,6 +284,9 @@ void loadSettingsFile(GraphicsSettings &graphics, KeyboardMouseBindings &input,
       input[action] = loaded;
     }
   }
+  input.mouse_chase_look =
+      readProfileInteger(path, L"KeyboardMouse", L"MouseChaseLook",
+                         input.mouse_chase_look ? 1 : 0) != 0;
 }
 
 void saveSettingsFile(const GraphicsSettings &graphics,
@@ -312,6 +317,8 @@ void saveSettingsFile(const GraphicsSettings &graphics,
     writeProfileInteger(path, L"KeyboardMouse", key.c_str(),
                         static_cast<int>(input[action]));
   }
+  writeProfileInteger(path, L"KeyboardMouse", L"MouseChaseLook",
+                      input.mouse_chase_look ? 1 : 0);
   saveGameImagePath(cue_path);
 }
 
@@ -868,9 +875,15 @@ LRESULT CALLBACK controlsWindowProc(HWND window, UINT message, WPARAM w_param,
     state->status = createControl(window, L"STATIC",
                                   L"Select an action, then press Change.", 0,
                                   472, 332, 244, 62, 0, state->ui_font);
-    createControl(window, L"STATIC",
-                  L"Stealth: crouch + movement\nSide roll: roll + strafe", 0,
-                  472, 398, 244, 44, 0, state->ui_font);
+    state->mouse_chase_look = createControl(
+        window, L"BUTTON", L"Mouse look in chase mode",
+        WS_TABSTOP | BS_AUTOCHECKBOX, 472, 398, 244, 24,
+        mouse_chase_look_control_id, state->ui_font);
+    SendMessageW(state->mouse_chase_look, BM_SETCHECK,
+                 state->input->mouse_chase_look ? BST_CHECKED : BST_UNCHECKED,
+                 0);
+    createControl(window, L"STATIC", L"Roll + strafe selects a side roll.", 0,
+                  472, 424, 244, 20, 0, state->ui_font);
     createControl(window, L"BUTTON", L"APPLY", WS_TABSTOP | BS_OWNERDRAW, 472,
                   448, 244, 34, close_bindings_control_id, state->heading_font);
     refreshControlsList(*state);
@@ -939,9 +952,19 @@ LRESULT CALLBACK controlsWindowProc(HWND window, UINT message, WPARAM w_param,
     }
     if (LOWORD(w_param) == default_bindings_control_id) {
       *state->input = defaultKeyboardMouseBindings();
+      SendMessageW(state->mouse_chase_look, BM_SETCHECK,
+                   state->input->mouse_chase_look ? BST_CHECKED
+                                                  : BST_UNCHECKED,
+                   0);
       state->capture.reset();
       refreshControlsList(*state);
       SetWindowTextW(state->status, L"Default controls restored.");
+      return 0;
+    }
+    if (LOWORD(w_param) == mouse_chase_look_control_id) {
+      state->input->mouse_chase_look =
+          SendMessageW(state->mouse_chase_look, BM_GETCHECK, 0, 0) ==
+          BST_CHECKED;
       return 0;
     }
     if (LOWORD(w_param) == close_bindings_control_id) {
