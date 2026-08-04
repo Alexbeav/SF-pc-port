@@ -1362,10 +1362,10 @@ SceneViewerResult PsyCrossSceneViewer::run(
         sf::platform::PlayerInput relative_look;
         relative_look.mouse_look_yaw =
             raw_player_input.pc.mouse_delta_x *
-            sf::platform::chase_mouse_yaw_sensitivity;
+            input_.chase_mouse_yaw_sensitivity;
         relative_look.mouse_look_pitch =
             -raw_player_input.pc.mouse_delta_y *
-            sf::platform::chase_mouse_pitch_sensitivity;
+            input_.chase_mouse_pitch_sensitivity;
         latched_chase_look.latch(relative_look);
       } else {
         latched_chase_look.reset();
