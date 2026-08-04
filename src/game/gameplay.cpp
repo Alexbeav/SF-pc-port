@@ -3947,6 +3947,22 @@ void GameplaySession::stageNativeChaseFreelook(const GameplayInput &input) {
   }
 
   host_free_look_active_ = true;
+  if (std::abs(input.look_yaw) > 0.0001) {
+    const auto current_heading = headingFromDirection(
+        static_cast<double>(bridge->player.guest_rotation[2]),
+        static_cast<double>(bridge->player.guest_rotation[8]));
+    const auto yaw_delta = static_cast<std::int64_t>(std::clamp(
+        std::llround(input.look_yaw),
+        static_cast<long long>(std::numeric_limits<std::int32_t>::min()),
+        static_cast<long long>(std::numeric_limits<std::int32_t>::max())));
+    const auto target_heading = normalizeHeading(
+        static_cast<std::int64_t>(current_heading) + yaw_delta);
+    if (!legacy_first_mission_->restoreHostPlayerHeading(target_heading)) {
+      legacy_runtime_faulted_ = true;
+      mission_failed_ = true;
+      return;
+    }
+  }
   host_free_look_pitch_ =
       std::clamp(host_free_look_pitch_ + input.look_pitch, -512.0, 512.0);
 }
