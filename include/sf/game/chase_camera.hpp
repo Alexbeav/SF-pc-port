@@ -68,9 +68,11 @@ cameraRayAtProjectionOffset(const CameraState &camera, double horizontal_offset,
 // positive-Y-down world convention.
 [[nodiscard]] CameraState applyChaseCameraPitch(CameraState camera,
                                                 double pitch) noexcept;
-// Rotates an authored chase eye around its target while retaining height,
-// distance and projection. Positive yaw follows the player heading convention.
+// Rotates an authored chase rig around the player while retaining height,
+// eye/target separation and projection. Positive yaw follows the player
+// heading convention.
 [[nodiscard]] CameraState applyChaseCameraYaw(CameraState camera,
+                                              double pivot_x, double pivot_z,
                                               double yaw) noexcept;
 
 class ChaseCamera final {

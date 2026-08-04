@@ -6453,7 +6453,9 @@ CameraState GameplaySession::camera() const noexcept {
     };
     if (host_free_look_active_ && !bridge.player.control_locked &&
         !camera.scripted && !camera.locked) {
-      native_chase = applyChaseCameraYaw(native_chase, host_free_look_yaw_);
+      native_chase = applyChaseCameraYaw(
+          native_chase, static_cast<double>(bridge.player.position.x),
+          static_cast<double>(bridge.player.position.z), host_free_look_yaw_);
       native_chase = applyChaseCameraPitch(native_chase,
                                            host_free_look_pitch_);
     }
