@@ -1395,10 +1395,15 @@ SceneViewerResult PsyCrossSceneViewer::run(
         const auto relative = simulation_updates_this_frame == 0U
                                   ? latched_chase_look.consumeForGuestTick()
                                   : sf::platform::PlayerLookSample{};
-        // SF1 has no retail right-stick camera axis. Preserve keyboard and
-        // controller turning, but route proportional mouse yaw to the proven
-        // common actor/camera guest hook instead of its rate-limited turn axis.
-        simulation_input.look_yaw += relative.yaw;
+        // Keep body, animation and collision aligned by feeding horizontal
+        // motion through retail's normal turn axis. Vertical motion is a
+        // camera-only extension guarded by GameplaySession's camera locks.
+        simulation_input.turn = std::clamp(
+            simulation_input.turn +
+                relative.yaw /
+                    static_cast<double>(
+                        game::PlayerController::turn_units_per_update),
+            -1.0, 1.0);
         simulation_input.look_pitch += relative.pitch * 0.35;
       }
       latched_gameplay_input = {};

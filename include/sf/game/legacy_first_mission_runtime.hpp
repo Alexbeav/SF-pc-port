@@ -250,7 +250,6 @@ public:
   [[nodiscard]] bool
   applyHostAimLocomotion(const LegacyHostPlayerLocomotion &state) noexcept;
   void setHostAimRay(std::optional<LegacyHostAimRay> ray) noexcept;
-  void setHostChaseMouseYawInput(std::int32_t delta, bool enabled) noexcept;
   [[nodiscard]] bool restoreHostPlayerHeading(std::int32_t yaw) noexcept;
   [[nodiscard]] std::uint64_t hostAimRayPatchCount() const noexcept;
   [[nodiscard]] bool applyHostWeaponMenuInput(bool held,
