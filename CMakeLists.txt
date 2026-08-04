@@ -16,6 +16,8 @@ set(SF_PSYCROSS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/PsyCross" CACHE PATH
     "Path to a PsyCross checkout")
 set(SF_SUPPORTED_ROM_CUE "" CACHE FILEPATH
     "Optional Syphon Filter USA v1.1 CUE used by supported-ROM CTest gates")
+set(SF3_SUPPORTED_ROM_CUE "" CACHE FILEPATH
+    "Optional Syphon Filter 3 USA SCUS-94640 CUE used by ROM CTest gates")
 set(_sf_rom_probes_default OFF)
 if(SF_SUPPORTED_ROM_CUE)
     set(_sf_rom_probes_default ON)

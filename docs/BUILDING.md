@@ -100,6 +100,19 @@ ctest --preset windows-psycross-release -L rom
 Disable them again with `-DSF_BUILD_ROM_PROBES=OFF`. Never commit or upload BIN,
 CUE, extracted retail data, saves or generated logs.
 
+SF3 uses a separate CUE setting because SCUS-94640 must never be passed to an
+SF1 ROM test. Supplying it registers the headless/silent product-runtime gate,
+which runs two 300-frame neutral processes and requires byte-identical stdout
+and matching SHA-256 transcripts:
+
+```powershell
+cmake --preset windows-psycross `
+  -DSF3_SUPPORTED_ROM_CUE='D:/Games/Syphon Filter 3 (USA).cue'
+cmake --build --preset windows-psycross-release --target sf_tool
+ctest --test-dir build/windows-psycross -C Release `
+  -R '^sf3_product_runtime_rom$' --output-on-failure
+```
+
 ## Inspecting an image
 
 The `sf_tool` diagnostic executable can validate the image without starting the

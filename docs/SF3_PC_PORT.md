@@ -126,6 +126,16 @@ control to the player; interactive title selection, campaign completion,
 quick states, full presentation verification and long human play remain open
 parts of S3 and later milestones.
 
+"Stable Mission 1 gameplay" in this workstream means probe-stable only. The
+2026-08-04 portfolio review imported a contrary human result from the separate
+SCUS-94640 recomp product: one ordinary launch failed to leave the briefing,
+and another reached gameplay with severe red/checkered world-texture
+corruption. A later launch looked correct, so the symptom was intermittent,
+not resolved by that observation. This does not identify the hybrid runtime as
+the owner, but it prevents deterministic headless evidence from being reported
+as human presentation acceptance. The hybrid product still requires its own
+visible two-page texture, control, pause, audio, and sustained-play gate.
+
 ### S4 — runtime systems
 
 - Map SF3 player, actor, camera, item, weapon, damage and checkpoint layouts.

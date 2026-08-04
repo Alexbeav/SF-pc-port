@@ -489,6 +489,33 @@ void Sf2SampledMouseAccumulator::add(std::uint64_t sample, int delta_x,
   y_ = accumulate(y_, delta_y);
 }
 
+bool applySf2PcMouseFacingVector(
+    psx::R3000Runtime &runtime, std::uint32_t controller,
+    bool mouse_look_enabled, bool ownership_granted, bool manual_aim,
+    std::int32_t yaw, std::int32_t pitch) noexcept {
+  if (!mouse_look_enabled || !ownership_granted || controller == 0U) {
+    return false;
+  }
+
+  constexpr std::uint32_t horizontal_offset = 0xccU;
+  constexpr std::uint32_t middle_offset = 0xd0U;
+  constexpr std::uint32_t vertical_offset = 0xd4U;
+  constexpr std::int32_t fixed_one = 4096;
+  yaw = std::clamp(yaw, -256, 256);
+  pitch = manual_aim ? std::clamp(pitch, -96, 96) : 0;
+  if (!manual_aim && yaw == 0) {
+    return false;
+  }
+
+  return runtime.write32(
+             controller + horizontal_offset,
+             std::bit_cast<std::uint32_t>(yaw * fixed_one)) &&
+         runtime.write32(controller + middle_offset, 0U) &&
+         runtime.write32(
+             controller + vertical_offset,
+             std::bit_cast<std::uint32_t>(pitch * fixed_one));
+}
+
 Sf2WeaponSelectPulseQueue::Sf2WeaponSelectPulseQueue(
     std::uint64_t initial_sample) noexcept
     : sample_(initial_sample) {}
@@ -5460,10 +5487,6 @@ private:
     // SF1's accepted 0x80037B08 hook writes the processed mouse vector to
     // controller +0xCC/+0xD4. SF2 0x80053464 is instruction-identical; its
     // controller is preserved in s2 at this boundary.
-    constexpr std::uint32_t horizontal_offset = 0xccU;
-    constexpr std::uint32_t middle_offset = 0xd0U;
-    constexpr std::uint32_t vertical_offset = 0xd4U;
-    constexpr std::int32_t fixed_one = 4096;
     const auto controller = context.registerValue(18U);
     const auto manual_aim = pc_manual_aim_enabled_;
     const auto yaw = std::clamp(
@@ -5477,12 +5500,8 @@ private:
     if (!manual_aim && yaw == 0) {
       return;
     }
-    if (controller == 0U ||
-        !context.write32(controller + horizontal_offset,
-                         std::bit_cast<std::uint32_t>(yaw * fixed_one)) ||
-        !context.write32(controller + middle_offset, 0U) ||
-        !context.write32(controller + vertical_offset,
-                         std::bit_cast<std::uint32_t>(pitch * fixed_one))) {
+    if (!applySf2PcMouseFacingVector(
+            vm_.runtime(), controller, true, true, manual_aim, yaw, pitch)) {
       return;
     }
     if (manual_aim) {

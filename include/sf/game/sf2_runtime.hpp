@@ -15,6 +15,7 @@
 #include <vector>
 
 namespace sf::psx {
+class R3000Runtime;
 struct SpuPcmFrame;
 }
 
@@ -662,6 +663,15 @@ private:
   int x_{};
   int y_{};
 };
+
+// Applies the three-word SF2 mouse-facing vector only when both the feature
+// and the exact guest owner authorize it. This source-owned seam is shared by
+// the production SF2 donor and its negative no-write regression; it does not
+// establish an SF3 camera address or ownership contract.
+[[nodiscard]] bool applySf2PcMouseFacingVector(
+    psx::R3000Runtime &runtime, std::uint32_t controller,
+    bool mouse_look_enabled, bool ownership_granted, bool manual_aim,
+    std::int32_t yaw, std::int32_t pitch) noexcept;
 
 // Converts host weapon-cycle impulses into retail Select edges. Every press is
 // held until sampled and separated from the next queued press by one sampled

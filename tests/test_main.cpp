@@ -36,6 +36,7 @@
 #include "sf/platform/retail_scope_text_policy.hpp"
 #include "sf/psx/executable.hpp"
 #include "sf/psx/function_map.hpp"
+#include "sf/psx/r3000_runtime.hpp"
 
 #include <algorithm>
 #include <array>
@@ -544,6 +545,44 @@ void testSf2PresentationFrameCapture() {
               !sf::game::sf2WeaponSlotPulseCount(weapon_cycle, 0U),
           "SF2 weapon adapter manufactured a selection without inventory");
 
+}
+
+void testSf2DisabledMouseLookDoesNotWriteGuestRam() {
+  sf::psx::R3000Runtime runtime;
+  std::vector<std::byte> seed(sf::psx::R3000Runtime::ram_size);
+  for (auto index = std::size_t{}; index < seed.size(); ++index) {
+    seed[index] = static_cast<std::byte>((index * 37U + 11U) & 0xffU);
+  }
+  require(runtime.restoreRam(seed), "Could not seed synthetic guest RAM");
+  const std::vector<std::byte> before{runtime.ram().begin(),
+                                      runtime.ram().end()};
+  constexpr std::uint32_t controller = 0x80102000U;
+
+  require(!sf::game::applySf2PcMouseFacingVector(
+              runtime, controller, false, true, true, 23, -17),
+          "Disabled SF2 mouselook reported a guest injection");
+  require(std::ranges::equal(runtime.ram(), before),
+          "Disabled SF2 mouselook changed guest RAM");
+
+  require(!sf::game::applySf2PcMouseFacingVector(
+              runtime, controller, true, false, true, 23, -17),
+          "Ownership-denied SF2 mouselook reported a guest injection");
+  require(std::ranges::equal(runtime.ram(), before),
+          "Ownership-denied SF2 mouselook changed guest RAM");
+
+  require(sf::game::applySf2PcMouseFacingVector(
+              runtime, controller, true, true, true, 23, -17),
+          "Authorized SF2 mouselook did not apply its guest vector");
+  std::uint32_t horizontal{};
+  std::uint32_t middle{};
+  std::uint32_t vertical{};
+  require(runtime.read32(controller + 0xccU, horizontal) &&
+              runtime.read32(controller + 0xd0U, middle) &&
+              runtime.read32(controller + 0xd4U, vertical) &&
+              std::bit_cast<std::int32_t>(horizontal) == 23 * 4096 &&
+              middle == 0U &&
+              std::bit_cast<std::int32_t>(vertical) == -17 * 4096,
+          "Authorized SF2 mouselook wrote the wrong guest vector");
 }
 
 void writeLe16(std::span<std::byte> bytes, std::size_t offset,
@@ -4189,6 +4228,7 @@ int main() {
     testSupportedGames();
     testRuntimeProfiles();
     testSf2PresentationFrameCapture();
+    testSf2DisabledMouseLookDoesNotWriteGuestRam();
     testDiscSelectionTitles();
     testFogArchive();
     testInvalidFogArchive();

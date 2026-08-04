@@ -20,9 +20,17 @@ auto-operated, movie completion is headless, product GPU composition and
 texture residency are incomplete, and human presentation/audio/input
 validation was still pending when the handoff was packaged.
 
+Portfolio correction (2026-08-05): "stable" above is probe-stable, not a
+human presentation claim. The separate ordinary SCUS-94640 recomp product had
+one briefing-to-gameplay failure followed by a launch with severe
+red/checkered world-texture corruption; a later correct launch narrowed the
+symptom to intermittent behavior but did not resolve it at that checkpoint.
+The result is an incoming renderer/lifecycle lead, not evidence that this MIT
+hybrid product has passed or failed its still-open visible presentation gate.
+
 ## Shared findings contributed
 
-The private PSX ports knowledge repository records these normalized findings:
+The private PSX ports knowledge repository records these finding candidates:
 
 | Finding | SF3 evidence |
 |---|---|
