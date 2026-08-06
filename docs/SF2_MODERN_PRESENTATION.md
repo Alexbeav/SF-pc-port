@@ -67,6 +67,17 @@ Known baseline defects must not be mistaken for modern regressions:
 - mission-failure mattes animate at 4:3 before settling at full width; and
 - Missions 8-21 still need equivalent consecutive human completion coverage.
 
+## Current playtest notes
+
+- **Pending polish pass — third-person lock-on reticle at extreme angles.**
+  Widescreen projection now keeps the primary target box and all authored
+  wobbling/ghosted 8/12-line layers aligned while Gabe or the enemy moves.
+  Human Mission 3 testing still finds a brief outward snap in rare phases when
+  a moving target reaches an extreme horizontal angle; it then returns to the
+  correct position. Normal angles and stationary-target alignment are correct.
+  Keep the conservative retail-packet classifier until the remaining phase can
+  be isolated without reclassifying green world effects.
+
 ## Delivery plan
 
 ### P0 — profiles and measurement

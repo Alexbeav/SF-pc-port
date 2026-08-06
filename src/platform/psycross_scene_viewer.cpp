@@ -8243,8 +8243,20 @@ struct Sf2TargetReticlePacketRun {
   std::size_t count{};
 };
 
-[[nodiscard]] std::optional<Sf2TargetReticlePacketRun>
-sf2TargetReticlePacketRun(std::span<const game::Sf2GpuPacket> packets) {
+struct Sf2TargetReticlePacketSet {
+  std::array<Sf2TargetReticlePacketRun, 8U> runs{};
+  std::size_t count{};
+
+  [[nodiscard]] bool contains(std::size_t packet) const noexcept {
+    return std::ranges::any_of(
+        std::span{runs}.first(count), [packet](const auto &run) {
+          return packet >= run.first && packet < run.first + run.count;
+        });
+  }
+};
+
+[[nodiscard]] std::optional<Sf2TargetReticlePacketSet>
+sf2TargetReticlePacketSet(std::span<const game::Sf2GpuPacket> packets) {
   const auto target_line = [](const game::Sf2GpuPacket &packet) {
     if (packet.gp0_words.size() != 3U) {
       return false;
@@ -8258,7 +8270,12 @@ sf2TargetReticlePacketRun(std::span<const game::Sf2GpuPacket> packets) {
            green >= static_cast<unsigned int>(red) * 3U &&
            green >= static_cast<unsigned int>(blue) * 3U;
   };
+  struct Candidate {
+    Sf2TargetReticlePacketRun run{};
+    bool axis_aligned{true};
+  };
   constexpr auto minimum_reticle_lines = std::size_t{8U};
+  auto candidates = std::vector<Candidate>{};
   for (auto first = std::size_t{}; first < packets.size();) {
     if (!target_line(packets[first])) {
       ++first;
@@ -8269,12 +8286,7 @@ sf2TargetReticlePacketRun(std::span<const game::Sf2GpuPacket> packets) {
       ++end;
     }
     if (end - first >= minimum_reticle_lines) {
-      auto minimum_x = std::numeric_limits<std::int16_t>::max();
-      auto maximum_x = std::numeric_limits<std::int16_t>::min();
-      auto minimum_y = std::numeric_limits<std::int16_t>::max();
-      auto maximum_y = std::numeric_limits<std::int16_t>::min();
-      auto horizontal = false;
-      auto vertical = false;
+      auto axis_aligned = true;
       for (auto index = first; index < end; ++index) {
         const auto first_word = packets[index].gp0_words[1U];
         const auto second_word = packets[index].gp0_words[2U];
@@ -8282,24 +8294,36 @@ sf2TargetReticlePacketRun(std::span<const game::Sf2GpuPacket> packets) {
         const auto y0 = packedScreenY(first_word);
         const auto x1 = packedScreenX(second_word);
         const auto y1 = packedScreenY(second_word);
-        minimum_x = std::min({minimum_x, x0, x1});
-        maximum_x = std::max({maximum_x, x0, x1});
-        minimum_y = std::min({minimum_y, y0, y1});
-        maximum_y = std::max({maximum_y, y0, y1});
-        horizontal = horizontal || (y0 == y1 && x0 != x1);
-        vertical = vertical || (x0 == x1 && y0 != y1);
+        axis_aligned = axis_aligned && (x0 == x1 || y0 == y1);
       }
-      // FUN_80041830 emits a compact box/ray cluster. Requiring both axes and
-      // a small screen-space extent keeps green world tracers and grenade
-      // trajectory segments on the widened world path.
-      if (horizontal && vertical && maximum_x - minimum_x <= 96 &&
-          maximum_y - minimum_y <= 96) {
-        return Sf2TargetReticlePacketRun{first, end - first};
-      }
+      candidates.push_back(Candidate{
+          .run = Sf2TargetReticlePacketRun{first, end - first},
+          .axis_aligned = axis_aligned,
+      });
     }
     first = end;
   }
-  return std::nullopt;
+  Sf2TargetReticlePacketSet result;
+  for (const auto &candidate : candidates) {
+    const auto retail_box_line_count = candidate.run.count == 8U ||
+                                       candidate.run.count == 12U;
+    if (!retail_box_line_count || !candidate.axis_aligned ||
+        result.count == result.runs.size()) {
+      continue;
+    }
+    result.runs[result.count++] = candidate.run;
+  }
+  // FUN_80041830 interleaves the animated 8/12-line box groups with enemy
+  // geometry and draw-state packets. Moving targets deliberately spread the
+  // fading boxes across their historical screen positions, and an animation
+  // phase can collapse every edge in a group to points or wrap it across a
+  // screen boundary. Recognize each exact axis-aligned run independently,
+  // including collapsed phases; diagonal green tracers remain world-space,
+  // and a broad contiguous exemption would rescale the enemy packets between
+  // the authored reticle groups.
+  return result.count != 0U
+             ? std::optional<Sf2TargetReticlePacketSet>{result}
+             : std::nullopt;
 }
 
 void setPacketColor(std::uint32_t word, std::uint8_t &red, std::uint8_t &green,
@@ -13945,7 +13969,7 @@ void drawSf2GuestFrameInternal(const game::Sf2PresentationFrame &frame,
                                         ? frame.packets.size()
                                         : frame.submission_packet_ends[0U];
   const auto target_reticle = frame.application_state == 0U
-                                  ? sf2TargetReticlePacketRun(
+                                  ? sf2TargetReticlePacketSet(
                                         std::span{frame.packets}.first(
                                             first_submission_end))
                                   : std::nullopt;
@@ -13955,8 +13979,7 @@ void drawSf2GuestFrameInternal(const game::Sf2PresentationFrame &frame,
     // squeeze would apply that transform twice. Later submissions are retail
     // HUD/radar/text and intentionally remain centred and unstretched.
     const auto target_reticle_packet =
-        target_reticle && index >= target_reticle->first &&
-        index < target_reticle->first + target_reticle->count;
+        target_reticle && target_reticle->contains(index);
     const auto native_wide_world = frame.application_state == 0U &&
                                    boundary == 0U &&
                                    !target_reticle_packet;
@@ -14011,7 +14034,7 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
   const auto first_submission_end = frame.submission_packet_ends.empty()
                                         ? frame.packets.size()
                                         : frame.submission_packet_ends[0U];
-  const auto target_reticle = sf2TargetReticlePacketRun(
+  const auto target_reticle = sf2TargetReticlePacketSet(
       std::span{frame.packets}.first(first_submission_end));
 
   dump << "presented=" << presented_frame << " sequence=" << frame.sequence
@@ -14033,7 +14056,13 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
        << " projected-matched=" << frame.projection_matches.matched_packets
        << " reticle=";
   if (target_reticle) {
-    dump << target_reticle->first << '+' << target_reticle->count;
+    for (auto index = std::size_t{}; index < target_reticle->count; ++index) {
+      if (index != 0U) {
+        dump << ',';
+      }
+      const auto &run = target_reticle->runs[index];
+      dump << run.first << '+' << run.count;
+    }
   } else {
     dump << "none";
   }
