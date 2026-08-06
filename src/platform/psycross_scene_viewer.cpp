@@ -8238,6 +8238,70 @@ static_assert(reprojectGuestCoordinate(-155.0, guest_draw_offset_x, 0.0) ==
               37.0);
 static_assert(reprojectGuestCoordinate(0.0, guest_draw_offset_y, 0.0) == 120.0);
 
+struct Sf2TargetReticlePacketRun {
+  std::size_t first{};
+  std::size_t count{};
+};
+
+[[nodiscard]] std::optional<Sf2TargetReticlePacketRun>
+sf2TargetReticlePacketRun(std::span<const game::Sf2GpuPacket> packets) {
+  const auto target_line = [](const game::Sf2GpuPacket &packet) {
+    if (packet.gp0_words.size() != 3U) {
+      return false;
+    }
+    const auto command = packet.gp0_words[0U];
+    const auto opcode = static_cast<std::uint8_t>(command >> 24U);
+    const auto red = static_cast<std::uint8_t>(command);
+    const auto green = static_cast<std::uint8_t>(command >> 8U);
+    const auto blue = static_cast<std::uint8_t>(command >> 16U);
+    return (opcode & 0xfdU) == 0x40U && green >= 96U &&
+           green >= static_cast<unsigned int>(red) * 3U &&
+           green >= static_cast<unsigned int>(blue) * 3U;
+  };
+  constexpr auto minimum_reticle_lines = std::size_t{8U};
+  for (auto first = std::size_t{}; first < packets.size();) {
+    if (!target_line(packets[first])) {
+      ++first;
+      continue;
+    }
+    auto end = first + 1U;
+    while (end < packets.size() && target_line(packets[end])) {
+      ++end;
+    }
+    if (end - first >= minimum_reticle_lines) {
+      auto minimum_x = std::numeric_limits<std::int16_t>::max();
+      auto maximum_x = std::numeric_limits<std::int16_t>::min();
+      auto minimum_y = std::numeric_limits<std::int16_t>::max();
+      auto maximum_y = std::numeric_limits<std::int16_t>::min();
+      auto horizontal = false;
+      auto vertical = false;
+      for (auto index = first; index < end; ++index) {
+        const auto first_word = packets[index].gp0_words[1U];
+        const auto second_word = packets[index].gp0_words[2U];
+        const auto x0 = packedScreenX(first_word);
+        const auto y0 = packedScreenY(first_word);
+        const auto x1 = packedScreenX(second_word);
+        const auto y1 = packedScreenY(second_word);
+        minimum_x = std::min({minimum_x, x0, x1});
+        maximum_x = std::max({maximum_x, x0, x1});
+        minimum_y = std::min({minimum_y, y0, y1});
+        maximum_y = std::max({maximum_y, y0, y1});
+        horizontal = horizontal || (y0 == y1 && x0 != x1);
+        vertical = vertical || (x0 == x1 && y0 != y1);
+      }
+      // FUN_80041830 emits a compact box/ray cluster. Requiring both axes and
+      // a small screen-space extent keeps green world tracers and grenade
+      // trajectory segments on the widened world path.
+      if (horizontal && vertical && maximum_x - minimum_x <= 96 &&
+          maximum_y - minimum_y <= 96) {
+        return Sf2TargetReticlePacketRun{first, end - first};
+      }
+    }
+    first = end;
+  }
+  return std::nullopt;
+}
+
 void setPacketColor(std::uint32_t word, std::uint8_t &red, std::uint8_t &green,
                     std::uint8_t &blue) {
   red = static_cast<std::uint8_t>(word);
@@ -13877,13 +13941,25 @@ void drawSf2GuestFrameInternal(const game::Sf2PresentationFrame &frame,
   GR_SetDepthState(0, 0);
   auto boundary = std::size_t{};
   const auto retail_briefing = frame.application_state == 8U;
+  const auto first_submission_end = frame.submission_packet_ends.empty()
+                                        ? frame.packets.size()
+                                        : frame.submission_packet_ends[0U];
+  const auto target_reticle = frame.application_state == 0U
+                                  ? sf2TargetReticlePacketRun(
+                                        std::span{frame.packets}.first(
+                                            first_submission_end))
+                                  : std::nullopt;
   for (auto index = std::size_t{}; index < frame.packets.size(); ++index) {
     // Gameplay's first submission is the authored world base. Its horizontal
     // projection was widened in the guest GTE, so the generic PsyCross 4:3
     // squeeze would apply that transform twice. Later submissions are retail
     // HUD/radar/text and intentionally remain centred and unstretched.
-    const auto native_wide_world =
-        frame.application_state == 0U && boundary == 0U;
+    const auto target_reticle_packet =
+        target_reticle && index >= target_reticle->first &&
+        index < target_reticle->first + target_reticle->count;
+    const auto native_wide_world = frame.application_state == 0U &&
+                                   boundary == 0U &&
+                                   !target_reticle_packet;
     drawSf2GuestPacket(frame.packets[index], texture_bank,
                        native_wide_world, retail_briefing,
                        retail_briefing_loaded);
@@ -13921,7 +13997,7 @@ __attribute__((noinline))
 #endif
 void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
                               std::uint64_t presented_frame,
-                              std::uint32_t system_clock) {
+                              const game::Sf2GuestRuntimeDiagnostics &diagnostics) {
   const auto dump_path =
       std::filesystem::path{"build"} /
       ("sf2-presentation-frame-" + std::to_string(presented_frame) + ".txt");
@@ -13932,8 +14008,18 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
     return;
   }
 
+  const auto first_submission_end = frame.submission_packet_ends.empty()
+                                        ? frame.packets.size()
+                                        : frame.submission_packet_ends[0U];
+  const auto target_reticle = sf2TargetReticlePacketRun(
+      std::span{frame.packets}.first(first_submission_end));
+
   dump << "presented=" << presented_frame << " sequence=" << frame.sequence
-       << " guest=" << frame.guest_frame << " clock=" << system_clock
+       << " guest=" << frame.guest_frame << " clock="
+       << diagnostics.system_clock << " target="
+       << (diagnostics.player_target_active ? 1U : 0U) << '/'
+       << diagnostics.player_target_slot << " target-flags=0x" << std::hex
+       << diagnostics.player_target_flags << std::dec
        << " packets=" << frame.packets.size()
        << " segments=" << frame.submission_packet_ends.size()
        << " projected-observed="
@@ -13945,7 +14031,13 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
        << " projected-polygons="
        << frame.projection_matches.world_polygon_packets
        << " projected-matched=" << frame.projection_matches.matched_packets
-       << '\n';
+       << " reticle=";
+  if (target_reticle) {
+    dump << target_reticle->first << '+' << target_reticle->count;
+  } else {
+    dump << "none";
+  }
+  dump << '\n';
   auto segment = std::size_t{};
   auto segment_end = frame.submission_packet_ends.empty()
                          ? frame.packets.size()
@@ -14365,6 +14457,11 @@ SceneViewerResult runSf2GuestScene(
   auto quick_state_last_ui_create_guest_frame = std::uint64_t{};
   auto pickup_capture_pending = false;
   auto ui_text_capture_pending = false;
+  auto target_capture_after_sequence = std::optional<std::uint64_t>{};
+  auto target_capture_armed = false;
+  auto target_reference_capture_pending = false;
+  auto previous_capture_target_lock = false;
+  auto previous_replay_target_lock = false;
   auto previous_guest_armor = runtime.diagnostics().player_armor;
   auto quick_state_previous_guest_armor = previous_guest_armor;
   struct ObjectiveAutoplayState {
@@ -14439,6 +14536,8 @@ SceneViewerResult runSf2GuestScene(
       diagnostic_frame("SF2_CAPTURE_ON_PICKUP").value_or(0U) != 0U;
   const auto capture_on_ui_text =
       diagnostic_frame("SF2_CAPTURE_ON_UI_TEXT").value_or(0U) != 0U;
+  const auto capture_on_target =
+      diagnostic_frame("SF2_CAPTURE_ON_TARGET").value_or(0U) != 0U;
   const auto input_record_path = diagnostic_path("SF2_RECORD_INPUT");
   const auto input_replay_path = diagnostic_path("SF2_REPLAY_INPUT");
   // Health pinning exists only to keep deterministic recording/replay routes
@@ -14726,6 +14825,13 @@ SceneViewerResult runSf2GuestScene(
                    .mouse_wheel_delta = consumePsyCrossMouseWheel(),
                });
     const auto raw = pcPlayerInputFromKeyboardMouseActions(actions);
+    if (capture_on_target && raw.target_lock &&
+        !previous_capture_target_lock) {
+      target_capture_armed = true;
+      target_reference_capture_pending = true;
+      target_capture_after_sequence.reset();
+    }
+    previous_capture_target_lock = raw.target_lock;
     const auto pause_down = actions[KeyboardMouseAction::pause];
     if (pause_down && !pause_was_down) {
       mouse_capture.set(false);
@@ -15047,6 +15153,15 @@ SceneViewerResult runSf2GuestScene(
               readButtons(pad), SceneExitReason::return_to_title};
         }
         sampled_pad = input_replay[input_replay_index++];
+        const auto replay_target_lock =
+            (sampled_pad.buttons & 0x0800U) != 0U;
+        if (capture_on_target && replay_target_lock &&
+            !previous_replay_target_lock) {
+          target_capture_armed = true;
+          target_reference_capture_pending = true;
+          target_capture_after_sequence.reset();
+        }
+        previous_replay_target_lock = replay_target_lock;
       }
       runtime.setHostPadState(sampled_pad);
       if (input_record) {
@@ -15365,6 +15480,16 @@ SceneViewerResult runSf2GuestScene(
     }
     if (const auto &frame = runtime.presentationFrame()) {
       const auto diagnostics = runtime.diagnostics();
+      if (target_reference_capture_pending) {
+        dumpSf2PresentationFrame(*frame, presented_frames, diagnostics);
+        target_reference_capture_pending = false;
+      }
+      if (target_capture_armed && diagnostics.player_target_active &&
+          !target_capture_after_sequence) {
+        // Target selection becomes active before the animated retail target
+        // presentation settles, so capture after a short stable interval.
+        target_capture_after_sequence = frame->sequence;
+      }
       for (auto index = std::size_t{}; index < ram_dump_clocks.size();
            ++index) {
         if (!ram_dump_clocks[index] || ram_dump_completed[index] ||
@@ -15845,6 +15970,9 @@ SceneViewerResult runSf2GuestScene(
       const auto capture_screenshot =
           !screenshot_captured &&
           (pickup_capture_pending || ui_text_capture_pending ||
+           (target_capture_after_sequence &&
+            frame->sequence > *target_capture_after_sequence + 30U &&
+            diagnostics.player_target_active) ||
            (screenshot_frame &&
             presented_frames >=
                 *screenshot_frame + screenshot_captures));
@@ -16091,7 +16219,7 @@ SceneViewerResult runSf2GuestScene(
         PsyX_Log_Info(
             "SF2 capture frame: presented=%llu sequence=%llu guest=%llu "
             "clock=%u packets=%zu draws=%zu kinds=%zu/%zu/%zu/%zu/%zu/%zu "
-            "composite=%u env=(%d,%d,%d,%d)/"
+            "target=%u/%d flags=0x%08X composite=%u env=(%d,%d,%d,%d)/"
             "(%d,%d)/tpage=0x%04X dtd=%d\n",
             static_cast<unsigned long long>(presented_frames),
             static_cast<unsigned long long>(frame->sequence),
@@ -16099,19 +16227,22 @@ SceneViewerResult runSf2GuestScene(
             diagnostics.system_clock, frame->packets.size(),
             frame->draw_command_count, command_kinds[0U], command_kinds[1U],
             command_kinds[2U], command_kinds[3U], command_kinds[4U],
-            command_kinds[5U], guest_ui_overlay ? 1U : 0U,
+            command_kinds[5U], diagnostics.player_target_active ? 1U : 0U,
+            diagnostics.player_target_slot, diagnostics.player_target_flags,
+            guest_ui_overlay ? 1U : 0U,
             captured_environment.clip.x,
             captured_environment.clip.y, captured_environment.clip.w,
             captured_environment.clip.h, captured_environment.ofs[0],
             captured_environment.ofs[1], captured_environment.tpage,
             captured_environment.dtd);
         if (dump_presentation_on_capture) {
-          dumpSf2PresentationFrame(*frame, presented_frames,
-                                   diagnostics.system_clock);
+          dumpSf2PresentationFrame(*frame, presented_frames, diagnostics);
         }
         PsyX_TakeScreenshot();
         pickup_capture_pending = false;
         ui_text_capture_pending = false;
+        target_capture_after_sequence.reset();
+        target_capture_armed = false;
         if (screenshot_capture_count > 1U) {
           auto copy_error = std::error_code{};
           std::filesystem::copy_file(
