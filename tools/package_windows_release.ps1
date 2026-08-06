@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0-sf2-guest-alpha.10",
+    [string]$Version = "0.1.0-sf2-guest-alpha.11",
     [string]$Configuration = "Release",
     [switch]$Sf2GuestAlpha
 )
@@ -13,6 +13,19 @@ $packageName = "SyphonFilterPC-$Version-win64"
 $packageDir = Join-Path $distDir $packageName
 $archivePath = Join-Path $distDir "$packageName.zip"
 $archiveHashPath = "$archivePath.sha256"
+
+# BUILD_INFO records the current commit. Refuse a package whose tracked source
+# differs from that revision, otherwise a public archive cannot be reproduced
+# from the hash embedded inside it. Untracked local screenshots and other files
+# remain outside the explicit package copy list and are audited below.
+& git -C $repoRoot diff --quiet --exit-code
+if ($LASTEXITCODE -ne 0) {
+    throw "Refusing to package uncommitted tracked source changes. Commit the validated release tree first."
+}
+& git -C $repoRoot diff --cached --quiet --exit-code
+if ($LASTEXITCODE -ne 0) {
+    throw "Refusing to package staged but uncommitted source changes. Commit the validated release tree first."
+}
 
 foreach ($path in @($packageDir, $archivePath, $archiveHashPath)) {
     if (Test-Path -LiteralPath $path) {
@@ -163,13 +176,19 @@ AUDIO / CUTSCENE STATUS
   Homan/truck departure and silenced-rifle patrols appear and animate. Guard
   detection can still fail to trigger the authored mission failure, and
   hostile fire was observed without effects audio or player damage.
-- Mission 1 now completes beyond the former post-C4 blocking-CD stop. Dying by
-  falling during its playable parachute opening still restarts at an invalid
-  boundary state instead of replaying the complete in-engine parachute intro.
+- Mission 1 now completes beyond the former post-C4 blocking-CD stop. Its
+  parachute opening stays checkpoint-free until retail creates a real one;
+  failure while absent requests a clean same-mission package reconstruction.
+  Early parachute failure and Restart At Last Checkpoint have both been
+  confirmed to replay the complete opening with Gabe still attached.
 
-- All 21 missions boot through direct launch. A 42-route, 4,000-update matrix
+- All 21 missions boot through direct launch. A 42-route, 3,000-update matrix
   covers every mission on both discs under quick-state and combat/restart
-  input, with no renderer containment or collision-residency gaps. Missions 3,
+  input, requires complete checkpoint ownership for ordinary starts and
+  authored checkpoint deferral for opening-transfer starts, and reports no
+  renderer containment or collision-residency gaps. Separate fresh-generation
+  probes require Missions 1/5/6/8/17 to replay the same retail opening event.
+  Missions 3,
   7 and 8 have also been completed interactively.
 - Controls, combat, doors, climbing, weapons, dialogue, sound effects, death,
   checkpoint restart and in-session F5/F9 quick states are functional.
@@ -180,13 +199,15 @@ AUDIO / CUTSCENE STATUS
   coverage, including the open-air, train, scoped-weapon and NVG routes.
 - Retail briefing records now use SF2's forward field order, restoring the
   authored location, operative, date/time and directive layout.
+- The briefing frame's authentic animated mottled surface remains incomplete;
+  the current native fallback can allow grid lines to cross the border.
 - Native chase pitch yields to scripted retail camera ownership during
   in-engine cinematics and resumes when control returns to the player.
 - P opens and closes the retail pause/map screen without replacing the live
   mission, and cross-mission startup no longer retains its full-screen grid.
-- Connected campaign progression, SF2 inventory/vitals carry, save handoff,
-  every retail-selected EOL movie, the final Z17_1 stream, and automatic Disc
-  1-to-Disc 2 selection are implemented. Mission 8's complete ending-movie,
+- Connected campaign progression, retail-authored destination inventory/vitals,
+  save handoff, every retail-selected EOL movie, the final Z17_1 stream, and
+  automatic Disc 1-to-Disc 2 selection are implemented. Mission 8's ending-movie,
   save, disc-swap, Mission 9 opening-movie and gameplay sequence has been
   verified interactively.
 - Retail-indexed in-mission movies are bridged for AIRBASE (3_2/3_3) and
@@ -195,6 +216,9 @@ AUDIO / CUTSCENE STATUS
   interactive playtesting, while AIRBASEX still needs equivalent coverage.
 - SF2 scoped weapons no longer abort when SF1's SCOPED.TIM is absent.
 - The remaining AIRBASEX movie transition needs broader interactive coverage.
+- Mission 6's helicopter/troop opening now uses fresh-generation reconstruction
+  after checkpoint-free death or Restart Mission; exact interactive replay is
+  a release gate for this candidate.
 - Quick states are in-session only and do not persist after process exit.
 
 Controls use the existing PC bindings. Native relative-mouse control works on
@@ -255,18 +279,28 @@ playtesting build rather than a finished PC port.
 Mission 1's opening and complete post-C4 route, Mission 3 dialogue,
 post-checkpoint audio, Mission 5 choreography and Mission 7 music pass
 interactive checks. Missions 1-7 have been played consecutively through the
-current campaign, presentation and control paths. A Mission 1 death
-during the playable parachute opening still restores an invalid boundary state
-instead of replaying the complete in-engine parachute intro.
+current campaign, presentation and control paths. The candidate now keeps
+Mission 1 checkpoint-free during its authored parachute opening and rebuilds
+the active mission when failure occurs before a checkpoint. Mission 1 and
+Mission 8 checkpoint-free restart behavior now passes interactive testing.
+Retail Restart Mission and Save and Quit use distinct host lifecycle handoffs;
+the latter enters the native durable slot picker before returning to TITLE.
+The centered picker, durable save, return to TITLE and subsequent load pass
+interactive testing. Restart Mission remains an active playtest route.
+
+Direct SF2 startup uses Normal difficulty. The retail difficulty selector and
+Hard campaign route are not exposed in this alpha.
 
 Native relative-mouse aim/chase control and native-wide guest projection are
 included. Scripted in-engine cameras retain vertical ownership, and the default
 third-person mouse yaw is 0.75. SF2 briefing fields and text layout now match
 the retail record order.
 
-Known presentation follow-ups include the missing decorative briefing frame,
-the Mission 6 NVG right-edge strip, and mission-failure letterbox bars that
-animate at 4:3 before extending across the widescreen viewport when settled.
+Known presentation follow-ups include the incomplete retail state-8 briefing
+surface and border clipping. The candidate generalizes native-wide auxiliary
+effects for the Mission 6 NVG edge, fades, scopes, and the complete cinematic-
+matte animation; Mission 6 NVG passes interactively while the other effects
+remain useful regression routes.
 
 The archive contains no game image, save, settings, extracted game assets or
 syphon_filter_cheats marker. Read README_FIRST.txt before launching.

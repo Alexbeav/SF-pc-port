@@ -218,6 +218,7 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
       }
     }
     auto text_animation_complete = false;
+    retail_briefing.prepare(retail_time);
     if (PsyX_BeginScene() != 0) {
       text_animation_complete =
           retail_briefing.draw(mission.briefing(), retail_time);

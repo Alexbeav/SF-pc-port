@@ -178,3 +178,6 @@ sf2_address,descriptive_name,confidence,sf3_address,evidence
 0x800af9f0,ObjectPosition_ApproximateDistance,confirmed,0x800b255c,Resolves two object positions and computes largest absolute delta plus one quarter of the other two absolute deltas
 0x800b1d30,MissionScript_ObjectApproximateDistanceOp,confirmed,0x800b4b30,Action 0x63 stores the approximate distance between two decoded objects divided by 32 in the VM result register
 0x800afb68,MissionScript_IndexedOrientationScalarAssignOp,confirmed,0x800b26d4,Action 0x7f writes a fixed scalar or absolute object orientation component divided by 32 into one of two indexed halfword tables
+0x80143568,Menu_RestartAtLastCheckpoint,confirmed,,Live MENU overlay confirmation callback tears down state 7 then selects application state 5 which reaches the retail checkpoint restore lifecycle
+0x801435e4,Menu_SaveAndQuitGame,confirmed,,Live MENU overlay confirmation callback tears down state 7 then calls the shared outcome transition at 0x8014360c with return address 0x80143614
+0x80143624,Menu_RestartMission,confirmed,,Live MENU overlay confirmation callback clears checkpoint ownership then calls package teardown at 0x8014364c with return address 0x80143654 before reopening the current retail mission index

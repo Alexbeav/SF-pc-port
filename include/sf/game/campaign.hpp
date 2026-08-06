@@ -106,6 +106,12 @@ public:
   [[nodiscard]] bool stageMissionCompletionInSlot(
       TitleSaveSlots &slots, std::size_t save_slot,
       std::optional<CampaignCarryState> carry = std::nullopt) noexcept;
+  // Save and Quit stores the current mission cursor without manufacturing a
+  // completion/EOL transaction. The campaign is rebound to the chosen slot
+  // only in the candidate copy which the host persists atomically.
+  [[nodiscard]] bool saveCurrentMissionInSlot(
+      TitleSaveSlots &slots, std::size_t save_slot,
+      std::optional<CampaignCarryState> carry = std::nullopt) noexcept;
   // Finalize a staged EOL transaction. For compatibility with deterministic
   // probes this also accepts an unstaged in-memory completion, but the title
   // host always stages and persists first.

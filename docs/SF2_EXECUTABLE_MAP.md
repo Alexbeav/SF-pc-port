@@ -182,6 +182,19 @@ direct overlay ownership, `.DEM` path construction, and visible state
 mutations; state 3 remains deliberately generic because its player/view
 service has not yet been named.
 
+`MENU.OVL` keeps its three mission-exit callbacks distinct even though they
+converge on shared executable lifecycle functions:
+
+| SF2 callback | Command | Proven transition |
+|---:|---|---|
+| `0x80143568` | Restart At Last Checkpoint | teardown state 7, select state 5, then enter checkpoint restore |
+| `0x801435e4` | Save and Quit Game | after confirmation, tear down state 7 and call the shared outcome transition at `0x8014360c` (return `0x80143614`) |
+| `0x80143624` | Restart Mission | clear the retail checkpoint owner, tear down the package at `0x8014364c` (return `0x80143654`), then reopen the current mission index |
+
+The callback/caller pairs are the correct hybrid handoff points: observing the
+shared teardown or outcome routines alone cannot distinguish restart, quit,
+death, mission success, or mission selection.
+
 ## SF2 mission overlays
 
 SF2 mission overlays are small extension modules, not complete mission

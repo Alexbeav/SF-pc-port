@@ -272,6 +272,16 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint32_t last_pad_caller{};
   std::uint32_t last_pad_index{};
   std::uint32_t player_instance{};
+  std::uint32_t player_camera_wrapper{};
+  std::uint32_t player_camera_owner{};
+  bool player_owns_camera{};
+  bool scripted_camera_observed{};
+  bool initial_checkpoint_deferred_by_opening_event{};
+  bool checkpoint_captured{};
+  std::uint64_t checkpoint_capture_frame{};
+  std::uint64_t retail_checkpoint_capture_calls{};
+  bool mission_restart_requested{};
+  bool quit_to_title_requested{};
   std::uint16_t guest_current_room{};
   std::uint32_t guest_collision_room_count{};
   std::uint32_t guest_collision_room_record{};
@@ -607,7 +617,11 @@ struct Sf2GuestRuntimeDiagnostics {
   std::uint64_t async_file_services{};
   std::uint64_t async_file_completions{};
   std::uint32_t last_async_completion_caller{};
-  std::uint64_t raw_cd_sync_scheduler_slices{};
+  // Exhausted instruction slices that advanced hardware after the same guest
+  // PC recurred within one host-boundary search. The recurrence proves a
+  // device-dependent execution cycle without identifying a routine, API,
+  // return address, MMIO register, or display operation.
+  std::uint64_t device_wait_scheduler_slices{};
   std::uint64_t input_samples{};
   std::uint64_t checkpoint_restores{};
   std::uint64_t checkpoint_audio_discarded_frames{};
@@ -761,6 +775,18 @@ public:
   // the suppressed-interrupt scheduler. Diagnostic-only; the runtime should
   // be discarded after this call.
   [[nodiscard]] bool exerciseRawCdSyncWaitForProbe() noexcept;
+  // Invokes retail's restore entry without manufacturing a checkpoint. Used
+  // to prove that a clean-start package yields a host mission-restart request.
+  [[nodiscard]] bool exerciseCleanMissionRestartForProbe() noexcept;
+  // Invokes retail's level-reset entry after an authored opening event has
+  // made a late frontend checkpoint unsafe. The runtime must yield ownership
+  // to the product host before retail can reuse consumed one-shot state.
+  [[nodiscard]] bool exerciseOpeningMissionRestartForProbe() noexcept;
+  // Executes the loaded retail MENU confirmation callback through its real
+  // teardown and requires the native lifecycle bridge to yield at the
+  // authored outcome call. Diagnostic-only.
+  [[nodiscard]] bool
+  exercisePauseMenuLifecycleForProbe(bool save_and_quit) noexcept;
   [[nodiscard]] bool
   setPlayerHealthForProbe(std::uint16_t health) noexcept;
   // PC-control enhancement used only on the edge into manual aim. The
@@ -815,6 +841,14 @@ public:
   // signal is raised only when the success entry reaches that shared outcome
   // transition, so death/restart cannot advance the campaign.
   [[nodiscard]] bool missionCompleteRequested() const noexcept;
+  // Retail requested a clean package restart rather than restoring its
+  // checkpoint stream. The scene host reconstructs the active mission without
+  // replaying SOL/briefing or returning to the title screen.
+  [[nodiscard]] bool missionRestartRequested() const noexcept;
+  // Retail MENU confirmed Save and Quit and reached its outer lifecycle. The
+  // native campaign host owns the durable slot UI and TITLE shell, so gameplay
+  // yields rather than waiting for an application state this runtime omits.
+  [[nodiscard]] bool quitToTitleRequested() const noexcept;
   [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
   presentationFrame() const noexcept;
   [[nodiscard]] std::size_t

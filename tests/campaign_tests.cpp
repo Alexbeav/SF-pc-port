@@ -251,6 +251,54 @@ void testRetailSavePromptAndTransientCampaign() {
                   sf::game::CampaignAdvance::next_mission &&
               slots[3] == sf::game::TitleSaveSlot{true, 2U, false},
           "Accepted mission save did not finalize after EOL");
+
+  sf::game::TitleSaveSlots quit_slots{};
+  quit_slots[2] = sf::game::TitleSaveSlot{true, 9U, false};
+  auto quitting = sf::game::CampaignProgress::startUnsaved(
+      4U, true,
+      static_cast<std::uint32_t>(sf2_catalog.size()));
+  require(quitting &&
+              quitting->saveCurrentMissionInSlot(quit_slots, 2U) &&
+              quitting->saveSlot() == 2U && quitting->missionIndex() == 4U &&
+              quit_slots[2] ==
+                  sf::game::TitleSaveSlot{true, 4U, false},
+          "Save and Quit did not replace the selected slot with the current "
+          "mission cursor");
+  require(!quitting->saveCurrentMissionInSlot(quit_slots,
+                                               quit_slots.size()),
+          "Save and Quit accepted an invalid durable slot");
+
+  sf::game::CampaignCarryState quit_carry;
+  const auto unarmed = static_cast<unsigned>(sf::game::WeaponId::unarmed);
+  quit_carry.current_weapon = static_cast<std::uint8_t>(unarmed);
+  quit_carry.owned_weapons = std::uint32_t{1U} << unarmed;
+  quit_carry.health = 100U;
+  require(sf::game::validCampaignCarry(quit_carry),
+          "Save and Quit fixture carry is invalid");
+
+  auto connected_quit = sf::game::CampaignProgress::startUnsaved(
+      1U, true, static_cast<std::uint32_t>(sf2_catalog.size()));
+  require(connected_quit &&
+              connected_quit->saveCurrentMissionInSlot(quit_slots, 0U,
+                                                        quit_carry) &&
+              quit_slots[0].carry == quit_carry,
+          "Save and Quit discarded carry imported by a connected mission");
+
+  auto boundary_quit = sf::game::CampaignProgress::startUnsaved(
+      5U, true, static_cast<std::uint32_t>(sf2_catalog.size()));
+  require(boundary_quit &&
+              boundary_quit->saveCurrentMissionInSlot(quit_slots, 1U,
+                                                       quit_carry) &&
+              !quit_slots[1].carry,
+          "Save and Quit retained live carry at a chapter boundary");
+
+  auto staged = sf::game::CampaignProgress::startUnsaved(
+      4U, true,
+      static_cast<std::uint32_t>(sf2_catalog.size()));
+  require(staged && staged->stageMissionCompletionInSlot(quit_slots, 0U) &&
+              !staged->saveCurrentMissionInSlot(quit_slots, 1U),
+          "Save and Quit overwrote an in-flight mission-completion "
+          "transaction");
 }
 
 void testSf2TrainChapterConnectedMovieOrder() {

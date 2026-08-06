@@ -299,17 +299,61 @@ receive PAD samples. The host writes only the registered record at the retail
 input boundary; buttons and analog axes then flow through the original player,
 camera, collision, and animation code.
 
-Mission 3's first checkpoint is also authored by retail code. Once application
-state 0 is live, the runtime invokes retail capture function `0x800AD48C` and
-accepts the serialized checkpoint only when its command stream is structurally
-valid. When retail enters restore function `0x800AD9F4`, the host observes the
-edge but executes the original function. Instruction-budget slices which remain
-inside this synchronous restart advance the guest hardware scheduler, allowing
-its CD command, DMA, callbacks, and subsequent mission reload to complete
-while normal display submissions remain fixed at 60 Hz. The host audio sink
-discards samples from the retired generation at the restore edge. No
-CPU/RAM/CD/SPU host snapshot substitutes for the retail restart, and no actor,
-script, camera, or mission state is synthesized.
+The initial restart checkpoint is authored by retail code. The direct mission
+bridge replaces the frontend handoff which normally invokes retail capture
+function `0x800AD48C`. Ordinary missions begin that capture once application
+state 0 and `LEVEL` are live and accept it only after the serialized retail
+command stream is structurally complete. Clean-start packages which dispatch
+the shared special-opening object event `0x72` do not receive that synthetic
+frontend capture at all. Their checkpoint-present flag remains zero through
+the COLO and WRECK parachute openings; only a later call from retail mission
+logic may make a checkpoint valid.
+
+Restore function `0x800AD9F4` therefore has two retail-authored outcomes. With
+a set checkpoint-present flag and complete stream, the host observes the edge
+but executes the original function. Instruction-budget slices inside that
+synchronous restore advance the guest hardware scheduler, allowing its CD
+command, DMA, callbacks, and mission reload to complete. With the flag clear,
+the request means Restart Mission (or failure before the first checkpoint):
+the guest yields and the campaign host reconstructs the active package without
+returning to title or replaying its SOL movie/briefing. No CPU/RAM/CD/SPU host
+snapshot substitutes for either lifecycle, and no actor, script, camera, or
+mission state is synthesized.
+
+MENU keeps three restart/exit paths separate. Restart At Last Checkpoint
+reaches the checkpoint restore above. Restart Mission calls the retail package
+teardown from MENU's dedicated callback, so the runtime yields at that boundary
+and asks the native campaign host to reconstruct the same mission. Save and
+Quit uses MENU's separate shared-outcome caller after its confirmation and
+menu-side cleanup. It yields to the native durable-save owner, which presents
+the slot picker, stores the current mission cursor if requested, and then
+returns to TITLE. Caller identity is used only to distinguish these authored
+callbacks which converge on shared executable functions, not to replace their
+gameplay behavior. Both callbacks have already dismantled application state 7
+before reaching those shared functions, so their exact architectural return
+addresses are the lifecycle discriminator; testing the former application
+state at that point rejects every authentic confirmation. The validation
+matrix executes the loaded callbacks through their real teardown and requires
+both distinct yields.
+
+This native Save and Quit handoff does not yet claim retail memory-card
+checkpoint fidelity. The durable slot records the active mission cursor and
+player snapshot, but does not serialize the guest checkpoint command stream;
+loading it re-enters the mission package. The independent recompilation route
+executes retail's complete card protocol and is the differential reference for
+the eventual last-checkpoint persistence contract.
+
+Connected SF2 missions do not import the completed mission's live player RAM.
+Each destination package authors its playable character, health, armor and
+inventory during retail bootstrap. Injecting the preceding snapshot after
+that bootstrap once armed Mission 2 Lian with Mission 1 Gabe's arsenal. The
+native save/campaign shell may still retain the exact 34-slot sequel snapshot
+for format compatibility and inspection, but `runSf2GuestScene` treats it as
+metadata and leaves the new guest runtime untouched. The completion-flow gate
+poisons the outgoing snapshot with distinctive vitals and inventory, boots
+every same-disc destination, and fails if that state appears in the new
+mission. Mission 8-to-9 remains owned by the two-disc resolver, while Mission
+21 is terminal and has no destination runtime.
 
 The GP0 side-effect stream retains incomplete VRAM-upload packets between
 updates and compacts consumed words, so long product sessions do not grow an
@@ -399,11 +443,16 @@ intentionally empty SF1 definition. Four host-only alias pages isolate the
 complete native HUD atlas from guest framebuffers and mission textures; this
 also makes the full-height `KNIFEA/B` placement safe.
 
-Mission failure contains a resident `VSync(-1)` polling loop which submits no
-ordering table while it waits for two retraces. The product advances hardware
-from instruction slices in that exact lifecycle wait, just as it does for the
-synchronous checkpoint CD loader; otherwise a display-boundary-owned clock
-can never satisfy the loop. PC-synthesized face actions also omit the
+Mission failure and blocking CD/card paths can wait for hardware without
+submitting an ordering table. During one host-boundary search, the runtime
+records PCs at exhausted 50,000-instruction slice boundaries. Recurrence of
+the same PC proves that guest execution has entered a cycle; only then are all
+devices advanced by the retired guest cycles. The rule recognizes no routine,
+API, return address, MMIO register, mission state, or display operation. A
+single heavy slice remains clock-neutral, while a completed GPU boundary is
+padded only to its next 60 Hz event. This keeps ordinary gameplay at exactly
+735 PCM frames per update while allowing CD, DMA, SPU, timers, callbacks, and
+future device waits to make deterministic progress. PC-synthesized face actions also omit the
 processed PAD's derived face-button axes, preventing Cross crouch from
 simultaneously becoming backward movement. Physical controller buttons retain
 their retail-derived axes.

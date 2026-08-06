@@ -1,6 +1,6 @@
 1 VERSIONINFO
- FILEVERSION 0,1,0,92
- PRODUCTVERSION 0,1,0,91
+ FILEVERSION 0,1,0,911
+ PRODUCTVERSION 0,1,0,911
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -13,11 +13,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Syphon Filter PC community project\0"
       VALUE "FileDescription", "Syphon Filter PC Launcher\0"
-      VALUE "FileVersion", "0.1.0 SF2 guest alpha 2\0"
+      VALUE "FileVersion", "0.1.0 SF2 guest alpha 11\0"
       VALUE "InternalName", "syphon_filter\0"
       VALUE "OriginalFilename", "syphon_filter.exe\0"
       VALUE "ProductName", "Syphon Filter PC\0"
-      VALUE "ProductVersion", "0.1.0 SF2 guest alpha 2\0"
+      VALUE "ProductVersion", "0.1.0 SF2 guest alpha 11\0"
     END
   END
   BLOCK "VarFileInfo"

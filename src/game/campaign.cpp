@@ -165,6 +165,29 @@ bool CampaignProgress::stageMissionCompletionInSlot(
   return true;
 }
 
+bool CampaignProgress::saveCurrentMissionInSlot(
+    TitleSaveSlots &slots, std::size_t save_slot,
+    std::optional<CampaignCarryState> carry) noexcept {
+  if (!active_ || pending_eol_mission_ || save_slot >= slots.size() ||
+      mission_index_ >= mission_count_) {
+    return false;
+  }
+  // A durable slot's carry describes the state imported by its current
+  // mission. Chapter-opening missions author that state themselves, so a
+  // live gameplay snapshot is neither consumed on load nor valid in the save
+  // format. This mirrors completion's outgoing-boundary normalization, but
+  // tests the current mission's incoming boundary for Save and Quit.
+  if (mission_index_ == 0U ||
+      !campaignMissionsShareCarry(mission_index_ - 1U, mission_index_)) {
+    carry.reset();
+  }
+  save_slot_ = save_slot;
+  slots[save_slot] =
+      TitleSaveSlot{true, mission_index_, false, std::nullopt,
+                    std::move(carry)};
+  return true;
+}
+
 CampaignAdvance
 CampaignProgress::completeMission(TitleSaveSlots &slots) noexcept {
   if (!active_ || !save_slot_ || *save_slot_ >= slots.size() ||

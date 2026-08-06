@@ -5,6 +5,49 @@ pre-release tags rather than a stable semantic-versioning promise.
 
 ## Unreleased
 
+### SF2 retail-ownership hardening
+
+- Replaced guest-PC/return-address and `VSync(-1)`-threshold device-wait
+  recognition with bounded repeated-execution detection. Once an exhausted
+  guest quantum recurs inside one boundary search, all devices advance by
+  retired guest cycles through the generic hardware-clocked,
+  guest-interrupt-suppressed VM execution contract.
+- Moved restart ownership to structurally validated retail checkpoint streams.
+  Authored parachute and opening vehicle/actor transfers remain checkpoint-free
+  until retail itself calls the serializer; restore or level reset while absent
+  reconstructs a fresh mission generation. Direct starts retain the replaced
+  frontend's initial capture after a bounded opening-observation interval.
+- Added distinct MENU lifecycle handoffs for Restart Mission and Save and Quit,
+  preventing the former from falling through to TITLE and routing the latter
+  through the native durable slot picker instead of an unhosted frontend wait.
+- Generalized widescreen auxiliary primitives so authored full-frame fades,
+  filters, scopes and cinematic mattes expand without mission, packet-address,
+  texture or color recognition.
+- Repaired the H11/sniper diagnostic setup to wait for retail inventory
+  bootstrap and made both optics positive release gates: H11 must publish its
+  line-based reticle while the sniper must publish its sprite-heavy scope.
+- Extended F5/F9 determinism to the complete published presentation state,
+  including retail draw/display pages and every captured GPU packet.
+- Strengthened the two-disc release matrix: ordinary routes require a positive,
+  complete retail checkpoint; opening-transfer routes must preserve authored
+  deferral and replay the same event in a newly constructed guest generation.
+- Corrected the connected-completion gate to preserve each destination
+  package's retail-authored character, vitals and loadout. Exact SF2 carry
+  snapshots remain available to the durable-save shell, but are no longer
+  injected into a newly booted guest mission; all 21 success-shell routes now
+  reject the former cross-character inventory leak. The reproducible release
+  matrix runs these completion routes by default.
+- Added a reusable bring-up retrospective, a consecutive Missions 8-21 manual
+  release gate, and an audited boundary for any future generic upstream patch.
+- Confirmed the corrected Save and Quit lifecycle end to end: the centered
+  native slot picker saves the active campaign cursor, returns to TITLE and
+  reloads the selected mission.
+- Kept enhanced chase pitch dormant at authored-camera handoff until the first
+  real mouse-Y sample, removing the upward camera snap when gameplay begins.
+- Mapped the retail state-8 briefing's exact GPU primitive topology and rejected
+  the incomplete native texture reconstruction. Authentic briefing-surface
+  fidelity remains a documented follow-up rather than a release claim.
+
 ## 0.1.0-sf2-guest-alpha.10 - 2026-08-02
 
 ### SF2 campaign playtest candidate
