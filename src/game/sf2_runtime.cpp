@@ -2060,6 +2060,9 @@ public:
     result.last_pad_index = last_pad_index_;
     result.pc_chase_pitch_hook_calls = pc_chase_pitch_hook_calls_;
     result.pc_chase_camera_base = pc_chase_camera_base_;
+    result.pc_chase_camera_flags = pc_chase_camera_flags_;
+    result.pc_chase_interaction_suspensions =
+        pc_chase_interaction_suspensions_;
     result.pc_chase_desired_pitch = pc_chase_pitch_target_;
     result.pc_chase_rendered_pitch = pc_chase_rendered_pitch_;
     result.pc_chase_yaw_hook_calls = pc_chase_yaw_hook_calls_;
@@ -6096,6 +6099,7 @@ private:
     constexpr std::uint32_t player_state_camera_offset = 0xe0U;
     constexpr std::uint32_t camera_wrapper_base_offset = 0xa4U;
     constexpr std::uint32_t camera_wrapper_owner_offset = 0xdcU;
+    constexpr std::uint32_t camera_wrapper_mode_flags_offset = 0x13cU;
     constexpr std::uint32_t camera_desired_pitch_offset = 0x8e8U;
     constexpr std::uint32_t camera_rendered_pitch_offset = 0x918U;
     constexpr std::int32_t maximum_pitch = 512;
@@ -6105,6 +6109,7 @@ private:
     std::uint32_t camera_wrapper{};
     std::uint32_t camera_base{};
     std::uint32_t camera_owner{};
+    std::uint32_t camera_flags{};
     if (!pc_chase_pitch_enabled_ ||
         !vm_.runtime().read32(player_pointer, player) || player == 0U ||
         !vm_.runtime().read32(player + instance_player_state_offset,
@@ -6117,7 +6122,9 @@ private:
                               camera_base) ||
         camera_base == 0U ||
         !vm_.runtime().read32(camera_wrapper + camera_wrapper_owner_offset,
-                              camera_owner)) {
+                              camera_owner) ||
+        !vm_.runtime().read32(camera_wrapper + camera_wrapper_mode_flags_offset,
+                              camera_flags)) {
       // The camera base survives retail ownership transfers. During an
       // in-engine cinematic wrapper+0xDC names the scripted camera actor;
       // ordinary chase gameplay names the live player instance. Never carry
@@ -6127,11 +6134,26 @@ private:
       pc_chase_camera_base_ = 0U;
       return;
     }
+    pc_chase_camera_flags_ = camera_flags;
     if (camera_owner != player) {
       pc_chase_pitch_pending_ = 0;
       pc_chase_pitch_valid_ = false;
       pc_chase_scripted_camera_seen_ = true;
       pc_chase_camera_base_ = 0U;
+      return;
+    }
+    // PlayerObjectInteraction_Start retains player camera ownership while
+    // wrapper mode bit 0x40 gives the authored pickup/C4 interaction full
+    // control of its camera curve. Rewriting the chase pitch through this
+    // interval carries the last mouse angle into that close framing and
+    // produces the apparent autonomous pan. Suspend until retail clears the
+    // mode, then reacquire from neutral on the next vertical mouse command.
+    if ((camera_flags & 0x40U) != 0U) {
+      pc_chase_pitch_pending_ = 0;
+      pc_chase_pitch_valid_ = false;
+      pc_chase_scripted_camera_seen_ = true;
+      pc_chase_camera_base_ = 0U;
+      ++pc_chase_interaction_suspensions_;
       return;
     }
     ++pc_chase_pitch_hook_calls_;
@@ -7296,6 +7318,8 @@ private:
   std::int32_t pc_chase_pitch_pending_{};
   std::int32_t pc_chase_pitch_target_{};
   std::uint32_t pc_chase_camera_base_{};
+  std::uint32_t pc_chase_camera_flags_{};
+  std::uint64_t pc_chase_interaction_suspensions_{};
   std::uint64_t pc_chase_pitch_hook_calls_{};
   std::int32_t pc_chase_rendered_pitch_{};
   bool pc_chase_yaw_enabled_{};

@@ -14562,11 +14562,18 @@ SceneViewerResult runSf2GuestScene(
   auto traced_presentation_sequence = std::uint64_t{};
   auto traced_gpu_submissions = std::uint64_t{};
   auto drawn_presentation_sequence = std::uint64_t{};
+  struct Sf2RecordedInputSample {
+    game::LegacyHostPadState pad{};
+    int mouse_x{};
+    int mouse_y{};
+  };
   auto input_record = std::ofstream{};
+  auto recorded_mouse_pending_x = std::int64_t{};
+  auto recorded_mouse_pending_y = std::int64_t{};
   if (input_record_path) {
     input_record.open(*input_record_path, std::ios::out | std::ios::trunc);
     if (input_record) {
-      input_record << "SF2PAD1 " << mission.definition().index << '\n';
+      input_record << "SF2PAD2 " << mission.definition().index << '\n';
       input_record.flush();
       PsyX_Log_Info("SF2 input recording: path=%s pin-health=%u\n",
                     input_record_path->string().c_str(),
@@ -14576,13 +14583,14 @@ SceneViewerResult runSf2GuestScene(
                      input_record_path->string().c_str());
     }
   }
-  auto input_replay = std::vector<game::LegacyHostPadState>{};
+  auto input_replay = std::vector<Sf2RecordedInputSample>{};
   auto input_replay_index = std::size_t{};
   if (input_replay_path) {
     auto replay = std::ifstream{*input_replay_path};
     auto magic = std::string{};
     auto recorded_mission = std::uint32_t{};
-    if (!(replay >> magic >> recorded_mission) || magic != "SF2PAD1" ||
+    if (!(replay >> magic >> recorded_mission) ||
+        (magic != "SF2PAD1" && magic != "SF2PAD2") ||
         recorded_mission != mission.definition().index) {
       PsyX_Log_Error(
           "SF2 input replay rejected: path=%s mission=%u expected=%u\n",
@@ -14597,18 +14605,27 @@ SceneViewerResult runSf2GuestScene(
         auto left_y = unsigned int{};
         auto right_x = unsigned int{};
         auto right_y = unsigned int{};
+        auto mouse_x = 0;
+        auto mouse_y = 0;
         if (!(replay >> buttons_value >> face_value >> explicit_value >> left_x >>
               left_y >> right_x >> right_y)) {
           break;
         }
-        input_replay.push_back(game::LegacyHostPadState{
-            .buttons = static_cast<std::uint16_t>(buttons_value),
-            .face_axis_buttons = static_cast<std::uint16_t>(face_value),
-            .use_explicit_face_axis_buttons = explicit_value != 0U,
-            .left_x = static_cast<std::uint8_t>(left_x),
-            .left_y = static_cast<std::uint8_t>(left_y),
-            .right_x = static_cast<std::uint8_t>(right_x),
-            .right_y = static_cast<std::uint8_t>(right_y),
+        if (magic == "SF2PAD2" && !(replay >> mouse_x >> mouse_y)) {
+          break;
+        }
+        input_replay.push_back(Sf2RecordedInputSample{
+            .pad = game::LegacyHostPadState{
+                .buttons = static_cast<std::uint16_t>(buttons_value),
+                .face_axis_buttons = static_cast<std::uint16_t>(face_value),
+                .use_explicit_face_axis_buttons = explicit_value != 0U,
+                .left_x = static_cast<std::uint8_t>(left_x),
+                .left_y = static_cast<std::uint8_t>(left_y),
+                .right_x = static_cast<std::uint8_t>(right_x),
+                .right_y = static_cast<std::uint8_t>(right_y),
+            },
+            .mouse_x = mouse_x,
+            .mouse_y = mouse_y,
         });
       }
       PsyX_Log_Info("SF2 input replay: path=%s samples=%zu pin-health=%u\n",
@@ -14873,6 +14890,14 @@ SceneViewerResult runSf2GuestScene(
     int mouse_x{};
     int mouse_y{};
     SDL_GetRelativeMouseState(&mouse_x, &mouse_y);
+    if (input_record) {
+      recorded_mouse_pending_x = std::clamp<std::int64_t>(
+          recorded_mouse_pending_x + mouse_x,
+          std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+      recorded_mouse_pending_y = std::clamp<std::int64_t>(
+          recorded_mouse_pending_y + mouse_y,
+          std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+    }
     mouse_motion.add(current_input_sample, mouse_x, mouse_y);
     const auto add_weapon_pulses = [&weapon_select](unsigned int count) {
       weapon_select.enqueue(count);
@@ -14886,31 +14911,37 @@ SceneViewerResult runSf2GuestScene(
       static_cast<void>(runtime.alignPlayerAimToLockedTarget());
     }
     previous_manual_aim = raw.aim;
-    runtime.setPcManualAimInput(
-        static_cast<std::int32_t>(std::clamp(
-            std::llround(static_cast<double>(mouse_x) *
-                         input.mouse_yaw_sensitivity),
-            -512LL, 512LL)),
-        static_cast<std::int32_t>(std::clamp(
-            std::llround(static_cast<double>(mouse_y) *
-                         input.mouse_pitch_sensitivity),
-            -512LL, 512LL)),
-        raw.aim && weapon_state.application_state == 0U &&
-            weapon_state.player_health != 0U);
-    runtime.setPcChaseCameraYawInput(
-        static_cast<std::int32_t>(std::clamp(
-            std::llround(static_cast<double>(mouse_x) *
-                         input.mouse_chase_yaw_sensitivity),
-            -512LL, 512LL)),
-        !raw.aim && weapon_state.application_state == 0U &&
-            weapon_state.player_health != 0U);
-    runtime.setPcChaseCameraPitchInput(
-        static_cast<std::int32_t>(std::clamp(
-            std::llround(static_cast<double>(mouse_y) *
-                         input.mouse_chase_pitch_sensitivity),
-            -96LL, 96LL)),
-        !raw.aim && weapon_state.application_state == 0U &&
-            weapon_state.player_health != 0U);
+    const auto apply_pc_mouse = [&](int delta_x, int delta_y, bool manual_aim,
+                                    const auto &state) {
+      runtime.setPcManualAimInput(
+          static_cast<std::int32_t>(std::clamp(
+              std::llround(static_cast<double>(delta_x) *
+                           input.mouse_yaw_sensitivity),
+              -512LL, 512LL)),
+          static_cast<std::int32_t>(std::clamp(
+              std::llround(static_cast<double>(delta_y) *
+                           input.mouse_pitch_sensitivity),
+              -512LL, 512LL)),
+          manual_aim && state.application_state == 0U &&
+              state.player_health != 0U);
+      runtime.setPcChaseCameraYawInput(
+          static_cast<std::int32_t>(std::clamp(
+              std::llround(static_cast<double>(delta_x) *
+                           input.mouse_chase_yaw_sensitivity),
+              -512LL, 512LL)),
+          !manual_aim && state.application_state == 0U &&
+              state.player_health != 0U);
+      runtime.setPcChaseCameraPitchInput(
+          static_cast<std::int32_t>(std::clamp(
+              std::llround(static_cast<double>(delta_y) *
+                           input.mouse_chase_pitch_sensitivity),
+              -96LL, 96LL)),
+          !manual_aim && state.application_state == 0U &&
+              state.player_health != 0U);
+    };
+    if (input_replay.empty()) {
+      apply_pc_mouse(mouse_x, mouse_y, raw.aim, weapon_state);
+    }
     auto direct_weapon_slot = std::optional<std::size_t>{};
     for (auto slot = std::size_t{}; slot < raw.quick_weapon_keys.size();
          ++slot) {
@@ -15142,9 +15173,19 @@ SceneViewerResult runSf2GuestScene(
     previous_buttons = buttons;
 
     auto updates = 0U;
+    auto recorded_mouse_consumed = false;
     while (updates < maximum_updates &&
            simulation_accumulator + 1.0e-9 >= simulation_step) {
       auto sampled_pad = host_pad;
+      auto sampled_mouse_x = 0;
+      auto sampled_mouse_y = 0;
+      if (input_record && !recorded_mouse_consumed) {
+        sampled_mouse_x = static_cast<int>(recorded_mouse_pending_x);
+        sampled_mouse_y = static_cast<int>(recorded_mouse_pending_y);
+        recorded_mouse_pending_x = 0;
+        recorded_mouse_pending_y = 0;
+        recorded_mouse_consumed = true;
+      }
       if (!input_replay.empty()) {
         if (input_replay_index >= input_replay.size()) {
           PsyX_Log_Info("SF2 input replay completed: samples=%zu\n",
@@ -15152,7 +15193,15 @@ SceneViewerResult runSf2GuestScene(
           return SceneViewerResult{
               readButtons(pad), SceneExitReason::return_to_title};
         }
-        sampled_pad = input_replay[input_replay_index++];
+        const auto &replay_sample = input_replay[input_replay_index++];
+        sampled_pad = replay_sample.pad;
+        sampled_mouse_x = replay_sample.mouse_x;
+        sampled_mouse_y = replay_sample.mouse_y;
+        constexpr std::uint16_t manual_aim_button = 0x0400U;
+        apply_pc_mouse(
+            sampled_mouse_x, sampled_mouse_y,
+            (sampled_pad.buttons & manual_aim_button) != 0U,
+            runtime.diagnostics());
         const auto replay_target_lock =
             (sampled_pad.buttons & 0x0800U) != 0U;
         if (capture_on_target && replay_target_lock &&
@@ -15172,6 +15221,7 @@ SceneViewerResult runSf2GuestScene(
                      << ' ' << static_cast<unsigned int>(sampled_pad.left_y)
                      << ' ' << static_cast<unsigned int>(sampled_pad.right_x)
                      << ' ' << static_cast<unsigned int>(sampled_pad.right_y)
+                     << ' ' << sampled_mouse_x << ' ' << sampled_mouse_y
                      << '\n';
         input_record.flush();
       }
@@ -16219,7 +16269,8 @@ SceneViewerResult runSf2GuestScene(
         PsyX_Log_Info(
             "SF2 capture frame: presented=%llu sequence=%llu guest=%llu "
             "clock=%u packets=%zu draws=%zu kinds=%zu/%zu/%zu/%zu/%zu/%zu "
-            "target=%u/%d flags=0x%08X composite=%u env=(%d,%d,%d,%d)/"
+            "target=%u/%d flags=0x%08X camera=0x%08X/%d/%d "
+            "interaction-suspends=%llu composite=%u env=(%d,%d,%d,%d)/"
             "(%d,%d)/tpage=0x%04X dtd=%d\n",
             static_cast<unsigned long long>(presented_frames),
             static_cast<unsigned long long>(frame->sequence),
@@ -16229,6 +16280,11 @@ SceneViewerResult runSf2GuestScene(
             command_kinds[2U], command_kinds[3U], command_kinds[4U],
             command_kinds[5U], diagnostics.player_target_active ? 1U : 0U,
             diagnostics.player_target_slot, diagnostics.player_target_flags,
+            diagnostics.pc_chase_camera_flags,
+            diagnostics.pc_chase_desired_pitch,
+            diagnostics.pc_chase_rendered_pitch,
+            static_cast<unsigned long long>(
+                diagnostics.pc_chase_interaction_suspensions),
             guest_ui_overlay ? 1U : 0U,
             captured_environment.clip.x,
             captured_environment.clip.y, captured_environment.clip.w,

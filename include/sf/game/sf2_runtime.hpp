@@ -328,6 +328,8 @@ struct Sf2GuestRuntimeDiagnostics {
   std::int16_t player_forward_z{4096};
   std::uint64_t pc_chase_pitch_hook_calls{};
   std::uint32_t pc_chase_camera_base{};
+  std::uint32_t pc_chase_camera_flags{};
+  std::uint64_t pc_chase_interaction_suspensions{};
   std::int32_t pc_chase_desired_pitch{};
   std::int32_t pc_chase_rendered_pitch{};
   std::uint64_t pc_chase_yaw_hook_calls{};
