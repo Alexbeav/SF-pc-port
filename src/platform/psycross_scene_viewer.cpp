@@ -1,4 +1,7 @@
 #include "psycross_scene_viewer.hpp"
+
+#include "sf/core/fixed_rate_clock.hpp"
+
 #include "muzzle_flash_texture.hpp"
 #include "psycross_audio_output.hpp"
 #include "psycross_font_texture.hpp"
@@ -15950,15 +15953,72 @@ SceneViewerResult runSf3GuestScene(
   PsyCrossAudioOutput audio{12U, "sf3-gameplay"};
   RelativeMouseCapture mouse_capture;
   mouse_capture.set(true);
-  constexpr double simulation_step = 1.0 / 60.0;
   constexpr double maximum_frame_time = 0.25;
   constexpr unsigned int maximum_updates = 4U;
-  auto simulation_accumulator = 0.0;
+  sf::core::FixedStepClock simulation_clock{20.0, 5U};
   auto previous_counter = SDL_GetPerformanceCounter();
   const auto frequency = SDL_GetPerformanceFrequency();
   auto pause_was_down = false;
   auto drawn_presentation_sequence = std::uint64_t{};
   std::array<psx::SpuPcmFrame, 4096U> pcm{};
+  const auto input_record_path =
+      std::filesystem::path{"logs"} / "sf3-last-input.txt";
+  std::error_code input_directory_error;
+  std::filesystem::create_directories(input_record_path.parent_path(),
+                                      input_directory_error);
+  auto input_record =
+      std::ofstream{input_record_path, std::ios::out | std::ios::trunc};
+  if (input_record) {
+    input_record << "SF3PAD1 " << mission.definition().index << '\n';
+    input_record.flush();
+  } else {
+    PsyX_Log_Error("SF3 input recording open failed: path=%s\n",
+                   input_record_path.string().c_str());
+  }
+  auto input_replay = std::vector<game::LegacyHostPadState>{};
+  auto input_replay_index = std::size_t{};
+  const auto diagnostic_path = [](const char *name)
+      -> std::optional<std::filesystem::path> {
+    const auto *value = SDL_getenv(name);
+    return value != nullptr && *value != '\0'
+               ? std::optional<std::filesystem::path>{value}
+               : std::nullopt;
+  };
+  if (const auto input_replay_path = diagnostic_path("SF3_REPLAY_INPUT")) {
+    auto replay = std::ifstream{*input_replay_path};
+    auto magic = std::string{};
+    auto recorded_mission = std::uint32_t{};
+    if (!(replay >> magic >> recorded_mission) || magic != "SF3PAD1" ||
+        recorded_mission != mission.definition().index) {
+      PsyX_Log_Error("SF3 input replay rejected: path=%s\n",
+                     input_replay_path->string().c_str());
+    } else {
+      for (;;) {
+        auto buttons = unsigned int{};
+        auto face_buttons = unsigned int{};
+        auto explicit_face_buttons = unsigned int{};
+        auto left_x = unsigned int{};
+        auto left_y = unsigned int{};
+        auto right_x = unsigned int{};
+        auto right_y = unsigned int{};
+        if (!(replay >> buttons >> face_buttons >> explicit_face_buttons >>
+              left_x >> left_y >> right_x >> right_y)) {
+          break;
+        }
+        input_replay.push_back(game::LegacyHostPadState{
+            .buttons = static_cast<std::uint16_t>(buttons),
+            .face_axis_buttons = static_cast<std::uint16_t>(face_buttons),
+            .use_explicit_face_axis_buttons = explicit_face_buttons != 0U,
+            .left_x = static_cast<std::uint8_t>(left_x),
+            .left_y = static_cast<std::uint8_t>(left_y),
+            .right_x = static_cast<std::uint8_t>(right_x),
+            .right_y = static_cast<std::uint8_t>(right_y),
+        });
+      }
+      PsyX_Log_Info("SF3 input replay: path=%s samples=%zu\n",
+                    input_replay_path->string().c_str(), input_replay.size());
+    }
+  }
 
   PsyX_Log_Info(
       "SF3 guest alpha: campaign=1 title=\"%s\" resource=%s "
@@ -15975,8 +16035,7 @@ SceneViewerResult runSf3GuestScene(
                   static_cast<double>(frequency),
         0.0, maximum_frame_time);
     previous_counter = counter;
-    simulation_accumulator =
-        std::min(simulation_accumulator + elapsed, simulation_step * 5.0);
+    simulation_clock.addElapsed(elapsed);
 
     PsyX_UpdateInput();
     const auto buttons = readButtons(pad);
@@ -16056,14 +16115,78 @@ SceneViewerResult runSf3GuestScene(
     host_pad.right_y = pad.analog[1];
     previous_buttons = buttons;
 
-    auto updates = 0U;
-    while (updates < maximum_updates &&
-           simulation_accumulator + 1.0e-9 >= simulation_step) {
-      runtime.setHostPadState(host_pad);
+    const auto updates = simulation_clock.takeReadyUpdates(maximum_updates);
+    for (auto update = 0U; update < updates; ++update) {
+      auto sampled_pad = host_pad;
+      if (!input_replay.empty()) {
+        if (input_replay_index >= input_replay.size()) {
+          PsyX_Log_Info("SF3 input replay completed: samples=%zu\n",
+                        input_replay.size());
+          return SceneViewerResult{readButtons(pad),
+                                   SceneExitReason::return_to_title};
+        }
+        sampled_pad = input_replay[input_replay_index++];
+      }
+      if (input_record) {
+        input_record << sampled_pad.buttons << ' '
+                     << sampled_pad.face_axis_buttons << ' '
+                     << (sampled_pad.use_explicit_face_axis_buttons ? 1U : 0U)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.left_x)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.left_y)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.right_x)
+                     << ' ' << static_cast<unsigned int>(sampled_pad.right_y)
+                     << '\n';
+        input_record.flush();
+      }
+      runtime.setHostPadState(sampled_pad);
       if (!runtime.advanceHostUpdate()) {
         const auto detail = runtime.faultDetail();
-        PsyX_Log_Error("SF3 guest runtime stopped: %.*s\n",
-                       static_cast<int>(detail.size()), detail.data());
+        const auto diagnostics = runtime.diagnostics();
+        PsyX_Log_Error(
+            "SF3 guest runtime stopped: %.*s frames=%llu input=%llu "
+            "gpu=%llu presentation=%llu platform=%llu/%llu retrace=%llu "
+            "vsync=%llu/%llu[%llu,%llu,%llu] state=%u/%u "
+            "cpu=0x%08X/0x%08X/0x%08X tick=%llu counter=%u "
+            "cd=%u->%u/read%u/mode%02X/filter%u:%u/xa%u:%u:%u/irq%02X:%02X/"
+            "cmd%02X/sector%u:%u spu=%u/%u xa=%llu/%llu\n",
+            static_cast<int>(detail.size()), detail.data(),
+            static_cast<unsigned long long>(diagnostics.guest_frames),
+            static_cast<unsigned long long>(diagnostics.input_samples),
+            static_cast<unsigned long long>(diagnostics.gpu_submissions),
+            static_cast<unsigned long long>(diagnostics.presentation_frames),
+            static_cast<unsigned long long>(diagnostics.platform_slices),
+            static_cast<unsigned long long>(diagnostics.platform_ticks),
+            static_cast<unsigned long long>(diagnostics.retrace_increments),
+            static_cast<unsigned long long>(diagnostics.vsync_queries),
+            static_cast<unsigned long long>(diagnostics.vsync_nonnegative),
+            static_cast<unsigned long long>(diagnostics.vsync_mode_zero),
+            static_cast<unsigned long long>(diagnostics.vsync_mode_one),
+            static_cast<unsigned long long>(diagnostics.vsync_mode_multiple),
+            diagnostics.application_state, diagnostics.application_depth,
+            diagnostics.cpu_pc, diagnostics.cpu_sp, diagnostics.cpu_ra,
+            static_cast<unsigned long long>(diagnostics.machine_tick),
+            diagnostics.retrace_counter, diagnostics.cd_target_lba,
+            diagnostics.cd_current_lba, diagnostics.cd_reading ? 1U : 0U,
+            static_cast<unsigned int>(diagnostics.cd_mode),
+            static_cast<unsigned int>(diagnostics.cd_filter_file),
+            static_cast<unsigned int>(diagnostics.cd_filter_channel),
+            static_cast<unsigned int>(diagnostics.cd_xa_set),
+            static_cast<unsigned int>(diagnostics.cd_xa_file),
+            static_cast<unsigned int>(diagnostics.cd_xa_channel),
+            static_cast<unsigned int>(diagnostics.cd_interrupt_flags),
+            static_cast<unsigned int>(diagnostics.cd_interrupt_enable),
+            static_cast<unsigned int>(diagnostics.cd_pending_command),
+            static_cast<unsigned int>(diagnostics.cd_sector_pending),
+            diagnostics.cd_sector_delay_ticks,
+            diagnostics.spu_queued_pcm_frames,
+            diagnostics.spu_queued_cd_frames,
+            static_cast<unsigned long long>(diagnostics.xa_sectors_received),
+            static_cast<unsigned long long>(diagnostics.xa_sectors_admitted));
+        PsyX_Log_Info("SF3 input recording retained: path=%s samples=%zu\n",
+                      input_record_path.string().c_str(),
+                      input_replay.empty() ? static_cast<std::size_t>(
+                                                 diagnostics.guest_frames)
+                                           : input_replay_index);
         runtime.clearPcm();
         mouse_capture.set(false);
         return SceneViewerResult{previous_buttons,
@@ -16072,9 +16195,6 @@ SceneViewerResult runSf3GuestScene(
       while (const auto count = runtime.takePcm(pcm)) {
         audio.queue(std::span<const psx::SpuPcmFrame>{pcm}.first(count));
       }
-      simulation_accumulator =
-          std::max(0.0, simulation_accumulator - simulation_step);
-      ++updates;
     }
     audio.update();
 

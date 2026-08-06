@@ -43,6 +43,8 @@ if(SF_BUILD_TESTS)
         LIBRARIES sf::psx)
     sf_add_unit_test(sf_stable_frame_vector_tests
         tests/stable_frame_vector_tests.cpp)
+    sf_add_unit_test(sf_fixed_rate_clock_tests
+        tests/fixed_rate_clock_tests.cpp)
     sf_add_unit_test(sf_file_io_tests tests/file_io_tests.cpp
         LIBRARIES sf::core)
     sf_add_unit_test(sf_retail_pause_map_tests

@@ -5,6 +5,7 @@
 #include "sf/game/legacy_gameplay_vm.hpp"
 #include "sf/game/runtime_profile.hpp"
 #include "sf/game/sf3_runtime.hpp"
+#include "sf/core/fixed_rate_clock.hpp"
 
 #include <algorithm>
 #include <array>
@@ -66,6 +67,14 @@ public:
         return;
       }
       vm_.clearPcm();
+      platform_slices_ = 0U;
+      platform_ticks_ = 0U;
+      retrace_increments_ = 0U;
+      vsync_queries_ = 0U;
+      vsync_nonnegative_ = 0U;
+      vsync_mode_zero_ = 0U;
+      vsync_mode_one_ = 0U;
+      vsync_mode_multiple_ = 0U;
       ready_ = true;
     } catch (const std::exception &error) {
       markFault(error.what());
@@ -90,16 +99,13 @@ public:
     if (!ready_ || faulted_) {
       return false;
     }
-    const auto starting_frame = guest_frames_;
-    if (!runGuest(8'000'000U, [this, starting_frame] {
-          return guest_frames_ != starting_frame;
-        })) {
-      if (!faulted_) {
-        markFault("SF3 guest did not publish a display frame");
-      }
-      return false;
-    }
-    return true;
+    // A 20 Hz product update owns exactly one 20 Hz interval of guest CPU and
+    // device time.  Presentation is an asynchronous publication: retail may
+    // intentionally retain the previous ordering table while a dialogue/CD
+    // transition runs.  Waiting here for DrawOTag couples host input/audio to
+    // presentation and turns a legitimate no-new-frame interval into a long
+    // frontend stall followed by a watchdog exit.
+    return runGuestInterval(task_scheduler_period_);
   }
   [[nodiscard]] const std::shared_ptr<const Sf2PresentationFrame> &
   presentationFrame() const noexcept {
@@ -116,11 +122,59 @@ public:
         .input_samples = input_samples_,
         .gpu_submissions = gpu_submissions_,
         .presentation_frames = presentation_frames_,
+        .platform_slices = platform_slices_,
+        .platform_ticks = platform_ticks_,
+        .retrace_increments = retrace_increments_,
+        .vsync_queries = vsync_queries_,
+        .vsync_nonnegative = vsync_nonnegative_,
+        .vsync_mode_zero = vsync_mode_zero_,
+        .vsync_mode_one = vsync_mode_one_,
+        .vsync_mode_multiple = vsync_mode_multiple_,
+        .cd_control_calls = cd_control_calls_,
+        .cd_readn_calls = cd_readn_calls_,
     };
     static_cast<void>(vm_.runtime().read32(profile_.application_state,
                                            result.application_state));
     static_cast<void>(vm_.runtime().read32(profile_.application_state_depth,
                                            result.application_depth));
+    const auto &cpu = vm_.runtime().state();
+    result.cpu_pc = cpu.pc;
+    result.cpu_sp = cpu.gpr[29U];
+    result.cpu_ra = cpu.gpr[31U];
+    result.machine_tick = vm_.machine().currentTick();
+    const auto &layout = disc_.game()->executable_layout;
+    static_cast<void>(vm_.runtime().read32(layout.retrace_counter_address,
+                                           result.retrace_counter));
+    const auto cd = vm_.machine().cdrom().captureState();
+    result.cd_target_lba = cd.target_lba;
+    result.cd_current_lba = cd.current_lba;
+    result.cd_mode = cd.mode;
+    result.cd_filter_file = cd.filter_file;
+    result.cd_filter_channel = cd.filter_channel;
+    result.cd_xa_set = cd.xa_current_set;
+    result.cd_xa_file = cd.xa_current_file;
+    result.cd_xa_channel = cd.xa_current_channel;
+    result.cd_interrupt_flags = cd.interrupt_flags;
+    result.cd_interrupt_enable = cd.interrupt_enable;
+    result.cd_pending_command = cd.pending_command;
+    result.cd_sector_pending = cd.sector_event.pending;
+    result.cd_sector_delay_ticks = cd.sector_event.delay_ticks;
+    const auto machine = vm_.machine().captureState();
+    result.scheduler_now = machine.scheduler.now;
+    for (std::size_t index = 0U; index < machine.scheduler.event_count; ++index) {
+      const auto &event = machine.scheduler.events[index];
+      if (event.type == psx::MachineEventType::cdrom_sector &&
+          event.payload == cd.sector_event.generation) {
+        result.cd_sector_event_found = 1U;
+        result.cd_sector_deadline = event.deadline;
+        break;
+      }
+    }
+    result.cd_reading = cd.reading != 0U;
+    result.spu_queued_pcm_frames = static_cast<std::uint32_t>(
+        vm_.machine().spu().queuedPcmFrames());
+    result.spu_queued_cd_frames = static_cast<std::uint32_t>(
+        vm_.machine().spu().queuedCdFrames());
     const auto xa = vm_.machine().xaSectorAdmissionDiagnostics();
     result.xa_sectors_received = xa.received;
     result.xa_sectors_admitted = xa.admitted;
@@ -238,7 +292,30 @@ private:
                                     layout.cd_ready_result_address, false);
 
     vm_.setHostCallObserver(
-        [this](std::uint32_t pc, const psx::R3000State &state) {
+        [this, vsync_address = layout.vsync_address,
+         cd_control_address = layout.cd_control_address](
+            std::uint32_t pc, const psx::R3000State &state) {
+          if (pc == cd_control_address) {
+            ++cd_control_calls_;
+            if ((state.gpr[4U] & 0xffU) == 0x06U) {
+              ++cd_readn_calls_;
+            }
+          }
+          if (pc == vsync_address) {
+            const auto mode = std::bit_cast<std::int32_t>(state.gpr[4U]);
+            if (mode < 0) {
+              ++vsync_queries_;
+            } else {
+              ++vsync_nonnegative_;
+              if (mode == 0) {
+                ++vsync_mode_zero_;
+              } else if (mode == 1) {
+                ++vsync_mode_one_;
+              } else {
+                ++vsync_mode_multiple_;
+              }
+            }
+          }
           if (pc == 0x000000a0U &&
               (state.gpr[9U] == 0xabU || state.gpr[9U] == 0xacU)) {
             memory_card_info_event_pending_ = true;
@@ -660,6 +737,8 @@ private:
   }
 
   [[nodiscard]] bool servicePlatform(std::uint64_t consumed) {
+    ++platform_slices_;
+    platform_ticks_ += consumed;
     std::uint32_t poll_word{};
     if (vm_.runtime().read32(bootstrap_poll_word_, poll_word) &&
         poll_word != 0U &&
@@ -672,10 +751,16 @@ private:
     }
     vm_.machine().advanceHardwareTicks(consumed);
     const auto &layout = disc_.game()->executable_layout;
-    std::uint32_t retrace{};
-    if (!vm_.runtime().read32(layout.retrace_counter_address, retrace) ||
-        !vm_.runtime().write32(layout.retrace_counter_address, retrace + 1U)) {
-      return false;
+    const auto elapsed_retraces = retrace_clock_.advance(consumed);
+    if (elapsed_retraces != 0U) {
+      std::uint32_t retrace{};
+      if (!vm_.runtime().read32(layout.retrace_counter_address, retrace) ||
+          !vm_.runtime().write32(
+              layout.retrace_counter_address,
+              retrace + static_cast<std::uint32_t>(elapsed_retraces))) {
+        return false;
+      }
+      retrace_increments_ += elapsed_retraces;
     }
     LegacyGameplayVmResult cd_callback;
     if (!vm_.servicePsxCdReadyCallback(&cd_callback,
@@ -742,6 +827,22 @@ private:
     }
   }
 
+  [[nodiscard]] bool runGuestInterval(std::uint64_t budget) {
+    auto remaining = budget;
+    while (remaining != 0U) {
+      const auto slice = std::min(remaining, scheduler_slice_budget_);
+      const auto result = vm_.resumeCurrentPcClockNeutral(slice);
+      if (result.execution.reason !=
+              psx::R3000StopReason::instruction_budget ||
+          !servicePlatform(slice)) {
+        markFault("SF3 guest execution or platform callback stopped");
+        return false;
+      }
+      remaining -= slice;
+    }
+    return true;
+  }
+
   [[nodiscard]] bool runUntilMissionGameplay() {
     return runGuest(200'000'000U, [this] {
       std::uint32_t state{};
@@ -774,6 +875,18 @@ private:
   std::uint64_t presentation_frames_{};
   std::uint64_t guest_frames_{};
   std::uint64_t task_scheduler_ticks_{};
+  sf::core::FixedCycleRateClock retrace_clock_{
+      psx::CdRomController::cpu_clock_hz, 60U};
+  std::uint64_t platform_slices_{};
+  std::uint64_t platform_ticks_{};
+  std::uint64_t retrace_increments_{};
+  std::uint64_t vsync_queries_{};
+  std::uint64_t vsync_nonnegative_{};
+  std::uint64_t vsync_mode_zero_{};
+  std::uint64_t vsync_mode_one_{};
+  std::uint64_t vsync_mode_multiple_{};
+  std::uint64_t cd_control_calls_{};
+  std::uint64_t cd_readn_calls_{};
   bool memory_card_info_event_pending_{};
   bool memory_card_io_event_pending_{};
   bool blank_card_initial_info_seen_{};

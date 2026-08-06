@@ -15565,9 +15565,49 @@ int probeLegacyFrame(const char *cue_path, const char *ram_path,
 
 int probeSf3ProductRuntime(const char *cue_path, std::uint32_t frames,
                            std::string_view mode) {
-  if (mode != "neutral" && mode != "forward") {
+  constexpr auto replay_prefix = std::string_view{"replay="};
+  const auto replay_mode = mode.starts_with(replay_prefix);
+  if (mode != "neutral" && mode != "forward" && !replay_mode) {
     throw sf::core::Error{sf::core::ErrorCode::invalid_argument,
-                          "SF3 product probe mode must be neutral or forward"};
+                          "SF3 product probe mode must be neutral, forward, or replay=<path>"};
+  }
+  auto replay = std::vector<sf::game::LegacyHostPadState>{};
+  if (replay_mode) {
+    const auto replay_path = std::filesystem::path{mode.substr(replay_prefix.size())};
+    auto input = std::ifstream{replay_path};
+    auto magic = std::string{};
+    auto mission = std::uint32_t{};
+    if (!(input >> magic >> mission) || magic != "SF3PAD1" || mission != 0U) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "SF3 product replay requires an SF3PAD1 Mission 1 transcript"};
+    }
+    for (;;) {
+      auto buttons = unsigned int{};
+      auto face_buttons = unsigned int{};
+      auto explicit_face_buttons = unsigned int{};
+      auto left_x = unsigned int{};
+      auto left_y = unsigned int{};
+      auto right_x = unsigned int{};
+      auto right_y = unsigned int{};
+      if (!(input >> buttons >> face_buttons >> explicit_face_buttons >>
+            left_x >> left_y >> right_x >> right_y)) {
+        break;
+      }
+      replay.push_back(sf::game::LegacyHostPadState{
+          .buttons = static_cast<std::uint16_t>(buttons),
+          .face_axis_buttons = static_cast<std::uint16_t>(face_buttons),
+          .use_explicit_face_axis_buttons = explicit_face_buttons != 0U,
+          .left_x = static_cast<std::uint8_t>(left_x),
+          .left_y = static_cast<std::uint8_t>(left_y),
+          .right_x = static_cast<std::uint8_t>(right_x),
+          .right_y = static_cast<std::uint8_t>(right_y),
+      });
+    }
+    if (replay.empty()) {
+      throw sf::core::Error{sf::core::ErrorCode::invalid_format,
+                            "SF3 product replay contains no PAD samples"};
+    }
+    frames = std::max(frames, static_cast<std::uint32_t>(replay.size()));
   }
   sf::game::Sf3GuestMissionRuntime runtime{cue_path};
   if (!runtime.ready()) {
@@ -15578,14 +15618,36 @@ int probeSf3ProductRuntime(const char *cue_path, std::uint32_t frames,
   std::array<sf::psx::SpuPcmFrame, 4096U> pcm{};
   auto pcm_frames = std::uint64_t{};
   for (auto frame = std::uint32_t{}; frame < frames; ++frame) {
-    auto pad = sf::game::LegacyHostPadState{};
-    if (mode == "forward") {
+    auto pad = replay_mode && frame < replay.size()
+                   ? replay[frame]
+                   : sf::game::LegacyHostPadState{};
+    if (!replay_mode && mode == "forward") {
       pad.left_y = 0x00U;
     }
     runtime.setHostPadState(pad);
     if (!runtime.advanceHostUpdate()) {
+      const auto diagnostics = runtime.diagnostics();
       std::cerr << "SF3 product runtime stopped at frame " << frame << ": "
-                << runtime.faultDetail() << '\n';
+                << runtime.faultDetail() << " pc=0x" << std::hex
+                << std::uppercase << diagnostics.cpu_pc << " ra=0x"
+                << diagnostics.cpu_ra << std::dec << " cd="
+                << diagnostics.cd_target_lba << "->"
+                << diagnostics.cd_current_lba << "/read"
+                << (diagnostics.cd_reading ? 1U : 0U) << "/irq"
+                << static_cast<unsigned int>(diagnostics.cd_interrupt_flags)
+                << "/sector"
+                << static_cast<unsigned int>(diagnostics.cd_sector_pending)
+                << ':' << diagnostics.cd_sector_delay_ticks << '/'
+                << static_cast<unsigned int>(diagnostics.cd_sector_event_found)
+                << ':' << diagnostics.scheduler_now << "->"
+                << diagnostics.cd_sector_deadline
+                << "/control" << diagnostics.cd_control_calls << ':'
+                << diagnostics.cd_readn_calls
+                << "/xa" << static_cast<unsigned int>(diagnostics.cd_xa_set)
+                << ':' << static_cast<unsigned int>(diagnostics.cd_xa_file)
+                << ':' << static_cast<unsigned int>(diagnostics.cd_xa_channel)
+                << " xa-count=" << diagnostics.xa_sectors_received << '/'
+                << diagnostics.xa_sectors_admitted << '\n';
       return 25;
     }
     while (const auto count = runtime.takePcm(pcm)) {
@@ -15602,7 +15664,16 @@ int probeSf3ProductRuntime(const char *cue_path, std::uint32_t frames,
             << diagnostics.gpu_submissions << " presentation="
             << diagnostics.presentation_frames << " xa="
             << diagnostics.xa_sectors_received << '/'
-            << diagnostics.xa_sectors_admitted << " pcm=" << pcm_frames;
+            << diagnostics.xa_sectors_admitted << " platform="
+            << diagnostics.platform_slices << '/'
+            << diagnostics.platform_ticks << " retrace="
+            << diagnostics.retrace_increments << " vsync="
+            << diagnostics.vsync_queries << '/'
+            << diagnostics.vsync_nonnegative << '['
+            << diagnostics.vsync_mode_zero << ','
+            << diagnostics.vsync_mode_one << ','
+            << diagnostics.vsync_mode_multiple << ']'
+            << " pcm=" << pcm_frames;
   if (presentation) {
     std::cout << " final=" << presentation->application_state << "/0x"
               << std::hex << std::uppercase
@@ -15614,7 +15685,7 @@ int probeSf3ProductRuntime(const char *cue_path, std::uint32_t frames,
   return diagnostics.application_state == 0U &&
                  diagnostics.application_depth == 1U && presentation &&
                  presentation->application_state == 0U &&
-                 diagnostics.guest_frames >= frames
+                 diagnostics.guest_frames != 0U
              ? 0
              : 26;
 }
