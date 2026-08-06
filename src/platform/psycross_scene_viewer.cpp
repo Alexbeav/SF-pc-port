@@ -15031,11 +15031,13 @@ SceneViewerResult runSf2GuestScene(
     const auto aim_mouse_yaw = static_cast<double>(mouse_motion.x()) *
                                input.mouse_yaw_sensitivity;
     auto guest_input = game::GameplayInput{
-        .move = pc_move,
+        // Retail L1 aim keeps Gabe's root fixed. A/D changes from chase
+        // locomotion to the physical L2/R2 corner-lean buttons while held.
+        .move = raw.aim ? 0.0 : pc_move,
         .turn = std::clamp(pc_turn, -1.0, 1.0),
         .run = !raw.run,
         .aim = raw.aim,
-        .strafe = pc_strafe,
+        .strafe = raw.aim ? 0.0 : pc_strafe,
         .aim_sight_yaw =
             raw.aim
                 ? std::clamp(aim_mouse_yaw /
@@ -15050,6 +15052,8 @@ SceneViewerResult runSf2GuestScene(
                           mouse_aim_pitch_counts_per_full_deflection,
                       -1.0, 1.0)
                 : 0.0,
+        .aim_corner_strafe =
+            raw.aim ? std::clamp(pc_strafe, -1.0, 1.0) : 0.0,
         .fire_held = raw.fire,
         .roll = raw.roll,
         .reload = raw.reload,
