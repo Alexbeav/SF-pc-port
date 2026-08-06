@@ -13207,7 +13207,9 @@ namespace {
 
 void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
                         unsigned int texture_bank,
-                        bool native_wide_world) {
+                        bool native_wide_world,
+                        bool retail_briefing,
+                        bool retail_briefing_loaded) {
   const auto kind = game::sf2GpuCommandKind(packet);
   if (kind == game::Sf2GpuCommandKind::upload_vram) {
     const auto transfer = game::sf2GpuTransfer(packet);
@@ -13377,6 +13379,50 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
                           .x,
                       0.01F);
     };
+    const auto draw_polygon = [&](auto &primitive,
+                                  std::size_t vertex_count) {
+      static const auto sf2_pgxp_enabled =
+          SDL_getenv("SF2_DISABLE_PGXP") == nullptr;
+      if (!sf2_pgxp_enabled ||
+          !packet.projected_vertices_address_matched ||
+          packet.projected_vertex_count != vertex_count) {
+        DrawPrim(&primitive);
+        return;
+      }
+      constexpr auto q12_to_pgxp_view =
+          1.0 / (4096.0 * 128.0);
+      constexpr auto q16_to_float = 1.0 / 65536.0;
+      auto complete = true;
+      for (auto index = std::size_t{}; index < vertex_count; ++index) {
+        const auto &source = packet.projected_vertices[index];
+        PGXPVData data{};
+        data.lookup = source.packed_sxy;
+        data.px = static_cast<float>(source.camera_x_q12 *
+                                     q12_to_pgxp_view);
+        data.py = static_cast<float>(source.camera_y_q12 *
+                                     q12_to_pgxp_view);
+        data.pz = static_cast<float>(source.camera_z_q12 *
+                                     q12_to_pgxp_view);
+        data.sx = static_cast<float>(source.screen_x_q16 * q16_to_float);
+        data.sy = static_cast<float>(source.screen_y_q16 * q16_to_float);
+        data.scr_h = static_cast<float>(source.projection);
+        data.ofx = static_cast<float>(source.offset_x_q16 * q16_to_float);
+        data.ofy = static_cast<float>(source.offset_y_q16 * q16_to_float);
+        data.exact_projection = 1U;
+        data.bypass_presentation_scale = native_wide_world ? 1U : 0U;
+        if (PGXP_EmitCacheData(&data) == 0xffffU) {
+          complete = false;
+          break;
+        }
+      }
+      const auto cache_end = complete ? PGXP_GetIndex(0) : 0xffffU;
+      if (cache_end == 0xffffU) {
+        DrawPrim(&primitive);
+        return;
+      }
+      setpgxpindex(&primitive, cache_end);
+      DrawPrimPGXP(&primitive);
+    };
     // SF2 disables preallocated primitives by placing vertices at
     // (-1024,-1024). Polygon projection near the camera can produce the same
     // large raw-coordinate spans. The PS1 rejects polygons spanning 1024
@@ -13437,7 +13483,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       primitive.clut =
           relocateClut(source_clut, source_tpage, texture_bank);
       primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 4U);
       return;
     }
     if (base_opcode == 0x38U && words.size() == 8U) {
@@ -13457,7 +13503,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
              x(3U) / fullscreen_scale, y(3U),
              x(5U) / fullscreen_scale, y(5U),
              x(7U) / fullscreen_scale, y(7U));
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 4U);
       return;
     }
     if (base_opcode == 0x34U && words.size() == 9U) {
@@ -13484,7 +13530,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       primitive.clut =
           relocateClut(source_clut, source_tpage, texture_bank);
       primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 3U);
       return;
     }
     if (base_opcode == 0x30U && words.size() == 6U) {
@@ -13498,7 +13544,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       setPacketColor(words[2U], primitive.r1, primitive.g1, primitive.b1);
       setPacketColor(words[4U], primitive.r2, primitive.g2, primitive.b2);
       setXY3(&primitive, x(1U), y(1U), x(3U), y(3U), x(5U), y(5U));
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 3U);
       return;
     }
     if (base_opcode == 0x2cU && words.size() == 9U) {
@@ -13509,6 +13555,13 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       setPolyFT4(&primitive);
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      // INIT's state-8 frame pieces use zero modulation in their retained OT.
+      // Retail presents the indexed border at its native intensity; PsyCross
+      // instead multiplies those texels by literal black. Restore the neutral
+      // modulation used by the authored frontend image, scoped to state 8.
+      if (retail_briefing && opcode == 0x2cU) {
+        setRGB0(&primitive, 128U, 128U, 128U);
+      }
       const auto fullscreen_scale =
           auxiliary_fullscreen_scale({1U, 3U, 5U, 7U});
       setXY4(&primitive, x(1U) / fullscreen_scale, y(1U),
@@ -13530,7 +13583,21 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       primitive.clut =
           relocateClut(source_clut, source_tpage, texture_bank);
       primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
-      DrawPrim(&primitive);
+      if (retail_briefing && retail_briefing_loaded && opcode == 0x2eU) {
+        // The cyan fill is the background for the authored 0x2e texture. Its
+        // TPAGE selects PS1 blend mode 2 (background minus foreground), which
+        // subtracts the indexed pattern over this inset. Drawing the fallback
+        // after the FT4 flattened and concealed that authentic bar texture.
+        POLY_F4 loading_bar{};
+        setPolyF4(&loading_bar);
+        setRGB0(&loading_bar, 52U, 184U, 232U);
+        setXY4(&loading_bar, x(1U) / fullscreen_scale + 4.0F, y(1U) + 2.0F,
+               x(3U) / fullscreen_scale + 4.0F, y(3U) - 2.0F,
+               x(5U) / fullscreen_scale - 4.0F, y(5U) + 2.0F,
+               x(7U) / fullscreen_scale - 4.0F, y(7U) - 2.0F);
+        DrawPrim(&loading_bar);
+      }
+      draw_polygon(primitive, 4U);
       return;
     }
     if (base_opcode == 0x28U && words.size() == 5U) {
@@ -13564,7 +13631,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
              x(2U) / horizontal_scale, y(2U),
              x(3U) / horizontal_scale, y(3U),
              x(4U) / horizontal_scale, y(4U));
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 4U);
       return;
     }
     if (base_opcode == 0x24U && words.size() == 7U) {
@@ -13589,7 +13656,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       primitive.clut =
           relocateClut(source_clut, source_tpage, texture_bank);
       primitive.tpage = relocateTexturePage(source_tpage, texture_bank);
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 3U);
       return;
     }
     if (base_opcode == 0x20U && words.size() == 4U) {
@@ -13601,7 +13668,7 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
       setXY3(&primitive, x(1U), y(1U), x(2U), y(2U), x(3U), y(3U));
-      DrawPrim(&primitive);
+      draw_polygon(primitive, 3U);
       return;
     }
     if (base_opcode == 0x40U && words.size() == 3U) {
@@ -13612,6 +13679,12 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       setLineF2(&primitive);
       primitive.code = opcode;
       setPacketColor(words[0U], primitive.r0, primitive.g0, primitive.b0);
+      // The matching retained grid records zero-valued line colors. Preserve
+      // its retail dark-blue appearance instead of replaying invisible black.
+      if (retail_briefing && primitive.r0 == 0U &&
+          primitive.g0 == 0U && primitive.b0 == 0U) {
+        setRGB0(&primitive, 8U, 12U, 38U);
+      }
       setXY2(&primitive, x(1U), y(1U), x(2U), y(2U));
       DrawPrim(&primitive);
       return;
@@ -13632,6 +13705,15 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
       return;
     }
     if (base_opcode == 0x64U && words.size() == 4U) {
+      // The retail prompt is a 16-glyph SPRT run at these authored positions.
+      // Do not advertise confirmation while the authoritative SF2 gameplay
+      // runtime is still bootstrapping behind the briefing.
+      const auto sprite_x = packedScreenX(words[1U]);
+      const auto sprite_y = packedScreenY(words[1U]);
+      if (retail_briefing && !retail_briefing_loaded && sprite_y == 85 &&
+          sprite_x >= 53 && sprite_x <= 166) {
+        return;
+      }
       SPRT primitive{};
       setSprt(&primitive);
       primitive.code = opcode;
@@ -13788,11 +13870,13 @@ void drawSf2GuestPacket(const game::Sf2GpuPacket &packet,
   DrawPrim(tag);
 }
 
-void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
-                       unsigned int texture_bank) {
+void drawSf2GuestFrameInternal(const game::Sf2PresentationFrame &frame,
+                               unsigned int texture_bank,
+                               bool retail_briefing_loaded = true) {
   GR_EnableDepth(0);
   GR_SetDepthState(0, 0);
   auto boundary = std::size_t{};
+  const auto retail_briefing = frame.application_state == 8U;
   for (auto index = std::size_t{}; index < frame.packets.size(); ++index) {
     // Gameplay's first submission is the authored world base. Its horizontal
     // projection was widened in the guest GTE, so the generic PsyCross 4:3
@@ -13801,7 +13885,8 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
     const auto native_wide_world =
         frame.application_state == 0U && boundary == 0U;
     drawSf2GuestPacket(frame.packets[index], texture_bank,
-                       native_wide_world);
+                       native_wide_world, retail_briefing,
+                       retail_briefing_loaded);
     if (boundary < frame.submission_packet_ends.size() &&
         index + 1U == frame.submission_packet_ends[boundary]) {
       DrawSync(0);
@@ -13814,6 +13899,19 @@ void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
   // earlier submission. The native HUD pass snapshots and restores this
   // environment itself; forcing page zero here made later text/UI submissions
   // intermittently sample world or framebuffer data.
+}
+
+void prepareSf2GuestRetailPresentationInternal() noexcept {
+  for (auto &bank : streamed_texture_page_remap) {
+    for (auto page = std::size_t{}; page < bank.size(); ++page) {
+      bank[page] = physicalTexturePage(static_cast<unsigned int>(page));
+    }
+  }
+  for (auto &bank : streamed_clut_row_remap) {
+    for (auto row = std::size_t{}; row < bank.size(); ++row) {
+      bank[row] = static_cast<unsigned int>(row);
+    }
+  }
 }
 
 #if defined(_MSC_VER)
@@ -13837,7 +13935,17 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
   dump << "presented=" << presented_frame << " sequence=" << frame.sequence
        << " guest=" << frame.guest_frame << " clock=" << system_clock
        << " packets=" << frame.packets.size()
-       << " segments=" << frame.submission_packet_ends.size() << '\n';
+       << " segments=" << frame.submission_packet_ends.size()
+       << " projected-observed="
+       << frame.projection_matches.observed_vertices
+       << " projected-stores="
+       << frame.projection_matches.observed_vertex_stores
+       << " projected-ambiguous="
+       << frame.projection_matches.ambiguous_positions
+       << " projected-polygons="
+       << frame.projection_matches.world_polygon_packets
+       << " projected-matched=" << frame.projection_matches.matched_packets
+       << '\n';
   auto segment = std::size_t{};
   auto segment_end = frame.submission_packet_ends.empty()
                          ? frame.packets.size()
@@ -13857,7 +13965,8 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
          << std::setw(8) << std::setfill('0') << root
          << " packet=" << std::dec << packet_index << " guest=0x" << std::hex
          << std::setw(8) << packet.guest_address << " words=" << std::dec
-         << packet.gp0_words.size();
+         << packet.gp0_words.size() << " projected="
+         << static_cast<unsigned int>(packet.projected_vertex_count);
     for (const auto word : packet.gp0_words) {
       dump << " 0x" << std::hex << std::setw(8) << word;
     }
@@ -13916,8 +14025,8 @@ void dumpSf2PresentationFrame(const game::Sf2PresentationFrame &frame,
   return draw_area_y >= static_cast<std::uint32_t>(screen_height) ? 1U : 0U;
 }
 
-void beginSf2GuestFrame(unsigned int framebuffer_page,
-                        bool clear_published_page) {
+bool beginSf2GuestFrameInternal(unsigned int framebuffer_page,
+                                bool clear_published_page) {
   // SF2 alternates two persistent PS1 display pages. PsyCross mirrors those
   // as two high-resolution native color targets; only depth/stencil are
   // cleared by BeginScene. Retail OTs own all authored color clearing and
@@ -13928,10 +14037,11 @@ void beginSf2GuestFrame(unsigned int framebuffer_page,
     environment.isbg = 0;
     PutDrawEnv(&environment);
   }
-  static_cast<void>(PsyX_BeginScene());
+  const auto begun = PsyX_BeginScene() != 0;
   if (clear_published_page) {
     GR_ClearNativeFramebufferPage();
   }
+  return begun;
 }
 
 void drawSf2GuestHud(const HudTextureAtlas &textures,
@@ -14081,11 +14191,16 @@ SceneViewerResult runSf2GuestScene(
     std::uint16_t previous_buttons, const std::filesystem::path &cue_path,
     const KeyboardMouseBindings &input,
     game::GameplaySession &native_residency,
+    std::unique_ptr<game::Sf2GuestMissionRuntime> preloaded_runtime,
     const std::optional<game::CampaignCarryState> &campaign_carry) {
   struct NativeFramebufferPageReset {
     ~NativeFramebufferPageReset() { GR_SetNativeFramebufferPage(0); }
   } native_framebuffer_page_reset;
-  game::Sf2GuestMissionRuntime runtime{cue_path, mission.definition().index};
+  if (!preloaded_runtime) {
+    preloaded_runtime = std::make_unique<game::Sf2GuestMissionRuntime>(
+        cue_path, mission.definition().index);
+  }
+  auto &runtime = *preloaded_runtime;
   if (!runtime.ready()) {
     const auto detail = runtime.faultDetail();
     PsyX_Log_Error("SF2 guest runtime bootstrap failed: %.*s\n",
@@ -15750,7 +15865,9 @@ SceneViewerResult runSf2GuestScene(
             "SF2 presentation: presented=%llu sequence=%llu guest=%llu "
             "clock=%u app=%u packets=%zu draws=%zu words=%zu ui-events=%llu "
             "last-ui=%llu recent=%u composite=%u gp1=%zu flip=0x%06X "
-            "segments=%zu bank=%u retail-gp=0x%08X retail-buffers=%u/%u\n",
+            "segments=%zu bank=%u retail-gp=0x%08X retail-buffers=%u/%u "
+            "pgxp=%zu/%zu address=%zu vertices=%zu observed=%zu stores=%zu "
+            "ambiguous=%zu\n",
             static_cast<unsigned long long>(presented_frames),
             static_cast<unsigned long long>(frame->sequence),
             static_cast<unsigned long long>(frame->guest_frame),
@@ -15764,7 +15881,14 @@ SceneViewerResult runSf2GuestScene(
             display_start, frame->submission_packet_ends.size(),
             texture_bank, frame->retail_global_pointer,
             frame->retail_draw_buffer_index,
-            frame->retail_display_buffer_index);
+            frame->retail_display_buffer_index,
+            frame->projection_matches.matched_packets,
+            frame->projection_matches.world_polygon_packets,
+            frame->projection_matches.address_matched_packets,
+            frame->projection_matches.matched_vertices,
+            frame->projection_matches.observed_vertices,
+            frame->projection_matches.observed_vertex_stores,
+            frame->projection_matches.ambiguous_positions);
         auto segment_begin = std::size_t{};
         auto inherited_e1 = std::uint32_t{};
         auto inherited_e3 = std::uint32_t{};
@@ -15897,9 +16021,10 @@ SceneViewerResult runSf2GuestScene(
       const auto fresh_presentation =
           frame->sequence != drawn_presentation_sequence;
       retained_world_frame = frame;
-      beginSf2GuestFrame(sf2GuestFramebufferPage(*frame), fresh_presentation);
+      beginSf2GuestFrameInternal(sf2GuestFramebufferPage(*frame),
+                                 fresh_presentation);
       if (fresh_presentation) {
-        drawSf2GuestFrame(*frame, texture_bank);
+        drawSf2GuestFrameInternal(*frame, texture_bank);
         drawn_presentation_sequence = frame->sequence;
       }
       // The authored opening lasts roughly fifteen seconds. The retail HUD
@@ -16037,6 +16162,22 @@ SceneViewerResult runSf2GuestScene(
 
 } // namespace
 
+void prepareSf2GuestRetailPresentation() noexcept {
+  prepareSf2GuestRetailPresentationInternal();
+}
+
+bool beginSf2GuestFrame(const game::Sf2PresentationFrame &frame,
+                        bool clear_published_page) {
+  return beginSf2GuestFrameInternal(sf2GuestFramebufferPage(frame),
+                                    clear_published_page);
+}
+
+void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
+                       unsigned int texture_bank,
+                       bool retail_briefing_loaded) {
+  drawSf2GuestFrameInternal(frame, texture_bank, retail_briefing_loaded);
+}
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4702)
@@ -16047,6 +16188,7 @@ SceneViewerResult PsyCrossSceneViewer::run(
     std::uint32_t maximum_unlocked_mission,
     std::unique_ptr<game::GameplaySession> preloaded_gameplay,
     std::unique_ptr<PsyCrossAudioOutput> preloaded_audio,
+    std::unique_ptr<game::Sf2GuestMissionRuntime> preloaded_sf2_runtime,
     std::optional<game::CampaignCarryState> campaign_carry) {
   g_cfg_pgxpTextureCorrection = 1;
   g_cfg_pgxpZBuffer = 1;
@@ -16059,7 +16201,8 @@ SceneViewerResult PsyCrossSceneViewer::run(
   }
   if (mission.gameId() == game::GameId::syphon_filter_2) {
     return runSf2GuestScene(mission, pad, previous_buttons, cue_path, input_,
-                            *preloaded_gameplay, campaign_carry);
+                            *preloaded_gameplay,
+                            std::move(preloaded_sf2_runtime), campaign_carry);
   }
   auto &gameplay = *preloaded_gameplay;
   // The retail terminal transition can retire the live mission/inventory

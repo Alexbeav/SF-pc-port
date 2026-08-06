@@ -8,6 +8,7 @@
 #include "sf/game/mission.hpp"
 #include "sf/game/runtime_profile.hpp"
 #include "sf/game/sf2_runtime.hpp"
+#include "sf/psx/gte_runtime.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <unordered_map>
 
 namespace sf::game {
 
@@ -358,6 +360,165 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
   return reject("DMA packet limit", address);
 }
 
+Sf2ProjectionMatchStats attachSf2ProjectionProvenance(
+    Sf2PresentationFrame &frame,
+    std::span<const psx::GteProjectedVertex> observed_vertices,
+    std::span<const psx::GteVertexStoreTrace> observed_stores) {
+  struct Candidate {
+    Sf2GpuVertexProvenance vertex{};
+    bool ambiguous{};
+  };
+  const auto convert = [](const psx::GteProjectedVertex &source) {
+    return Sf2GpuVertexProvenance{
+        .camera_x_q12 = source.camera_x_q12,
+        .camera_y_q12 = source.camera_y_q12,
+        .camera_z_q12 = source.camera_z_q12,
+        .screen_x_q16 = source.screen_x_q16,
+        .screen_y_q16 = source.screen_y_q16,
+        .offset_x_q16 = source.offset_x_q16,
+        .offset_y_q16 = source.offset_y_q16,
+        .packed_sxy = source.packed_sxy,
+        .projection = source.projection,
+    };
+  };
+  const auto same_projection = [](const Sf2GpuVertexProvenance &first,
+                                  const Sf2GpuVertexProvenance &second) {
+    return first.camera_x_q12 == second.camera_x_q12 &&
+           first.camera_y_q12 == second.camera_y_q12 &&
+           first.camera_z_q12 == second.camera_z_q12 &&
+           first.screen_x_q16 == second.screen_x_q16 &&
+           first.screen_y_q16 == second.screen_y_q16 &&
+           first.offset_x_q16 == second.offset_x_q16 &&
+           first.offset_y_q16 == second.offset_y_q16 &&
+           first.projection == second.projection;
+  };
+
+  auto stats = Sf2ProjectionMatchStats{
+      .observed_vertices = observed_vertices.size(),
+      .observed_vertex_stores = observed_stores.size(),
+  };
+  for (auto &packet : frame.packets) {
+    packet.projected_vertices = {};
+    packet.projected_vertex_count = 0U;
+    packet.projected_vertices_address_matched = false;
+  }
+  std::unordered_map<std::uint32_t, Candidate> candidates;
+  candidates.reserve(observed_vertices.size());
+  for (const auto &observed : observed_vertices) {
+    const auto converted = convert(observed);
+    const auto [entry, inserted] =
+        candidates.try_emplace(observed.packed_sxy,
+                               Candidate{converted, false});
+    if (!inserted && !same_projection(entry->second.vertex, converted)) {
+      entry->second.ambiguous = true;
+    }
+  }
+  stats.unique_positions = candidates.size();
+  stats.ambiguous_positions = static_cast<std::size_t>(std::ranges::count_if(
+      candidates, [](const auto &entry) { return entry.second.ambiguous; }));
+  std::unordered_map<std::uint32_t, Sf2GpuVertexProvenance> stored_vertices;
+  stored_vertices.reserve(observed_stores.size());
+  for (const auto &store : observed_stores) {
+    stored_vertices[store.address & 0x001fffffU] = convert(store.vertex);
+  }
+
+  const auto position_words = [](const Sf2GpuPacket &packet) {
+    auto result = std::array<std::size_t, 4U>{};
+    auto count = std::size_t{};
+    if (packet.gp0_words.empty()) {
+      return std::pair{result, count};
+    }
+    const auto opcode = static_cast<std::uint8_t>(
+        packet.gp0_words.front() >> 24U);
+    const auto base = static_cast<std::uint8_t>(opcode & 0xfcU);
+    switch (base) {
+    case 0x20U: result = {1U, 2U, 3U, 0U}; count = 3U; break;
+    case 0x24U: result = {1U, 3U, 5U, 0U}; count = 3U; break;
+    case 0x28U: result = {1U, 2U, 3U, 4U}; count = 4U; break;
+    case 0x2cU: result = {1U, 3U, 5U, 7U}; count = 4U; break;
+    case 0x30U: result = {1U, 3U, 5U, 0U}; count = 3U; break;
+    case 0x34U: result = {1U, 4U, 7U, 0U}; count = 3U; break;
+    case 0x38U: result = {1U, 3U, 5U, 7U}; count = 4U; break;
+    case 0x3cU: result = {1U, 4U, 7U, 10U}; count = 4U; break;
+    default: break;
+    }
+    return std::pair{result, count};
+  };
+
+  const auto world_packet_end =
+      frame.application_state == 0U
+          ? (frame.submission_packet_ends.empty()
+                 ? frame.packets.size()
+                 : std::min(frame.submission_packet_ends.front(),
+                            frame.packets.size()))
+          : std::size_t{};
+  for (auto packet_index = std::size_t{}; packet_index < world_packet_end;
+       ++packet_index) {
+    auto &packet = frame.packets[packet_index];
+    const auto [words, count] = position_words(packet);
+    if (count == 0U) {
+      continue;
+    }
+    ++stats.world_polygon_packets;
+    auto matched = std::array<Sf2GpuVertexProvenance, 4U>{};
+    auto complete = true;
+    auto address_matched = true;
+    for (auto corner = std::size_t{}; corner < count; ++corner) {
+      if (words[corner] >= packet.gp0_words.size()) {
+        complete = false;
+        break;
+      }
+      const auto word_address =
+          (packet.guest_address + static_cast<std::uint32_t>(
+                                      words[corner] * sizeof(std::uint32_t))) &
+          0x001fffffU;
+      if (const auto stored = stored_vertices.find(word_address);
+          stored != stored_vertices.end() &&
+          stored->second.packed_sxy == packet.gp0_words[words[corner]]) {
+        matched[corner] = stored->second;
+      } else {
+        address_matched = false;
+        if (!observed_stores.empty()) {
+          complete = false;
+          break;
+        }
+        const auto candidate =
+            candidates.find(packet.gp0_words[words[corner]]);
+        if (candidate == candidates.end() || candidate->second.ambiguous) {
+          complete = false;
+          break;
+        }
+        matched[corner] = candidate->second.vertex;
+      }
+      if (matched[corner].camera_z_q12 <= 0 ||
+          matched[corner].projection == 0U) {
+        complete = false;
+        break;
+      }
+      if (corner != 0U &&
+          (matched[corner].projection != matched[0].projection ||
+           matched[corner].offset_x_q16 != matched[0].offset_x_q16 ||
+           matched[corner].offset_y_q16 != matched[0].offset_y_q16)) {
+        complete = false;
+        break;
+      }
+    }
+    if (!complete) {
+      continue;
+    }
+    packet.projected_vertices = matched;
+    packet.projected_vertex_count = static_cast<std::uint8_t>(count);
+    packet.projected_vertices_address_matched = address_matched;
+    ++stats.matched_packets;
+    stats.matched_vertices += count;
+    if (address_matched) {
+      ++stats.address_matched_packets;
+    }
+  }
+  frame.projection_matches = stats;
+  return stats;
+}
+
 void projectSf2GuestHud(
     GameplayHud &hud,
     const Sf2GuestRuntimeDiagnostics &guest,
@@ -584,9 +745,11 @@ sf2WeaponSlotPulseCount(const Sf2GuestRuntimeDiagnostics &guest,
 
 class Sf2GuestMissionRuntime::Impl final {
 public:
-  Impl(const std::filesystem::path &cue_path, std::uint32_t mission_index)
+  Impl(const std::filesystem::path &cue_path, std::uint32_t mission_index,
+       Sf2GuestRuntimeStartMode start_mode)
       : disc_(GameDisc::open(cue_path)), vm_(disc_.executable()),
-        cdrom_media_(disc_.image()), mission_index_(mission_index) {
+        cdrom_media_(disc_.image()), mission_index_(mission_index),
+        start_mode_(start_mode) {
     try {
       if (!disc_.game() ||
           disc_.game()->id != GameId::syphon_filter_2) {
@@ -620,6 +783,40 @@ public:
       loadAssets();
       setStage("platform binding");
       bindPlatform();
+      projected_vertices_.reserve(maximum_projected_vertices_);
+      vm_.runtime().setGteProjectionObserver(
+          [this](const psx::GteProjectionTrace &trace, std::uint32_t,
+                 std::uint32_t) {
+            if (projected_vertices_overflow_ || trace.count == 0U) {
+              return;
+            }
+            if (trace.count >
+                maximum_projected_vertices_ - projected_vertices_.size()) {
+              projected_vertices_overflow_ = true;
+              projected_vertices_.clear();
+              return;
+            }
+            projected_vertices_.insert(
+                projected_vertices_.end(), trace.vertices.begin(),
+                trace.vertices.begin() +
+                    static_cast<std::ptrdiff_t>(trace.count));
+          });
+      projected_vertex_stores_.reserve(maximum_projected_vertices_);
+      vm_.runtime().setGteVertexStoreObserver(
+          [this](const psx::GteVertexStoreTrace &store, std::uint32_t,
+                 std::uint32_t) {
+            if (projected_vertices_overflow_) {
+              return;
+            }
+            if (projected_vertex_stores_.size() >=
+                maximum_projected_vertices_) {
+              projected_vertices_overflow_ = true;
+              projected_vertices_.clear();
+              projected_vertex_stores_.clear();
+              return;
+            }
+            projected_vertex_stores_.push_back(store);
+          });
       configureUiInstructionTrace();
       // Arm before TITLE-to-mission transition work: bootstrap itself builds
       // and
@@ -638,7 +835,9 @@ public:
         }
         return;
       }
-      normalizeInitialAuxiliaryRendererState();
+      if (start_mode_ == Sf2GuestRuntimeStartMode::gameplay) {
+        normalizeInitialAuxiliaryRendererState();
+      }
       std::array<std::byte, protected_renderer_size_> protected_renderer{};
       if (!vm_.runtime().copyBytes(protected_renderer_begin_,
                                    protected_renderer)) {
@@ -745,6 +944,8 @@ public:
   ~Impl() {
     vm_.setHostCallObserver({});
     vm_.runtime().setExecutionObserver({});
+    vm_.runtime().setGteProjectionObserver({});
+    vm_.runtime().setGteVertexStoreObserver({});
     flushUiInstructionTrace();
   }
 
@@ -756,6 +957,10 @@ public:
   }
   void setHostPadState(const LegacyHostPadState &state) noexcept {
     host_pad_ = state;
+  }
+  void requestRetailBriefingConfirm() noexcept {
+    briefing_confirm_requested_ = true;
+    briefing_confirm_pulse_pending_ = true;
   }
   void setRetailAuxiliaryUiEnabled(bool enabled) noexcept {
     disable_retail_auxiliary_ui_ = !enabled;
@@ -1103,6 +1308,7 @@ public:
     if (!enabled) {
       pc_chase_pitch_pending_ = 0;
       pc_chase_pitch_valid_ = false;
+      pc_chase_scripted_camera_seen_ = false;
       pc_chase_camera_base_ = 0U;
       return;
     }
@@ -1740,6 +1946,13 @@ public:
       pending_presentation_ = quick_state_->pending_presentation;
       pending_presentation_clock_ =
           quick_state_->pending_presentation_clock;
+      // Projection provenance is a host presentation observation, not guest
+      // checkpoint state. Never match pre-restore transforms to packets built
+      // after the restored boundary; an incomplete restored composition falls
+      // back to retail affine replay until a fresh generation is published.
+      projected_vertices_.clear();
+      projected_vertex_stores_.clear();
+      projected_vertices_overflow_ = false;
       published_sequence_ = quick_state_->published_sequence;
       gpu_gp0_stream_.swap(gpu_gp0_stream);
       vram_setup_packets_.swap(vram_setup_packets);
@@ -2619,6 +2832,28 @@ public:
     return false;
   }
 
+  [[nodiscard]] bool advanceRetailBriefingAudioSlice(
+      bool dispatch_sound_callback) noexcept {
+    if (!ready_ || faulted_ ||
+        start_mode_ != Sf2GuestRuntimeStartMode::retail_briefing) {
+      return false;
+    }
+    auto profile = syphonFilterUsaV11RetailAudioProfile();
+    // SF2 installs its own timer-6 callback during bootstrap. Accept that
+    // registered target while retaining the shared 120 Hz device clock.
+    profile.expected_tick_callback = 0U;
+    const auto sound_callback_slot =
+        profile_.interrupt_callback_table + 6U * 4U;
+    if (!vm_.advanceAudioSliceClock(profile) ||
+        (dispatch_sound_callback &&
+         !vm_.servicePsxCallbackSlot(sound_callback_slot,
+                                     callback_stack_))) {
+      markFault("SF2 retail briefing audio slice failed");
+      return false;
+    }
+    return true;
+  }
+
   [[nodiscard]] bool missionCompleteRequested() const noexcept {
     return mission_complete_requested_;
   }
@@ -3469,8 +3704,19 @@ private:
     if (!pending_presentation_ ||
         !isAuthoredPresentationBase(*pending_presentation_)) {
       pending_presentation_.reset();
+      projected_vertices_.clear();
+      projected_vertex_stores_.clear();
+      projected_vertices_overflow_ = false;
       return;
     }
+    if (!projected_vertices_overflow_) {
+      static_cast<void>(attachSf2ProjectionProvenance(
+          *pending_presentation_, projected_vertices_,
+          projected_vertex_stores_));
+    }
+    projected_vertices_.clear();
+    projected_vertex_stores_.clear();
+    projected_vertices_overflow_ = false;
     pending_presentation_->sequence = ++published_sequence_;
     presentation_frame_ = std::make_shared<const Sf2PresentationFrame>(
         std::move(*pending_presentation_));
@@ -3845,6 +4091,22 @@ private:
     auto captured_submission = captureSf2PresentationFrame(
         vm_.runtime().ram(), submission_root, application_state,
         presentation_sequence_ + 1U, guest_frame_ + 1U);
+    if (start_mode_ == Sf2GuestRuntimeStartMode::retail_briefing &&
+        application_state == 8U) {
+      ++briefing_state8_boundaries_;
+      briefing_state8_maximum_draws_ = std::max(
+          briefing_state8_maximum_draws_,
+          captured_submission ? captured_submission->draw_command_count : 0U);
+    }
+    if (start_mode_ == Sf2GuestRuntimeStartMode::retail_briefing &&
+        application_state == 8U && captured_submission &&
+        captured_submission->draw_command_count != 0U) {
+      // State 8 submits through its loading renderer rather than gameplay's
+      // common return site. It is still an authored display boundary; promote
+      // it only for the disposable briefing presenter so the exact OT can be
+      // retained without weakening gameplay's proven boundary contract.
+      display_submitted = true;
+    }
     if (display_submitted) {
       ++presentation_sequence_;
       ++guest_frame_;
@@ -3949,6 +4211,22 @@ private:
         makeDrawEnvironmentSelfContained(*frame);
         captureOrderingTableUploads(*frame);
       }
+      if (frame &&
+          start_mode_ == Sf2GuestRuntimeStartMode::retail_briefing &&
+          application_state == 8U && frame->draw_command_count != 0U) {
+        frame->submission_roots.push_back(frame->ordering_table_root);
+        frame->submission_draw_counts.push_back(frame->draw_command_count);
+        attachVramSetup(*frame);
+        frame->submission_packet_ends.push_back(frame->packets.size());
+        if (!presentation_frame_ ||
+            presentation_frame_->application_state != 8U ||
+            frame->draw_command_count >=
+                presentation_frame_->draw_command_count) {
+          presentation_frame_ = std::make_shared<const Sf2PresentationFrame>(
+              std::move(*frame));
+        }
+        frame.reset();
+      }
       // Only authored world/UI lists belong in the visible composition.
       // Retail also queues maintenance OTs whose commands are not display
       // content; drawing them into the native target darkens the scene.
@@ -4039,6 +4317,7 @@ private:
       if (readPlayerCameraOwnership(player, camera_wrapper, camera_owner) &&
           camera_owner != 0U && camera_owner != player) {
         scripted_camera_observed_ = true;
+        pc_chase_scripted_camera_seen_ = true;
       }
     }
 
@@ -5838,14 +6117,20 @@ private:
                               camera_base) ||
         camera_base == 0U ||
         !vm_.runtime().read32(camera_wrapper + camera_wrapper_owner_offset,
-                              camera_owner) ||
-        camera_owner != player) {
+                              camera_owner)) {
       // The camera base survives retail ownership transfers. During an
       // in-engine cinematic wrapper+0xDC names the scripted camera actor;
       // ordinary chase gameplay names the live player instance. Never carry
       // mouse motion accumulated under scripted ownership into the handoff.
       pc_chase_pitch_pending_ = 0;
       pc_chase_pitch_valid_ = false;
+      pc_chase_camera_base_ = 0U;
+      return;
+    }
+    if (camera_owner != player) {
+      pc_chase_pitch_pending_ = 0;
+      pc_chase_pitch_valid_ = false;
+      pc_chase_scripted_camera_seen_ = true;
       pc_chase_camera_base_ = 0U;
       return;
     }
@@ -5870,14 +6155,23 @@ private:
         pc_chase_camera_base_ = 0U;
         return;
       }
-      std::uint32_t authored_pitch{};
-      if (!vm_.runtime().read32(camera_base + camera_desired_pitch_offset,
-                                authored_pitch)) {
-        return;
-      }
       pc_chase_camera_base_ = camera_base;
-      pc_chase_pitch_target_ = std::clamp(
-          normalize_angle(authored_pitch), -maximum_pitch, maximum_pitch);
+      if (pc_chase_scripted_camera_seen_) {
+        // The first vertical mouse command after a scripted-camera handoff
+        // starts from the neutral chase-camera horizon. The authored field can
+        // still contain the outgoing shot's upward pitch at this exact point;
+        // adopting it made mouse-look permanently inherit that stale angle.
+        pc_chase_pitch_target_ = 0;
+        pc_chase_scripted_camera_seen_ = false;
+      } else {
+        std::uint32_t authored_pitch{};
+        if (!vm_.runtime().read32(camera_base + camera_desired_pitch_offset,
+                                  authored_pitch)) {
+          return;
+        }
+        pc_chase_pitch_target_ = std::clamp(
+            normalize_angle(authored_pitch), -maximum_pitch, maximum_pitch);
+      }
       pc_chase_pitch_valid_ = true;
     }
     pc_chase_pitch_target_ = std::clamp(
@@ -6507,13 +6801,15 @@ private:
     if (!archive_selection ||
         !vm_.runtime().write32(0x801582d4U, *archive_selection) ||
         !vm_.runtime().write32(0x80156bdcU, 17U) ||
-        // This is a fresh TITLE-to-mission handoff. Mission overlays use the
-        // retail checkpoint-present flag to distinguish their clean-start
-        // choreography from restore setup; WRECK, for example, dispatches
-        // the parachute-opening event only when this is zero. The normal
-        // post-init checkpoint capture below sets it once retail state is
-        // actually ready.
-        !vm_.runtime().write32(0x8011f61cU, 0U)) {
+        // Gameplay is a fresh TITLE-to-mission handoff: mission overlays use
+        // the checkpoint-present flag to select clean-start choreography, so
+        // it stays zero there. The disposable briefing presenter deliberately
+        // takes retail's state-8 loading route (the same continuous frontend
+        // route proven by sf_tool) and never supplies state to gameplay.
+        !vm_.runtime().write32(
+            0x8011f61cU,
+            start_mode_ == Sf2GuestRuntimeStartMode::retail_briefing ? 1U
+                                                                     : 0U)) {
       return false;
     }
     setXaAbsoluteDiscActive(false);
@@ -6553,14 +6849,25 @@ private:
     }
     setStage("authored opening");
     opening_stack_ = vm_.runtime().state().gpr[29U];
+    auto last_opening_application_state = std::uint32_t{};
+    auto opening_display_submissions = std::size_t{};
     for (std::size_t index = 0U; index < 512U; ++index) {
       auto display_submitted = false;
       if (!advanceGuestBoundary(display_submitted)) {
         return false;
       }
+      std::uint32_t application_state{};
+      if (!vm_.runtime().read32(profile_.application_state,
+                                application_state)) {
+        return false;
+      }
+      last_opening_application_state = application_state;
+      opening_display_submissions += display_submitted ? 1U : 0U;
       if (display_submitted &&
           presentation_frame_ &&
-          presentation_frame_->draw_command_count != 0U) {
+          presentation_frame_->draw_command_count != 0U &&
+          (start_mode_ != Sf2GuestRuntimeStartMode::retail_briefing ||
+           presentation_frame_->application_state == 8U)) {
         if (mission_index_ == 4U) {
           if (const auto &trace = vm_.runtime().lastWriteTraceHit();
               trace.width != 0U) {
@@ -6584,6 +6891,12 @@ private:
         return true;
       }
     }
+    setStage("authored opening state=" +
+             std::to_string(last_opening_application_state) +
+             " submissions=" +
+             std::to_string(opening_display_submissions) + " state8=" +
+             std::to_string(briefing_state8_boundaries_) + "/" +
+             std::to_string(briefing_state8_maximum_draws_));
     return false;
   }
 
@@ -6661,7 +6974,8 @@ private:
     if (mission_index_ == 0U) {
       vm_.bindHostCall(
           0x80029c0cU, [this](LegacyHostCallContext &context) {
-            if (!loading_confirm_sent_) {
+            if (!loading_confirm_sent_ &&
+                start_mode_ == Sf2GuestRuntimeStartMode::gameplay) {
               // COLO shares its loading dispatcher with the unusually early
               // skippable parachute scene. The former bridge forced s0=1,
               // which is the dispatcher's decoded Cross-press condition and
@@ -6710,13 +7024,21 @@ private:
           mission_pad_record_ = record;
           ++mission_pad_polls_;
           auto state = host_pad_;
+          if (briefing_confirm_pulse_pending_) {
+            state.buttons = 0x4000U;
+            briefing_confirm_pulse_pending_ = false;
+          }
           // Colorado Mountains begins its skippable parachute choreography
           // unusually early. Send its required loading confirmation on the
           // first poll so the release edge retires before the scene becomes
           // skippable; the later generic pulse can land inside that intro.
           constexpr auto loading_confirm_poll = 8U;
-          if (mission_index_ != 0U && !loading_confirm_sent_ &&
-              mission_pad_polls_ >= loading_confirm_poll) {
+          if ((mission_index_ != 0U ||
+               start_mode_ == Sf2GuestRuntimeStartMode::retail_briefing) &&
+              !loading_confirm_sent_ &&
+              mission_pad_polls_ >= loading_confirm_poll &&
+              (start_mode_ == Sf2GuestRuntimeStartMode::gameplay ||
+               briefing_confirm_requested_)) {
             state.buttons = 0x4000U;
             loading_confirm_sent_ = true;
           }
@@ -6941,6 +7263,12 @@ private:
   bool xa_absolute_disc_active_{};
   bool xa_stream_observed_active_{};
   std::uint32_t mission_index_{};
+  Sf2GuestRuntimeStartMode start_mode_{
+      Sf2GuestRuntimeStartMode::gameplay};
+  bool briefing_confirm_requested_{};
+  bool briefing_confirm_pulse_pending_{};
+  std::size_t briefing_state8_boundaries_{};
+  std::size_t briefing_state8_maximum_draws_{};
   std::uint16_t runtime_selection_{};
   std::string fog_path_;
   std::vector<std::byte> fog_bytes_;
@@ -6964,6 +7292,7 @@ private:
   std::int32_t pc_manual_aim_pitch_command_{};
   bool pc_chase_pitch_enabled_{};
   bool pc_chase_pitch_valid_{};
+  bool pc_chase_scripted_camera_seen_{};
   std::int32_t pc_chase_pitch_pending_{};
   std::int32_t pc_chase_pitch_target_{};
   std::uint32_t pc_chase_camera_base_{};
@@ -6976,6 +7305,10 @@ private:
   std::shared_ptr<const Sf2PresentationFrame> presentation_frame_;
   std::optional<Sf2PresentationFrame> pending_presentation_;
   std::uint32_t pending_presentation_clock_{};
+  static constexpr std::size_t maximum_projected_vertices_ = 262'144U;
+  std::vector<psx::GteProjectedVertex> projected_vertices_;
+  std::vector<psx::GteVertexStoreTrace> projected_vertex_stores_;
+  bool projected_vertices_overflow_{};
   bool disable_retail_auxiliary_ui_{};
   std::uint64_t published_sequence_{};
   std::vector<std::uint32_t> gpu_gp0_stream_;
@@ -7265,8 +7598,9 @@ private:
 };
 
 Sf2GuestMissionRuntime::Sf2GuestMissionRuntime(
-    const std::filesystem::path &cue_path, std::uint32_t mission_index)
-    : impl_(std::make_unique<Impl>(cue_path, mission_index)) {}
+    const std::filesystem::path &cue_path, std::uint32_t mission_index,
+    Sf2GuestRuntimeStartMode start_mode)
+    : impl_(std::make_unique<Impl>(cue_path, mission_index, start_mode)) {}
 
 Sf2GuestMissionRuntime::~Sf2GuestMissionRuntime() = default;
 
@@ -7285,6 +7619,10 @@ std::string_view Sf2GuestMissionRuntime::faultDetail() const noexcept {
 void Sf2GuestMissionRuntime::setHostPadState(
     const LegacyHostPadState &state) noexcept {
   impl_->setHostPadState(state);
+}
+
+void Sf2GuestMissionRuntime::requestRetailBriefingConfirm() noexcept {
+  impl_->requestRetailBriefingConfirm();
 }
 
 void Sf2GuestMissionRuntime::setRetailAuxiliaryUiEnabled(
@@ -7430,6 +7768,11 @@ bool Sf2GuestMissionRuntime::applyCampaignCarryState(
 
 bool Sf2GuestMissionRuntime::advanceHostUpdate() noexcept {
   return impl_->advanceHostUpdate();
+}
+
+bool Sf2GuestMissionRuntime::advanceRetailBriefingAudioSlice(
+    bool dispatch_sound_callback) noexcept {
+  return impl_->advanceRetailBriefingAudioSlice(dispatch_sound_callback);
 }
 
 bool Sf2GuestMissionRuntime::missionCompleteRequested() const noexcept {

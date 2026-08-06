@@ -594,7 +594,8 @@ void perspectiveTransformVector(
     std::uint8_t vector_index,
     std::uint8_t shift,
     bool limit_mode,
-    bool last) noexcept {
+    bool last,
+    GteProjectionTrace* projection_trace) noexcept {
     const std::array vector{
         vectorElement(state, vector_index, 0U),
         vectorElement(state, vector_index, 1U),
@@ -653,6 +654,23 @@ void perspectiveTransformVector(
         lowSignedWord(screen_x >> 16U),
         lowSignedWord(screen_y >> 16U));
 
+    if (projection_trace != nullptr &&
+        projection_trace->count < projection_trace->vertices.size()) {
+        projection_trace->vertices[projection_trace->count++] =
+            GteProjectedVertex{
+                .camera_x_q12 = coordinate[0],
+                .camera_y_q12 = coordinate[1],
+                .camera_z_q12 = coordinate[2],
+                .screen_x_q16 = screen_x,
+                .screen_y_q16 = screen_y,
+                .offset_x_q16 = signedWord(state.control[24]),
+                .offset_y_q16 = signedWord(state.control[25]),
+                .packed_sxy = state.data[14],
+                .projection = static_cast<std::uint16_t>(
+                    state.control[26] & 0xffffU),
+            };
+    }
+
     if (last) {
         const auto depth_cue = static_cast<std::int64_t>(quotient) *
                 static_cast<std::int16_t>(state.control[27]) +
@@ -671,21 +689,31 @@ void perspectiveTransformVector(
     }
 }
 
-void executePerspectiveTransform(GteState& state, std::uint32_t instruction) noexcept {
+void executePerspectiveTransform(
+    GteState& state,
+    std::uint32_t instruction,
+    GteProjectionTrace* projection_trace) noexcept {
     state.control[31] = 0U;
     const auto shift = static_cast<std::uint8_t>((instruction & (1U << 19U)) != 0U ? 12U : 0U);
     const auto limit_mode = (instruction & (1U << 10U)) != 0U;
-    perspectiveTransformVector(state, 0U, shift, limit_mode, true);
+    perspectiveTransformVector(
+        state, 0U, shift, limit_mode, true, projection_trace);
     updateErrorFlag(state);
 }
 
-void executeTriplePerspectiveTransform(GteState& state, std::uint32_t instruction) noexcept {
+void executeTriplePerspectiveTransform(
+    GteState& state,
+    std::uint32_t instruction,
+    GteProjectionTrace* projection_trace) noexcept {
     state.control[31] = 0U;
     const auto shift = static_cast<std::uint8_t>((instruction & (1U << 19U)) != 0U ? 12U : 0U);
     const auto limit_mode = (instruction & (1U << 10U)) != 0U;
-    perspectiveTransformVector(state, 0U, shift, limit_mode, false);
-    perspectiveTransformVector(state, 1U, shift, limit_mode, false);
-    perspectiveTransformVector(state, 2U, shift, limit_mode, true);
+    perspectiveTransformVector(
+        state, 0U, shift, limit_mode, false, projection_trace);
+    perspectiveTransformVector(
+        state, 1U, shift, limit_mode, false, projection_trace);
+    perspectiveTransformVector(
+        state, 2U, shift, limit_mode, true, projection_trace);
     updateErrorFlag(state);
 }
 
@@ -796,10 +824,16 @@ void GteRuntime::writeControl(
     }
 }
 
-bool GteRuntime::executeCommand(GteState& state, std::uint32_t instruction) noexcept {
+bool GteRuntime::executeCommand(
+    GteState& state,
+    std::uint32_t instruction,
+    GteProjectionTrace* projection_trace) noexcept {
+    if (projection_trace != nullptr) {
+        *projection_trace = {};
+    }
     switch (instruction & 0x3fU) {
     case 0x01U:
-        executePerspectiveTransform(state, instruction);
+        executePerspectiveTransform(state, instruction, projection_trace);
         return true;
     case 0x06U:
         executeNormalClip(state);
@@ -838,7 +872,7 @@ bool GteRuntime::executeCommand(GteState& state, std::uint32_t instruction) noex
         executeAverageDepth(state, 16U, 4U, 30U);
         return true;
     case 0x30U:
-        executeTriplePerspectiveTransform(state, instruction);
+        executeTriplePerspectiveTransform(state, instruction, projection_trace);
         return true;
     case 0x3dU:
         executeGeneralPurposeMultiply(state, instruction);

@@ -1,12 +1,15 @@
 #include "psycross_mission_start.hpp"
 #include "psycross_audio_output.hpp"
 #include "psycross_retail_briefing.hpp"
+#include "psycross_scene_viewer.hpp"
 #include "psycross_window_mode.hpp"
 
 #include "sf/core/error.hpp"
 #include "sf/game/gameplay.hpp"
+#include "sf/game/legacy_first_mission_runtime.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/mission_start.hpp"
+#include "sf/game/sf2_runtime.hpp"
 
 #include <PsyX/PsyX_globals.h>
 #include <PsyX/PsyX_public.h>
@@ -25,6 +28,8 @@
 #include <span>
 #include <utility>
 
+void PsyX_TakeScreenshot();
+
 namespace sf::platform::detail {
 namespace {
 
@@ -33,6 +38,28 @@ constexpr std::uint16_t confirm_buttons = 0x4000U | 0x08U;
 std::uint16_t readButtons(const PADRAW &pad) noexcept {
   return static_cast<std::uint16_t>(pad.buttons[0]) |
          (static_cast<std::uint16_t>(pad.buttons[1]) << 8U);
+}
+
+bool sf2RetailPromptVisible(const game::Sf2PresentationFrame &frame) noexcept {
+  auto prompt_glyphs = std::size_t{};
+  for (const auto &packet : frame.packets) {
+    if (game::sf2GpuCommandKind(packet) != game::Sf2GpuCommandKind::draw ||
+        packet.gp0_words.size() != 4U) {
+      continue;
+    }
+    const auto opcode =
+        static_cast<std::uint8_t>(packet.gp0_words.front() >> 24U);
+    if ((opcode & 0xfcU) != 0x64U) {
+      continue;
+    }
+    const auto xy = packet.gp0_words[1U];
+    const auto x = static_cast<std::int16_t>(xy);
+    const auto y = static_cast<std::int16_t>(xy >> 16U);
+    if (y == 85 && x >= 53 && x <= 166) {
+      ++prompt_glyphs;
+    }
+  }
+  return prompt_glyphs >= 16U;
 }
 
 } // namespace
@@ -50,10 +77,16 @@ PsyCrossMissionStart::takePreloadedAudio() noexcept {
   return std::move(preloaded_audio_);
 }
 
+std::unique_ptr<game::Sf2GuestMissionRuntime>
+PsyCrossMissionStart::takePreloadedSf2Runtime() noexcept {
+  return std::move(preloaded_sf2_runtime_);
+}
+
 std::uint16_t
 PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
                           std::uint16_t previous_buttons,
                           const KeyboardMouseBindings &bindings,
+                          const std::filesystem::path &cue_path,
                           std::optional<game::CampaignCarryState> carry) {
   // The retail briefing is also the level-loading boundary. Remove the STR
   // framebuffer and its texture-page residue before presenting it; the
@@ -62,10 +95,33 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
   ClearImage(&whole_vram, 0, 0, 0);
   DrawSync(0);
   PsyCrossRetailBriefing retail_briefing{mission, bindings};
+  auto guest_briefing = std::unique_ptr<game::Sf2GuestMissionRuntime>{};
+  if (mission.gameId() == game::GameId::syphon_filter_2) {
+    guest_briefing = std::make_unique<game::Sf2GuestMissionRuntime>(
+        cue_path, mission.definition().index,
+        game::Sf2GuestRuntimeStartMode::retail_briefing);
+    if (!guest_briefing->ready()) {
+      throw core::Error{
+          core::ErrorCode::invalid_format,
+          "Authentic SF2 retail briefing failed: " +
+              std::string{guest_briefing->faultDetail()}};
+    }
+    guest_briefing->setHostPadState({});
+    prepareSf2GuestRetailPresentation();
+  }
   preloaded_gameplay_.reset();
-  preloaded_audio_ = std::make_unique<PsyCrossAudioOutput>();
-  auto preload = std::async(std::launch::async, [&mission, carry] {
-    auto gameplay = std::make_unique<game::GameplaySession>(mission);
+  preloaded_sf2_runtime_.reset();
+  preloaded_audio_ = std::make_unique<PsyCrossAudioOutput>(
+      12U, mission.gameId() == game::GameId::syphon_filter_2
+               ? "sf2-briefing"
+               : "briefing");
+  struct MissionPreload {
+    std::unique_ptr<game::GameplaySession> gameplay;
+    std::unique_ptr<game::Sf2GuestMissionRuntime> sf2_runtime;
+  };
+  auto preload = std::async(std::launch::async, [&mission, &cue_path, carry] {
+    auto result = MissionPreload{};
+    result.gameplay = std::make_unique<game::GameplaySession>(mission);
     // SF2's preloaded GameplaySession is only the native texture/residency
     // shell. Its authoritative player state lives in Sf2GuestMissionRuntime,
     // which applies the exact sequel carry after its retail mission bootstrap.
@@ -74,11 +130,21 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
     // bridge's player inventory at this loading boundary and rejects an
     // otherwise valid Mission 1 continuation before gameplay can start.
     if (mission.gameId() != game::GameId::syphon_filter_2 && carry &&
-        !gameplay->applyCampaignCarryState(*carry)) {
+        !result.gameplay->applyCampaignCarryState(*carry)) {
       throw core::Error{core::ErrorCode::invalid_format,
                         "Campaign carry could not be applied to retail RAM"};
     }
-    return gameplay;
+    if (mission.gameId() == game::GameId::syphon_filter_2) {
+      result.sf2_runtime = std::make_unique<game::Sf2GuestMissionRuntime>(
+          cue_path, mission.definition().index);
+      if (!result.sf2_runtime->ready()) {
+        throw core::Error{
+            core::ErrorCode::invalid_format,
+            "SF2 gameplay preload failed: " +
+                std::string{result.sf2_runtime->faultDetail()}};
+      }
+    }
+    return result;
   });
   game::MissionStartGate gate;
   static_cast<void>(gate.update(
@@ -96,8 +162,15 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
   std::uint64_t audio_pcm_blocks_pumped{};
   std::uint64_t audio_diagnostic_sequence{};
   const auto periodic_audio_diagnostics = psyCrossAudioDiagnosticsEnabled();
+  const auto capture_completed_briefing =
+      SDL_getenv("SF2_CAPTURE_COMPLETED_BRIEFING") != nullptr;
+  auto completed_briefing_captured = false;
   auto next_audio_diagnostic_counter =
       SDL_GetPerformanceCounter() + performance_frequency;
+  const auto guest_clock_start = SDL_GetPerformanceCounter();
+  auto guest_updates = std::uint64_t{};
+  auto guest_confirmation_requested = false;
+  auto drawn_guest_sequence = std::uint64_t{};
   const auto pump_audio = [&] {
     while (const auto count = preloaded_gameplay_->takePcm(briefing_pcm)) {
       audio_pcm_frames_pumped += count;
@@ -136,7 +209,9 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
 
     if (!preloaded_gameplay_ && preload.wait_for(std::chrono::seconds{0}) ==
                                     std::future_status::ready) {
-      preloaded_gameplay_ = preload.get();
+      auto loaded = preload.get();
+      preloaded_gameplay_ = std::move(loaded.gameplay);
+      preloaded_sf2_runtime_ = std::move(loaded.sf2_runtime);
       animation_start = SDL_GetPerformanceCounter();
       // The native SF2 package is renderable before its executable audio
       // callbacks are mapped. Keep the briefing responsive and enter the
@@ -147,6 +222,59 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
     }
 
     const auto current_counter = SDL_GetPerformanceCounter();
+    if (guest_briefing && performance_frequency != 0U) {
+      const auto target_updates = static_cast<std::uint64_t>(
+          static_cast<long double>(current_counter - guest_clock_start) *
+          20.0L / static_cast<long double>(performance_frequency));
+      auto updates_this_iteration = std::uint32_t{};
+      while (guest_updates < target_updates &&
+             updates_this_iteration < 4U) {
+        if (!guest_briefing->advanceHostUpdate()) {
+          if (guest_confirmation_requested &&
+              guest_briefing->diagnostics().application_state != 8U &&
+              preloaded_gameplay_) {
+            PsyX_Log_Info(
+                "Mission briefing: authentic retail state released; "
+                "entering gameplay\n");
+            return previous_buttons;
+          }
+          throw core::Error{
+              core::ErrorCode::invalid_format,
+              "Authentic SF2 retail briefing stopped: " +
+                  std::string{guest_briefing->faultDetail()}};
+        }
+        ++guest_updates;
+        ++updates_this_iteration;
+        // State 8 is intentionally retired at 20 Hz. Its guest boundary
+        // already produces one mixer slice, so supply the remaining five of
+        // the six 120 Hz slices required by each 50 ms interval. The boundary
+        // also dispatches two sequence callbacks; only four added slices need
+        // the retail sound callback to reach the same six-per-tick cadence.
+        for (auto audio_slice = 0U; audio_slice < 5U; ++audio_slice) {
+          if (!guest_briefing->advanceRetailBriefingAudioSlice(
+                  audio_slice < 4U)) {
+            throw core::Error{
+                core::ErrorCode::invalid_format,
+                "Authentic SF2 briefing audio clock stopped: " +
+                    std::string{guest_briefing->faultDetail()}};
+          }
+        }
+      }
+      while (const auto count = guest_briefing->takePcm(briefing_pcm)) {
+        preloaded_audio_->queue(
+            std::span<const psx::SpuPcmFrame>{briefing_pcm}.first(count));
+      }
+      preloaded_audio_->flush();
+      preloaded_audio_->update();
+      if (guest_confirmation_requested &&
+          guest_briefing->diagnostics().application_state == 0U &&
+          preloaded_gameplay_) {
+        PsyX_Log_Info(
+            "Mission briefing: authentic retail state confirmed; entering "
+            "gameplay\n");
+        return previous_buttons;
+      }
+    }
     const auto elapsed =
         animation_start ? current_counter - *animation_start : 0U;
     const auto retail_time =
@@ -218,18 +346,61 @@ PsyCrossMissionStart::run(const game::MissionPackage &mission, PADRAW &pad,
       }
     }
     auto text_animation_complete = false;
-    retail_briefing.prepare(retail_time);
-    if (PsyX_BeginScene() != 0) {
-      text_animation_complete =
-          retail_briefing.draw(mission.briefing(), retail_time);
+    if (!guest_briefing) {
+      retail_briefing.prepare(retail_time);
+    }
+    if (guest_briefing) {
+      if (const auto &frame = guest_briefing->presentationFrame()) {
+        const auto fresh_presentation =
+            frame->sequence != drawn_guest_sequence;
+        if (beginSf2GuestFrame(*frame, fresh_presentation)) {
+          if (fresh_presentation) {
+            drawSf2GuestFrame(*frame, 0U,
+                              preloaded_gameplay_ != nullptr);
+            drawn_guest_sequence = frame->sequence;
+          }
+          text_animation_complete =
+              frame->application_state == 8U &&
+              sf2RetailPromptVisible(*frame);
+          if (capture_completed_briefing && text_animation_complete &&
+              guest_updates >= 180U &&
+              !completed_briefing_captured) {
+            PsyX_TakeScreenshot();
+            completed_briefing_captured = true;
+            PsyX_Log_Info(
+                "Mission briefing: captured completed presentation\n");
+          }
+          PsyX_EndScene();
+        }
+      }
+    } else if (PsyX_BeginScene() != 0) {
+        text_animation_complete =
+            retail_briefing.draw(mission.briefing(), retail_time);
+      if (capture_completed_briefing && text_animation_complete &&
+          !completed_briefing_captured) {
+        PsyX_TakeScreenshot();
+        completed_briefing_captured = true;
+        PsyX_Log_Info("Mission briefing: captured completed presentation\n");
+      }
       PsyX_EndScene();
     }
     if (gate.update((held & confirm_buttons) != 0U ||
                         bound_actions[KeyboardMouseAction::interact],
-                    text_animation_complete) &&
+                    text_animation_complete &&
+                        preloaded_gameplay_ != nullptr) &&
         preloaded_gameplay_) {
-      PsyX_Log_Info("Mission briefing confirmed; entering gameplay\n");
-      return previous_buttons;
+      if (guest_briefing) {
+        // The state-8 VM exists only to present the authentic briefing. The
+        // separately preloaded gameplay VM is already at Mission 1's playable
+        // boundary; asking this disposable VM to bootstrap the mission again
+        // creates a long, invisible post-X load that is immediately discarded.
+        PsyX_Log_Info(
+            "Mission briefing confirmed; entering preloaded SF2 gameplay\n");
+        return previous_buttons;
+      } else {
+        PsyX_Log_Info("Mission briefing confirmed; entering gameplay\n");
+        return previous_buttons;
+      }
     }
   }
 }

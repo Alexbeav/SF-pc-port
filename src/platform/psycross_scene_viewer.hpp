@@ -13,11 +13,23 @@ struct PADRAW;
 namespace sf::game {
 class GameplaySession;
 class MissionPackage;
+class Sf2GuestMissionRuntime;
+struct Sf2PresentationFrame;
 } // namespace sf::game
 
 namespace sf::platform::detail {
 
 class PsyCrossAudioOutput;
+
+// Retail SF2 ordering-table presenter shared by state-8 mission briefing and
+// gameplay. The preparation call restores direct retail page identities;
+// gameplay's TextureStreamer installs its own residency map afterward.
+void prepareSf2GuestRetailPresentation() noexcept;
+bool beginSf2GuestFrame(const game::Sf2PresentationFrame &frame,
+                        bool clear_published_page);
+void drawSf2GuestFrame(const game::Sf2PresentationFrame &frame,
+                       unsigned int texture_bank,
+                       bool retail_briefing_loaded = true);
 
 enum class SceneExitReason {
   exit_application,
@@ -75,6 +87,7 @@ public:
       std::uint32_t maximum_unlocked_mission,
       std::unique_ptr<game::GameplaySession> preloaded_gameplay = {},
       std::unique_ptr<PsyCrossAudioOutput> preloaded_audio = {},
+      std::unique_ptr<game::Sf2GuestMissionRuntime> preloaded_sf2_runtime = {},
       std::optional<game::CampaignCarryState> campaign_carry = std::nullopt);
 
 private:

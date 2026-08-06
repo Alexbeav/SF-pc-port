@@ -28,6 +28,7 @@
 #include "sf/game/player_controller.hpp"
 #include "sf/game/runtime_profile.hpp"
 #include "sf/game/sf2_runtime.hpp"
+#include "sf/psx/gte_runtime.hpp"
 #include "sf/game/state_stack.hpp"
 #include "sf/game/supported_games.hpp"
 #include "sf/game/system.hpp"
@@ -328,6 +329,96 @@ void testSf2PresentationFrameCapture() {
   require(maximum_transfer && maximum_transfer->width == 1024U &&
               maximum_transfer->height == 512U,
           "SF2 presentation did not decode zero-sized maximum VRAM copy");
+
+  sf::game::Sf2PresentationFrame projected_frame{
+      .sequence = 1U,
+      .guest_frame = 2U,
+      .application_state = 0U,
+      .ordering_table_root = 0x80001000U,
+      .packets = {{.guest_address = 0x80001100U,
+                   .gp0_words = {0x24808080U, 0x00020001U, 0x00100020U,
+                                 0x00040003U, 0x00200030U, 0x00060005U,
+                                 0x00300040U}}},
+      .submission_packet_ends = {1U},
+  };
+  const std::array projected_vertices{
+      sf::psx::GteProjectedVertex{
+          .camera_x_q12 = 100,
+          .camera_z_q12 = 1000,
+          .screen_x_q16 = 65537,
+          .screen_y_q16 = 131073,
+          .packed_sxy = 0x00020001U,
+          .projection = 320U,
+      },
+      sf::psx::GteProjectedVertex{
+          .camera_x_q12 = 200,
+          .camera_z_q12 = 1100,
+          .screen_x_q16 = 196609,
+          .screen_y_q16 = 262145,
+          .packed_sxy = 0x00040003U,
+          .projection = 320U,
+      },
+      sf::psx::GteProjectedVertex{
+          .camera_x_q12 = 300,
+          .camera_z_q12 = 1200,
+          .screen_x_q16 = 327681,
+          .screen_y_q16 = 393217,
+          .packed_sxy = 0x00060005U,
+          .projection = 320U,
+      },
+  };
+  const auto projection_matches = sf::game::attachSf2ProjectionProvenance(
+      projected_frame, projected_vertices);
+  require(projection_matches.world_polygon_packets == 1U &&
+              projection_matches.matched_packets == 1U &&
+              projection_matches.matched_vertices == 3U &&
+              projected_frame.packets[0].projected_vertex_count == 3U &&
+              projected_frame.packets[0].projected_vertices[1].camera_z_q12 ==
+                  1100,
+          "SF2 presentation did not attach complete guest GTE provenance");
+
+  const std::array projected_stores{
+      sf::psx::GteVertexStoreTrace{0x80001104U, projected_vertices[0]},
+      sf::psx::GteVertexStoreTrace{0x8000110cU, projected_vertices[1]},
+      sf::psx::GteVertexStoreTrace{0x80001114U, projected_vertices[2]},
+  };
+  const auto address_matches = sf::game::attachSf2ProjectionProvenance(
+      projected_frame, projected_vertices, projected_stores);
+  require(address_matches.observed_vertex_stores == 3U &&
+              address_matches.address_matched_packets == 1U &&
+              projected_frame.packets[0].projected_vertex_count == 3U &&
+              projected_frame.packets[0]
+                  .projected_vertices_address_matched,
+          "SF2 presentation did not attach address-backed GTE provenance");
+
+  const auto incomplete_address_matches =
+      sf::game::attachSf2ProjectionProvenance(
+          projected_frame, projected_vertices,
+          std::span{projected_stores}.first(2U));
+  require(incomplete_address_matches.matched_packets == 0U &&
+              projected_frame.packets[0].projected_vertex_count == 0U &&
+              !projected_frame.packets[0]
+                   .projected_vertices_address_matched,
+          "SF2 presentation guessed through incomplete address provenance");
+
+  auto ambiguous_vertices = std::vector<sf::psx::GteProjectedVertex>{
+      projected_vertices.begin(), projected_vertices.end()};
+  auto conflicting = projected_vertices[1];
+  conflicting.camera_z_q12 = 9000;
+  ambiguous_vertices.push_back(conflicting);
+  const auto ambiguous_matches = sf::game::attachSf2ProjectionProvenance(
+      projected_frame, ambiguous_vertices);
+  require(ambiguous_matches.ambiguous_positions == 1U &&
+              ambiguous_matches.matched_packets == 0U &&
+              projected_frame.packets[0].projected_vertex_count == 0U,
+          "SF2 presentation guessed through ambiguous GTE provenance");
+
+  projected_frame.application_state = 1U;
+  const auto ui_matches = sf::game::attachSf2ProjectionProvenance(
+      projected_frame, projected_vertices);
+  require(ui_matches.world_polygon_packets == 0U &&
+              ui_matches.matched_packets == 0U,
+          "SF2 presentation attached world PGXP provenance to UI state");
 
   const std::array gp0_stream{
       0x3c808080U, 0x00010002U, 0x00030004U, 0x00050006U,

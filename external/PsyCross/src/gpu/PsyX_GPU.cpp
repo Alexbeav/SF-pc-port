@@ -239,6 +239,11 @@ inline void ApplyVertexPGXP(GrVertex* v, const PGXPVData& vd, float ofsX,
 	v->scr_h			= vd.scr_h;
 	v->ofsX				= 0.0f;
 	v->ofsY				= 0.0f;
+	// Some modern guest bridges have already applied their widescreen camera
+	// transform to the exact projected coordinate. Keep that world vertex out
+	// of the generic centred-4:3 presentation squeeze while leaving ordinary
+	// PGXP and authored 2D content unchanged.
+	v->_p0				= vd.bypass_presentation_scale ? 1 : 0;
 	if(vd.precise_texcoord)
 	{
 		v->precise_u = vd.precise_u;
@@ -988,8 +993,11 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 	{
 		P_TAG* polyTag = reinterpret_cast<P_TAG*>(p);
 #if USE_PGXP && USE_EXTENDED_PRIM_POINTERS
-		// force PGXP off
-		polyTag->pgxp_index = 0xFFFF;
+		// Ordinary immediate primitives have no associated GTE transform and
+		// must not accidentally consume cache entry zero. Mode 2 is the narrow
+		// host replay path whose caller explicitly supplied a PGXP index.
+		if(singlePrimitive == 1)
+			polyTag->pgxp_index = 0xFFFF;
 #endif
 		if(g_vertexIndex >= MAX_VERTEX_BUFFER_SIZE - MAX_VERTICES_PER_PRIMITIVE)
 		{

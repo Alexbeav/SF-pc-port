@@ -456,7 +456,23 @@ void DrawPrim(void* p)
 	//if (activeDrawEnv.isbg)
 	//	ClearImage(&activeDrawEnv.clip, activeDrawEnv.r0, activeDrawEnv.g0, activeDrawEnv.b0);
 
- 	ParsePrimitivesLinkedList((u_long*)p, 1);
+	ParsePrimitivesLinkedList((u_long*)p, 1);
+}
+
+void DrawPrimPGXP(void* p)
+{
+	if (g_GPUDisabledState)
+	{
+		ClearSplits();
+		return;
+	}
+
+	if (PsyX_BeginScene())
+	{
+		ClearSplits();
+	}
+
+	ParsePrimitivesLinkedList((u_long*)p, 2);
 }
 
 void SetSprt16(SPRT_16* p)

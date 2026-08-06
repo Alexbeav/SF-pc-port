@@ -12,6 +12,7 @@
 #include "sf/game/game_disc.hpp"
 #include "sf/game/mission.hpp"
 #include "sf/game/retail_cheats.hpp"
+#include "sf/game/sf2_runtime.hpp"
 #include "sf/game/supported_games.hpp"
 #include "sf/game/title.hpp"
 
@@ -902,6 +903,7 @@ public:
           // use their catalog title instead of silently skipping briefing UI.
           previous_buttons =
               mission_start.run(*mission, pad, previous_buttons, input_,
+                                campaign_cue_path,
                                 campaign_carry);
         } else {
           PsyX_Log_Info("Restarting active mission package: mission=%u\n",
@@ -922,6 +924,7 @@ public:
                              campaign->maximumUnlockedMission(),
                              mission_start.takePreloadedGameplay(),
                              mission_start.takePreloadedAudio(),
+                             mission_start.takePreloadedSf2Runtime(),
                              campaign_carry);
         previous_buttons = scene_result.previous_buttons;
         if (scene_result.reason ==
@@ -1128,18 +1131,26 @@ public:
     PadStartCom();
     detail::PsyCrossMoviePlayer movie_player;
     auto previous_buttons = std::uint16_t{0xffffU};
-    if (!mission_.openingMovie().path.empty()) {
+    if (!mission_.openingMovie().path.empty() &&
+        SDL_getenv("SF2_SKIP_OPENING_MOVIE") == nullptr) {
       previous_buttons = movie_player.playStandalone(mission_.openingMovie(),
                                                      pad, previous_buttons);
     }
     detail::PsyCrossMissionStart mission_start;
     std::unique_ptr<game::GameplaySession> preloaded_gameplay;
     std::unique_ptr<detail::PsyCrossAudioOutput> preloaded_audio;
-    if (mission_.gameId() == game::GameId::syphon_filter) {
+    std::unique_ptr<game::Sf2GuestMissionRuntime> preloaded_sf2_runtime;
+    const auto test_sf2_retail_briefing =
+        mission_.gameId() == game::GameId::syphon_filter_2 &&
+        SDL_getenv("SF2_TEST_RETAIL_BRIEFING") != nullptr;
+    if (mission_.gameId() == game::GameId::syphon_filter ||
+        test_sf2_retail_briefing) {
       previous_buttons =
-          mission_start.run(mission_, pad, previous_buttons, input_);
+          mission_start.run(mission_, pad, previous_buttons, input_,
+                            cue_path_);
       preloaded_gameplay = mission_start.takePreloadedGameplay();
       preloaded_audio = mission_start.takePreloadedAudio();
+      preloaded_sf2_runtime = mission_start.takePreloadedSf2Runtime();
     } else {
       // Sequel scene-test mode is the bring-up boundary: its mission data is
       // already native, while briefing/audio guest callbacks are mapped
@@ -1152,7 +1163,7 @@ public:
       const auto result = scene_viewer.run(
           mission_, pad, previous_buttons, cue_path_,
           mission_.definition().index, std::move(preloaded_gameplay),
-          std::move(preloaded_audio));
+          std::move(preloaded_audio), std::move(preloaded_sf2_runtime));
       previous_buttons = result.previous_buttons;
       if (result.reason == detail::SceneExitReason::restart_mission) {
         // Scene-test is also the public direct-mission launcher. A clean

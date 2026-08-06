@@ -15,6 +15,8 @@
 #include <vector>
 
 namespace sf::psx {
+struct GteProjectedVertex;
+struct GteVertexStoreTrace;
 struct SpuPcmFrame;
 }
 
@@ -54,9 +56,35 @@ struct Sf2GuestRuntimeProfile {
 // Immutable guest-to-native presentation handoff. SF2's renderer callback
 // supplies the root of a PSX DMA linked list; native presentation receives a
 // bounded deep copy, never a pointer or view into mutable guest RAM.
+struct Sf2GpuVertexProvenance {
+  std::int64_t camera_x_q12{};
+  std::int64_t camera_y_q12{};
+  std::int64_t camera_z_q12{};
+  std::int64_t screen_x_q16{};
+  std::int64_t screen_y_q16{};
+  std::int32_t offset_x_q16{};
+  std::int32_t offset_y_q16{};
+  std::uint32_t packed_sxy{};
+  std::uint16_t projection{};
+};
+
 struct Sf2GpuPacket {
   std::uint32_t guest_address{};
   std::vector<std::uint32_t> gp0_words;
+  std::array<Sf2GpuVertexProvenance, 4U> projected_vertices{};
+  std::uint8_t projected_vertex_count{};
+  bool projected_vertices_address_matched{};
+};
+
+struct Sf2ProjectionMatchStats {
+  std::size_t observed_vertices{};
+  std::size_t observed_vertex_stores{};
+  std::size_t unique_positions{};
+  std::size_t ambiguous_positions{};
+  std::size_t world_polygon_packets{};
+  std::size_t matched_packets{};
+  std::size_t matched_vertices{};
+  std::size_t address_matched_packets{};
 };
 
 struct Sf2PresentationFrame {
@@ -81,6 +109,7 @@ struct Sf2PresentationFrame {
   std::size_t gp0_word_count{};
   std::size_t gpu_command_count{};
   std::size_t draw_command_count{};
+  Sf2ProjectionMatchStats projection_matches{};
 
   [[nodiscard]] bool valid() const noexcept {
     return sequence != 0U && ordering_table_root != 0U && !packets.empty() &&
@@ -735,14 +764,29 @@ captureSf2PresentationFrame(std::span<const std::byte> guest_ram,
                             std::uint64_t sequence,
                             std::uint64_t guest_frame) noexcept;
 
+// Matches exact guest RTPS/RTPT results to the world polygons in a completed
+// presentation composition. Ambiguous or incomplete packets retain no
+// provenance and continue through the retail-compatible affine path.
+[[nodiscard]] Sf2ProjectionMatchStats attachSf2ProjectionProvenance(
+    Sf2PresentationFrame &frame,
+    std::span<const psx::GteProjectedVertex> observed_vertices,
+    std::span<const psx::GteVertexStoreTrace> observed_stores = {});
+
 // Production owner for the Disc 1 TITLE -> mission transition. It keeps
 // executable, overlays, CD/SPU state, collision, scripts, HUD and effects in
 // the retail guest; the host supplies only a standard pad sample and consumes
 // immutable GPU/SPU output.
+enum class Sf2GuestRuntimeStartMode {
+  gameplay,
+  retail_briefing,
+};
+
 class Sf2GuestMissionRuntime final {
 public:
   Sf2GuestMissionRuntime(const std::filesystem::path &cue_path,
-                         std::uint32_t mission_index);
+                         std::uint32_t mission_index,
+                         Sf2GuestRuntimeStartMode start_mode =
+                             Sf2GuestRuntimeStartMode::gameplay);
   ~Sf2GuestMissionRuntime();
 
   Sf2GuestMissionRuntime(const Sf2GuestMissionRuntime &) = delete;
@@ -755,6 +799,7 @@ public:
   [[nodiscard]] bool faulted() const noexcept;
   [[nodiscard]] std::string_view faultDetail() const noexcept;
   void setHostPadState(const LegacyHostPadState &state) noexcept;
+  void requestRetailBriefingConfirm() noexcept;
   // Diagnostic presentation A/B switch; gameplay state remains untouched.
   void setRetailAuxiliaryUiEnabled(bool enabled) noexcept;
   // Diagnostic-only authored event injection used by sf_tool to exercise
@@ -837,6 +882,11 @@ public:
   [[nodiscard]] bool
   applyCampaignCarryState(const CampaignCarryState &state) noexcept;
   [[nodiscard]] bool advanceHostUpdate() noexcept;
+  // State 8 is presented at its authored 20 Hz animation cadence while the
+  // PSX timer/SPU path continues at 120 Hz. One call advances one independent
+  // hardware audio slice without retiring another frontend display update.
+  [[nodiscard]] bool advanceRetailBriefingAudioSlice(
+      bool dispatch_sound_callback) noexcept;
   // Retail success and failure both converge on application state 3. This
   // signal is raised only when the success entry reaches that shared outcome
   // transition, so death/restart cannot advance the campaign.

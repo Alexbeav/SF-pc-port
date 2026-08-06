@@ -806,6 +806,7 @@ int PGXP_GetCacheData(PGXPVData* out, uint lookup, ushort indexhint)
 		out->texture_bounds	  = 0;
 		out->precise_texcoord = 0;
 		out->exact_projection = 0;
+		out->bypass_presentation_scale = 0;
 		return 0;
 	}
 
@@ -852,6 +853,7 @@ int PGXP_GetCacheData(PGXPVData* out, uint lookup, ushort indexhint)
 	out->texture_bounds	  = 0;
 	out->precise_texcoord = 0;
 	out->exact_projection = 0;
+	out->bypass_presentation_scale = 0;
 
 	return 0;
 }

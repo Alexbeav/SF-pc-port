@@ -27,6 +27,8 @@ sf2_address,descriptive_name,confidence,sf3_address,evidence
 0x8005cc3c,ActorAuxiliaryResources_Reset,strong,0x8005e29c,Frees and clears five auxiliary handles for one actor or each of two global actors
 0x800570a0,WorldCollision_Scan,strong,0x80058608,Normalized instruction sequence matches the verified SF1 collision scan at 0.704 with a 0.489 runner-up margin and is structurally preserved in SF3
 0x80049940,ActorCameraRenderCollision_Update,provisional,0x8004ac88,The SF1 predecessor references the retail camera controller and calls two collision helpers that map uniquely to 0x80057480/0x80057540; caller and field traffic prove actor render/attachment preparation rather than the chase-camera controller; SF3 preserves the joint-caller relationship
+0x80053464,PlayerCameraFacing_Update,confirmed,,Instruction-aligned with SF1 0x80037B08; a live 400-update probe recorded 132 calls retained the controller pointer in s2 and resolved the player-owned camera base
+0x800539d0,PlayerSightAngles_Consume,strong,,Live boundary consumes completed sight angles after retail target-bearing initialization and hosts the proportional manual-aim adapter
 0x80063dc4,ActorDroppedItem_Detach,provisional,0x80066208,Normalized instruction sequence matches the verified SF1 dropped-item detach path at 0.550 with a 0.273 runner-up margin and is structurally preserved in SF3
 0x800639f4,PlayerHeldModel_Resolve,strong,0x80065e10,Owns the explicit missing player-held-model diagnostic
 0x80066b54,RenderViewQueue_Add,confirmed,0x80068fa8,Inserts the supplied view through its +0x18c link into the GP-relative list and sets view flag 0x1000

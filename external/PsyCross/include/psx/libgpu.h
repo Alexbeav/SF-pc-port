@@ -850,6 +850,9 @@ extern void DrawOTag(u_long *p);
 extern void DrawOTagIO(u_long *p);
 extern void DrawOTagEnv(u_long *p, DRAWENV *env);
 extern void DrawPrim(void *p);
+// Immediate host primitive whose caller has explicitly populated pgxp_index.
+// Unlike DrawPrim, this preserves that index for exact projection replay.
+extern void DrawPrimPGXP(void *p);
 extern void DumpClut(u_short clut);
 extern void DumpDispEnv(DISPENV *env);
 extern void DumpDrawEnv(DRAWENV *env);

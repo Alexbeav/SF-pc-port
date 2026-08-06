@@ -7535,12 +7535,68 @@ int probeSf2ProductRuntime(const char *cue_path, std::uint32_t frames,
               << " samples=" << input_replay.size()
               << " updates=" << frames << '\n';
   }
+  auto probe_retail_briefing = false;
+#if defined(_WIN32)
+  std::size_t probe_retail_briefing_size{};
+  static_cast<void>(getenv_s(&probe_retail_briefing_size, nullptr, 0U,
+                             "SF2_PROBE_RETAIL_BRIEFING"));
+  probe_retail_briefing = probe_retail_briefing_size != 0U;
+#else
+  probe_retail_briefing =
+      std::getenv("SF2_PROBE_RETAIL_BRIEFING") != nullptr;
+#endif
   sf::game::Sf2GuestMissionRuntime runtime{
-      std::filesystem::path{cue_path}, mission_index};
+      std::filesystem::path{cue_path}, mission_index,
+      probe_retail_briefing
+          ? sf::game::Sf2GuestRuntimeStartMode::retail_briefing
+          : sf::game::Sf2GuestRuntimeStartMode::gameplay};
   if (!runtime.ready()) {
     std::cerr << "SF2 product runtime failed: " << runtime.faultDetail()
               << '\n';
     return 7;
+  }
+  if (probe_retail_briefing) {
+    auto probe_briefing_confirm = false;
+#if defined(_WIN32)
+    std::size_t probe_briefing_confirm_size{};
+    static_cast<void>(getenv_s(&probe_briefing_confirm_size, nullptr, 0U,
+                               "SF2_PROBE_BRIEFING_CONFIRM"));
+    probe_briefing_confirm = probe_briefing_confirm_size != 0U;
+#else
+    probe_briefing_confirm =
+        std::getenv("SF2_PROBE_BRIEFING_CONFIRM") != nullptr;
+#endif
+    runtime.setHostPadState({});
+    auto state_history = std::vector<std::uint32_t>{
+        runtime.diagnostics().application_state};
+    for (auto frame = std::uint32_t{}; frame < frames; ++frame) {
+      if (probe_briefing_confirm && frame == frames / 2U) {
+        runtime.requestRetailBriefingConfirm();
+      }
+      if (!runtime.advanceHostUpdate()) {
+        break;
+      }
+      const auto state = runtime.diagnostics().application_state;
+      if (state_history.back() != state) {
+        state_history.push_back(state);
+      }
+    }
+    const auto diagnostics = runtime.diagnostics();
+    const auto &presentation = runtime.presentationFrame();
+    std::cout << "SF2 retail briefing probe: state="
+              << diagnostics.application_state << " presentation="
+              << (presentation ? presentation->packets.size() : 0U)
+              << "/"
+              << (presentation ? presentation->draw_command_count : 0U)
+              << " states=";
+    for (const auto state : state_history) {
+      std::cout << state << '/';
+    }
+    std::cout << '\n';
+    return state_history.front() == 8U && presentation &&
+                   presentation->valid()
+               ? 0
+               : 7;
   }
   auto scope_probe_carry = std::optional<sf::game::CampaignCarryState>{};
   auto scope_probe_equipped = !scope_probe_item.has_value();

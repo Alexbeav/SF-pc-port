@@ -1092,7 +1092,9 @@ void testGteGameplayMath() {
       100U |
           (static_cast<std::uint32_t>(static_cast<std::uint16_t>(-50)) << 16U));
   sf::psx::GteRuntime::writeData(state, 1U, 1000U);
-  require(sf::psx::GteRuntime::executeCommand(state, 0x4a180001U) &&
+  sf::psx::GteProjectionTrace projection_trace{};
+  require(sf::psx::GteRuntime::executeCommand(
+              state, 0x4a180001U, &projection_trace) &&
               sf::psx::GteRuntime::readData(state, 25U) == 100U &&
               sf::psx::GteRuntime::readData(state, 26U) == 0xffffffceU &&
               sf::psx::GteRuntime::readData(state, 27U) == 1000U &&
@@ -1102,14 +1104,29 @@ void testGteGameplayMath() {
               sf::psx::GteRuntime::readData(state, 8U) == 0U &&
               sf::psx::GteRuntime::readControl(state, 31U) == 0U,
           "GTE RTPS result mismatch");
+  require(projection_trace.count == 1U &&
+              projection_trace.vertices[0].camera_x_q12 == 100 * 4096LL &&
+              projection_trace.vertices[0].camera_y_q12 == -50 * 4096LL &&
+              projection_trace.vertices[0].camera_z_q12 == 1000 * 4096LL &&
+              projection_trace.vertices[0].screen_x_q16 == 655400LL &&
+              projection_trace.vertices[0].screen_y_q16 == -327700LL &&
+              projection_trace.vertices[0].packed_sxy == 0xfffa000aU &&
+              projection_trace.vertices[0].projection == 100U,
+          "GTE RTPS presentation provenance lost exact projection data");
 
   state.horizontal_projection_scale = 0xc000U;
-  require(sf::psx::GteRuntime::executeCommand(state, 0x4a180001U) &&
+  require(sf::psx::GteRuntime::executeCommand(
+              state, 0x4a180001U, &projection_trace) &&
               sf::psx::GteRuntime::readData(state, 14U) == 0xfffa0007U &&
               sf::psx::GteRuntime::readData(state, 25U) == 100U &&
               sf::psx::GteRuntime::readData(state, 26U) == 0xffffffceU,
           "GTE native-wide horizontal projection changed Y or lost its "
           "Q16 X scale");
+  require(projection_trace.count == 1U &&
+              projection_trace.vertices[0].screen_x_q16 == 491550LL &&
+              projection_trace.vertices[0].screen_y_q16 == -327700LL &&
+              projection_trace.vertices[0].packed_sxy == 0xfffa0007U,
+          "GTE presentation provenance ignored native-wide projection");
 
   sf::psx::GteRuntime::writeData(state, 12U, 0U);
   sf::psx::GteRuntime::writeData(state, 13U, 1U);
@@ -6835,6 +6852,38 @@ void testWriteWatchSuppression() {
           "Disabling write-watch suppression did not restore normal writes");
 }
 
+void testGteVertexStoreProvenance() {
+  sf::psx::R3000Runtime runtime;
+  sf::psx::R3000State state{};
+  sf::psx::GteRuntime::writeControl(state.gte, 0U, 0x1000U);
+  sf::psx::GteRuntime::writeControl(state.gte, 2U, 0x1000U);
+  sf::psx::GteRuntime::writeControl(state.gte, 4U, 0x1000U);
+  sf::psx::GteRuntime::writeControl(state.gte, 26U, 100U);
+  sf::psx::GteRuntime::writeData(state.gte, 0U, 100U);
+  sf::psx::GteRuntime::writeData(state.gte, 1U, 1000U);
+  runtime.restoreCpuState(state);
+  constexpr std::array words{
+      encodeI(0x0fU, 0U, 8U, 0x8001U), 0x4a180001U,
+      encodeI(0x3aU, 8U, 14U, 0x0300U), 0x4a180001U,
+      encodeCop2Transfer(0U, 9U, 14U), 0U,
+      encodeI(0x2bU, 8U, 9U, 0x0304U),
+      encodeR(31U, 0U, 0U, 0U, 0x08U), 0U,
+  };
+  loadCode(runtime, words);
+  std::vector<sf::psx::GteVertexStoreTrace> stores;
+  runtime.setGteVertexStoreObserver(
+      [&](const sf::psx::GteVertexStoreTrace &store, std::uint32_t,
+          std::uint32_t) { stores.push_back(store); });
+  const auto result = runtime.call(code_address);
+  require(result.reason == sf::psx::R3000StopReason::returned &&
+              stores.size() == 2U &&
+              stores[0].address == 0x80010300U &&
+              stores[1].address == 0x80010304U &&
+              stores[0].vertex.packed_sxy == 0x0000000aU &&
+              stores[1].vertex.camera_z_q12 == 1000 * 4096LL,
+          "R3000 lost exact GTE provenance through SWC2 or MFC2/SW");
+}
+
 } // namespace
 
 int main() {
@@ -6862,6 +6911,7 @@ int main() {
     testLegacyGameplayVmClockOwnership();
     testLegacyGameplayVmContinuousPump();
     testWriteWatchSuppression();
+    testGteVertexStoreProvenance();
     std::cout << "R3000 runtime tests passed\n";
     return 0;
   } catch (const std::exception &error) {

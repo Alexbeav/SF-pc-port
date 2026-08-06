@@ -94,6 +94,10 @@ class R3000Runtime final {
 public:
     using ExecutionObserver = std::function<void(
         const R3000State&, std::uint32_t, std::uint32_t)>;
+    using GteProjectionObserver = std::function<void(
+        const GteProjectionTrace&, std::uint32_t, std::uint32_t)>;
+    using GteVertexStoreObserver = std::function<void(
+        const GteVertexStoreTrace&, std::uint32_t, std::uint32_t)>;
     static constexpr std::size_t ram_size = 2U * 1024U * 1024U;
     static constexpr std::size_t scratchpad_size = 1024U;
     static constexpr std::size_t mmio_size = 4U * 1024U;
@@ -128,6 +132,12 @@ public:
     void setExternalInterrupt(bool active) noexcept;
     void setExecutionObserver(ExecutionObserver observer) {
         execution_observer_ = std::move(observer);
+    }
+    void setGteProjectionObserver(GteProjectionObserver observer) {
+        gte_projection_observer_ = std::move(observer);
+    }
+    void setGteVertexStoreObserver(GteVertexStoreObserver observer) {
+        gte_vertex_store_observer_ = std::move(observer);
     }
     void setWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
     void addWriteWatch(std::uint32_t begin, std::uint32_t end) noexcept;
@@ -204,6 +214,8 @@ private:
         std::uint32_t value) noexcept;
     void writeRegister(std::uint8_t reg, std::uint32_t value) noexcept;
     void scheduleLoad(std::uint8_t reg, std::uint32_t value) noexcept;
+    void scheduleProjectionLoad(std::uint8_t reg, std::uint32_t value,
+                                const GteProjectedVertex& vertex) noexcept;
     void advanceLoadDelay() noexcept;
     void flushLoadDelay() noexcept;
     void clearLoadDelay() noexcept;
@@ -220,6 +232,16 @@ private:
     R3000State state_{};
     R3000MmioBus* mmio_bus_{};
     ExecutionObserver execution_observer_{};
+    GteProjectionObserver gte_projection_observer_{};
+    GteVertexStoreObserver gte_vertex_store_observer_{};
+    std::array<GteProjectedVertex, 3U> gte_projection_fifo_{};
+    std::array<bool, 3U> gte_projection_fifo_valid_{};
+    std::array<GteProjectedVertex, 32U> gpr_projection_{};
+    std::array<bool, 32U> gpr_projection_valid_{};
+    GteProjectedVertex load_projection_{};
+    GteProjectedVertex next_load_projection_{};
+    bool load_projection_valid_{};
+    bool next_load_projection_valid_{};
     std::array<std::uint32_t, 4U> write_watch_begins_{};
     std::array<std::uint32_t, 4U> write_watch_ends_{};
     std::size_t write_watch_count_{};

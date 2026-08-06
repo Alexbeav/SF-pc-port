@@ -207,6 +207,8 @@ weapon selection, pickup overflow, and item equip paths.
 |---|---:|---:|---|
 | world collision scan | `0x800570a0` | `0x80058608` | SF1 semantic and sequel structural match |
 | actor camera/render collision preparation | `0x80049940` | `0x8004ac88` | provisional; unique joint caller of two SF1-matched collision helpers |
+| common player camera/facing boundary | `0x80053464` | unknown | instruction-aligned with proven SF1 `0x80037B08`; live hook and controller-pointer probe |
+| completed sight-angle consumption | `0x800539d0` | unknown | live manual-aim boundary; consumes the selected actor bearing after retail initialization |
 
 `WorldCollision_Scan` calls the shared geometry helper at `0x80022a18`
 (SF3 `0x800231bc`) and a result/record path at `0x80099018`. This is the
@@ -218,8 +220,19 @@ calls helpers `0x8003a7fc` and `0x8003a8bc`. Those helpers map structurally
 to SF2 `0x80057480`/`0x80057540`; `0x80049940` is their only joint caller.
 SF3 keeps the same relationship at `0x8004ac88`. Full disassembly of the SF2
 caller proves this is actor render/attachment and collision preparation, not
-the chase-camera controller. The exact chase update therefore remains
-unnamed and requires a guest write probe.
+the chase-camera controller.
+
+The later guest write probe identified the live player camera/facing boundary
+at SF2 `0x80053464`, instruction-aligned with SF1 `0x80037B08`. Across 400
+ordinary gameplay updates it recorded 132 calls, retained the controller
+pointer in `s2`, resolved camera base `0x801285dc`, and drove the authored
+desired/rendered chase-pitch pair to its +/-512 clamp. The host mouse adapter
+uses the proportional direction-vector fields at controller
+`+0xcc/+0xd0/+0xd4` while leaving the retail turn axis active. This dual path
+is required to keep body facing, locomotion, animation and collision coupled
+to the chase camera. SF3's corresponding boundary remains unmapped and must be
+established by instruction alignment plus a live probe rather than address
+inference.
 
 Outdoor visibility and sky submission are scene/portal concerns and should
 not be folded into the camera routine merely because COLO exposes both
@@ -244,10 +257,10 @@ the responsible object/script controller is required.
 
 An earlier cross-game fuzzy name for `0x80066b54`/`0x80066be0` was rejected
 after full disassembly. They are render-view queue insertion/removal, not
-player integration or chase-camera updates. This leaves the exact sequel
-player/chase update intentionally unnamed; the large object interaction path
-at `0x8004a264` and visibility/event wrapper at `0x8004a050` are also ruled
-out as chase-camera owners.
+player integration or chase-camera updates. The live sequel camera/facing hook
+is instead `0x80053464`; the large object interaction path at `0x8004a264` and
+visibility/event wrapper at `0x8004a050` remain ruled out as chase-camera
+owners.
 
 ## Audio, speech, and ambience
 

@@ -171,11 +171,17 @@ void R3000Runtime::reset(std::uint32_t pc, std::uint32_t gp, std::uint32_t sp) n
     state_.gpr[28] = gp;
     state_.gpr[29] = sp;
     clearLoadDelay();
+    gte_projection_fifo_valid_ = {};
+    gpr_projection_valid_ = {};
 }
 
 void R3000Runtime::restoreCpuState(const R3000State& state) noexcept {
     state_ = state;
     state_.gpr[0] = 0U;
+    gte_projection_fifo_valid_ = {};
+    gpr_projection_valid_ = {};
+    load_projection_valid_ = false;
+    next_load_projection_valid_ = false;
 }
 
 bool R3000Runtime::beginCall(
@@ -483,8 +489,10 @@ void R3000Runtime::writeRegister(std::uint8_t reg, std::uint32_t value) noexcept
         return;
     }
     state_.gpr[reg] = value;
+    gpr_projection_valid_[reg] = false;
     if (state_.load_delay.valid && state_.load_delay.reg == reg) {
         state_.load_delay.valid = false;
+        load_projection_valid_ = false;
     }
 }
 
@@ -494,16 +502,34 @@ void R3000Runtime::scheduleLoad(std::uint8_t reg, std::uint32_t value) noexcept 
     }
     if (state_.load_delay.valid && state_.load_delay.reg == reg) {
         state_.load_delay.valid = false;
+        load_projection_valid_ = false;
     }
     state_.next_load_delay = R3000DelayedLoadState{reg, value, true};
+    next_load_projection_valid_ = false;
+}
+
+void R3000Runtime::scheduleProjectionLoad(
+    std::uint8_t reg, std::uint32_t value,
+    const GteProjectedVertex& vertex) noexcept {
+    scheduleLoad(reg, value);
+    if (reg != 0U) {
+        next_load_projection_ = vertex;
+        next_load_projection_valid_ = true;
+    }
 }
 
 void R3000Runtime::advanceLoadDelay() noexcept {
     if (state_.load_delay.valid && state_.load_delay.reg != 0U) {
         state_.gpr[state_.load_delay.reg] = state_.load_delay.value;
+        gpr_projection_[state_.load_delay.reg] = load_projection_;
+        gpr_projection_valid_[state_.load_delay.reg] =
+            load_projection_valid_;
     }
     state_.load_delay = state_.next_load_delay;
     state_.next_load_delay = {};
+    load_projection_ = next_load_projection_;
+    load_projection_valid_ = next_load_projection_valid_;
+    next_load_projection_valid_ = false;
     state_.gpr[0] = 0U;
 }
 
@@ -516,6 +542,8 @@ void R3000Runtime::flushLoadDelay() noexcept {
 void R3000Runtime::clearLoadDelay() noexcept {
     state_.load_delay = {};
     state_.next_load_delay = {};
+    load_projection_valid_ = false;
+    next_load_projection_valid_ = false;
 }
 
 void R3000Runtime::setExternalInterrupt(bool active) noexcept {
@@ -928,16 +956,48 @@ R3000RunResult R3000Runtime::step() noexcept {
     }
     case 0x12:
         if (rs == 0U) {
-            scheduleLoad(rt, GteRuntime::readData(state_.gte, rd));
+            const auto value = GteRuntime::readData(state_.gte, rd);
+            const auto fifo_index = rd >= 12U && rd <= 15U
+                ? std::min<std::uint8_t>(rd - 12U, 2U)
+                : 3U;
+            if (fifo_index < gte_projection_fifo_valid_.size() &&
+                gte_projection_fifo_valid_[fifo_index] &&
+                value == gte_projection_fifo_[fifo_index].packed_sxy) {
+                scheduleProjectionLoad(
+                    rt, value, gte_projection_fifo_[fifo_index]);
+            } else {
+                scheduleLoad(rt, value);
+            }
         } else if (rs == 2U) {
             scheduleLoad(rt, GteRuntime::readControl(state_.gte, rd));
         } else if (rs == 4U) {
             GteRuntime::writeData(state_.gte, rd, right);
+            if (rd >= 12U && rd <= 15U) {
+                gte_projection_fifo_valid_ = {};
+            }
         } else if (rs == 6U) {
             GteRuntime::writeControl(state_.gte, rd, right);
         } else if ((rs & 0x10U) != 0U) {
-            if (!GteRuntime::executeCommand(state_.gte, instruction)) {
+            GteProjectionTrace projection_trace{};
+            if (!GteRuntime::executeCommand(
+                    state_.gte, instruction, &projection_trace)) {
                 stop = R3000StopReason::unsupported_instruction;
+            } else if (projection_trace.count != 0U) {
+                for (std::size_t index = 0U;
+                     index < projection_trace.count; ++index) {
+                    gte_projection_fifo_[0U] = gte_projection_fifo_[1U];
+                    gte_projection_fifo_[1U] = gte_projection_fifo_[2U];
+                    gte_projection_fifo_[2U] = projection_trace.vertices[index];
+                    gte_projection_fifo_valid_[0U] =
+                        gte_projection_fifo_valid_[1U];
+                    gte_projection_fifo_valid_[1U] =
+                        gte_projection_fifo_valid_[2U];
+                    gte_projection_fifo_valid_[2U] = true;
+                }
+                if (gte_projection_observer_) {
+                    gte_projection_observer_(
+                        projection_trace, instruction_pc, instruction);
+                }
             }
         } else {
             stop = R3000StopReason::unsupported_instruction;
@@ -1037,17 +1097,44 @@ R3000RunResult R3000Runtime::step() noexcept {
         static_cast<void>(storeWord(aligned_address, value));
         break;
     }
-    case 0x2b: static_cast<void>(storeWord(memoryAddress(), right)); break;
+    case 0x2b: {
+        const auto address = memoryAddress();
+        if (storeWord(address, right) && gte_vertex_store_observer_ &&
+            gpr_projection_valid_[rt] &&
+            right == gpr_projection_[rt].packed_sxy) {
+            gte_vertex_store_observer_(
+                GteVertexStoreTrace{address, gpr_projection_[rt]},
+                instruction_pc, instruction);
+        }
+        break;
+    }
     case 0x32: {
         std::uint32_t value{};
         if (loadWord(memoryAddress(), value)) {
             GteRuntime::writeData(state_.gte, rt, value);
+            if (rt >= 12U && rt <= 15U) {
+                gte_projection_fifo_valid_ = {};
+            }
         }
         break;
     }
-    case 0x3a:
-        static_cast<void>(storeWord(memoryAddress(), GteRuntime::readData(state_.gte, rt)));
+    case 0x3a: {
+        const auto address = memoryAddress();
+        const auto value = GteRuntime::readData(state_.gte, rt);
+        const auto fifo_index = rt >= 12U && rt <= 15U
+            ? std::min<std::uint8_t>(rt - 12U, 2U)
+            : 3U;
+        if (storeWord(address, value) && gte_vertex_store_observer_ &&
+            fifo_index < gte_projection_fifo_valid_.size() &&
+            gte_projection_fifo_valid_[fifo_index] &&
+            value == gte_projection_fifo_[fifo_index].packed_sxy) {
+            gte_vertex_store_observer_(
+                GteVertexStoreTrace{address,
+                                    gte_projection_fifo_[fifo_index]},
+                instruction_pc, instruction);
+        }
         break;
+    }
     default: stop = R3000StopReason::unsupported_instruction; break;
     }
 

@@ -39,6 +39,7 @@ typedef struct
 	uint  texture_bounds;
 	uint  precise_texcoord;
 	uint  exact_projection;
+	uint  bypass_presentation_scale;
 } PGXPVData;
 
 #if defined(_LANGUAGE_C_PLUS_PLUS) || defined(__cplusplus) || \
