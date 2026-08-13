@@ -18,9 +18,9 @@ int main() {
     return 1;
   }
 
-  if (extended_texture_page_count != 63U ||
-      resident_texture_page_count - 6U <
-          maximum_scene_texture_identities) {
+  if constexpr (extended_texture_page_count != 63U ||
+                resident_texture_page_count - 6U <
+                    maximum_scene_texture_identities) {
     std::cerr << "Resident texture pool cannot cover a complete scene\n";
     return 9;
   }
