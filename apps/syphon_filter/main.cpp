@@ -113,7 +113,7 @@ void printUsage() {
       << "Graphics options: --fullscreen --no-launcher "
          "--resolution=WIDTHxHEIGHT "
          "--msaa=0|2|4|8 --bilinear --nearest --anisotropic "
-         "--no-anisotropic --aspect-adaptive --aspect-4-3 "
+         "--no-anisotropic --pgxp --no-pgxp --aspect-adaptive --aspect-4-3 "
          "--vsync --no-vsync --fps-limit=0|20..1000\n";
   std::cerr << "Language options: --language=en --language=ru\n";
 }
@@ -156,6 +156,10 @@ int main(int argc, char **argv) {
         graphics.anisotropic_filtering = true;
       } else if (argument == "--no-anisotropic") {
         graphics.anisotropic_filtering = false;
+      } else if (argument == "--pgxp") {
+        graphics.pgxp_geometry = true;
+      } else if (argument == "--no-pgxp") {
+        graphics.pgxp_geometry = false;
       } else if (argument == "--vsync") {
         graphics.vsync = true;
       } else if (argument == "--no-vsync") {

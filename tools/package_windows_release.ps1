@@ -1,12 +1,18 @@
 param(
-    [string]$Version = "0.1.0-public-test.22",
-    [string]$Configuration = "Release"
+    [string]$Version = "0.1.0-phase1-baseline.1",
+    [string]$Configuration = "Release",
+    [string]$BuildDirectory = "",
+    [string]$DependencyRoot = "",
+    [Parameter(Mandatory = $true)]
+    [string]$BuildReceiptPath
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$buildDir = Join-Path $repoRoot "build\windows-psycross\$Configuration"
+$buildRoot = if ($BuildDirectory) { $BuildDirectory } else { Join-Path $repoRoot "build\windows-psycross" }
+$buildDir = Join-Path $buildRoot $Configuration
+$dependencyRoot = if ($DependencyRoot) { $DependencyRoot } else { Join-Path $repoRoot "build\windows-psycross\vcpkg_installed" }
 $distDir = Join-Path $repoRoot "dist"
 $packageName = "SyphonFilterPC-$Version-win64"
 $packageDir = Join-Path $distDir $packageName
@@ -17,6 +23,16 @@ foreach ($path in @($packageDir, $archivePath, $archiveHashPath)) {
     if (Test-Path -LiteralPath $path) {
         throw "Refusing to overwrite an existing release artifact: $path"
     }
+}
+
+if (-not (Test-Path -LiteralPath $BuildReceiptPath -PathType Leaf)) {
+    throw "Build provenance receipt is missing: $BuildReceiptPath"
+}
+$buildReceipt = Get-Content -Raw -LiteralPath $BuildReceiptPath | ConvertFrom-Json
+$sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($buildReceipt.schema_version -ne "sf1-phase1-build-provenance-v1" -or
+    $buildReceipt.source_revision -ne $sourceRevision) {
+    throw "Build provenance does not match the exact package source revision."
 }
 
 $runtimeFiles = @(
@@ -125,7 +141,7 @@ foreach ($file in $vcFiles) {
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $packageDir "LICENSE.txt")
 Copy-Item -LiteralPath (Join-Path $repoRoot "external\PsyCross\LICENSE") -Destination (Join-Path $packageDir "licenses\PsyCross.txt")
 
-$vcpkgShare = Join-Path $repoRoot "build\windows-psycross\vcpkg_installed\x64-windows\share"
+$vcpkgShare = Join-Path $dependencyRoot "x64-windows\share"
 $licenseSources = @{
     "FFmpeg.txt" = Join-Path $vcpkgShare "ffmpeg\copyright"
     "fmt.txt" = Join-Path $vcpkgShare "fmt\copyright"
@@ -246,22 +262,27 @@ if (Test-Path -LiteralPath $releaseNotesPath -PathType Leaf) {
     $notes = [IO.File]::ReadAllText($releaseNotesPath, [Text.Encoding]::UTF8)
 }
 
-$commit = try { (& git -C $repoRoot rev-parse --short HEAD 2>$null).Trim() } catch { "unknown" }
+$commit = try { (& git -C $repoRoot rev-parse HEAD 2>$null).Trim() } catch { "unknown" }
 if (-not $commit) { $commit = "unknown" }
 
 $buildInfo = @"
 Product: Syphon Filter PC
-Channel: Public Test
+Channel: Phase 1 launcher-ready baseline
 Version: $Version
 Platform: Windows x64
 Build type: $Configuration
 Build date: $buildDate
 Source revision: $commit
+Selected source base: c24ce313b1356da2e3d5615f3001f6000e399f99
 Supported disc: Syphon Filter USA v1.1, SCUS-94240, BIN/CUE
+Retail executable SHA-256: bac292061ad5bc718ce137ef5b43d3d7e9b1b65248fb0d52229f328ccfe4ab4e
 Launcher: integrated; no CMD bootstrap
 Game image included: no
 Save data included: no
 Cheat marker included: no
+BIOS policy: not consumed by this native runtime; no BIOS is included
+Fast boot policy: unavailable; there is no BIOS boot path to bypass
+Faithful defaults: 640x480, 4:3, 20 Hz, MSAA/filtering/PGXP/mouse-look off
 "@
 
 $notices = @"
@@ -289,9 +310,50 @@ $utf8 = New-Object System.Text.UTF8Encoding($true)
 [IO.File]::WriteAllText((Join-Path $packageDir "PUBLIC_TEST_NOTES.txt"), $notes, $utf8)
 [IO.File]::WriteAllText((Join-Path $packageDir "BUILD_INFO.txt"), $buildInfo, $utf8)
 [IO.File]::WriteAllText((Join-Path $packageDir "THIRD_PARTY_NOTICES.txt"), $notices, $utf8)
+Copy-Item -LiteralPath $BuildReceiptPath -Destination (Join-Path $packageDir "BASELINE_BUILD_PROVENANCE.json")
+
+$packagedExecutable = Join-Path $packageDir "syphon_filter.exe"
+$packagedExecutableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedExecutable).Hash.ToLowerInvariant()
+if ($buildReceipt.executable.sha256 -ne $packagedExecutableHash) {
+    throw "Packaged executable does not match the build provenance receipt."
+}
+$buildReceiptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $BuildReceiptPath).Hash.ToLowerInvariant()
+$payloadLines = Get-ChildItem -LiteralPath $packageDir -Recurse -File |
+    Sort-Object FullName |
+    ForEach-Object {
+        $relative = $_.FullName.Substring($packageDir.Length + 1).Replace("\", "/")
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+        "$hash  $relative"
+    }
+$payloadBytes = $utf8.GetBytes(($payloadLines -join "`n") + "`n")
+$payloadHasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $payloadIdentity = ([Convert]::ToHexString($payloadHasher.ComputeHash($payloadBytes))).ToLowerInvariant()
+} finally {
+    $payloadHasher.Dispose()
+}
+$identity = @"
+Title: Syphon Filter
+Region: USA / NTSC-U
+Disc serial: SCUS-94240
+Disc revision: v1.1
+Retail executable SHA-256: bac292061ad5bc718ce137ef5b43d3d7e9b1b65248fb0d52229f328ccfe4ab4e
+Selected source base: c24ce313b1356da2e3d5615f3001f6000e399f99
+Prepared source revision: $commit
+Build provenance SHA-256: $buildReceiptHash
+Executable SHA-256: $packagedExecutableHash
+Package payload identity: $payloadIdentity
+BIOS policy: not-consumed-native-runtime (no BIOS required or packaged)
+Fast boot policy: unavailable-no-bios-boot-path
+Faithful defaults: 640x480; 4:3; 20 Hz; MSAA/filtering/PGXP/mouse-look off
+Controller: retail-style gamepad remains available
+Keyboard/mouse: remappable; optional chase mouse-look remains default-off
+Claim: launcher-ready baseline only; no campaign, enhancement, full-game, or release-readiness claim
+"@
+[IO.File]::WriteAllText((Join-Path $packageDir "BASELINE_IDENTITY.txt"), $identity, $utf8)
 
 $forbidden = Get-ChildItem -LiteralPath $packageDir -Recurse -File | Where-Object {
-    $_.Name -match "(?i)(syphon_filter_cheats|save|\.sav(?:\.bak)?$|\.cue$|\.bin$|\.iso$|\.img$|\.chd$|\.cmd$|\.log$|\.dmp$|\.obj$|\.pdb$|\.ilk$|\.lib$|\.exp$)"
+    $_.Name -match "(?i)(syphon_filter_cheats|save|bios|scph[-_ ]?[0-9]|\.sav(?:\.bak)?$|\.cue$|\.bin$|\.iso$|\.img$|\.chd$|\.cmd$|\.log$|\.dmp$|\.obj$|\.pdb$|\.ilk$|\.lib$|\.exp$)"
 }
 if ($forbidden) {
     throw "Forbidden files found in release: $($forbidden.FullName -join ', ')"

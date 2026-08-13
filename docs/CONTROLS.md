@@ -4,6 +4,9 @@ The launcher exposes all 31 native gameplay actions. Bindings are captured as
 physical keyboard scancodes or mouse inputs and are saved in
 `%LOCALAPPDATA%\SyphonFilterPC\launcher.ini`.
 
+Retail-style controller input remains available. Chase-camera mouse-look is an
+optional enhancement and is off in a fresh Phase 1 baseline profile.
+
 | Action | Default | Runtime meaning |
 | --- | --- | --- |
 | Move forward / backward | W / S | Walk in chase and first-person; crouch-walk while kneeling |

@@ -22,14 +22,15 @@ enum class AspectRatioMode {
 };
 
 struct GraphicsSettings {
-  int width{1280};
-  int height{720};
-  int msaa_samples{4};
-  bool bilinear_filtering{true};
-  bool anisotropic_filtering{true};
-  AspectRatioMode aspect_ratio{AspectRatioMode::adaptive};
+  int width{640};
+  int height{480};
+  int msaa_samples{};
+  bool bilinear_filtering{};
+  bool anisotropic_filtering{};
+  bool pgxp_geometry{};
+  AspectRatioMode aspect_ratio{AspectRatioMode::original_4_3};
   bool vsync{true};
-  std::uint32_t frame_limit{60U};
+  std::uint32_t frame_limit{20U};
   bool fullscreen{};
 };
 

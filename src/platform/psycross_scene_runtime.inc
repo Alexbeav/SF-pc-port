@@ -4,8 +4,6 @@ SceneViewerResult PsyCrossSceneViewer::run(
     std::uint32_t maximum_unlocked_mission,
     std::unique_ptr<game::GameplaySession> preloaded_gameplay,
     std::unique_ptr<PsyCrossAudioOutput> preloaded_audio) {
-  g_cfg_pgxpTextureCorrection = 1;
-  g_cfg_pgxpZBuffer = 1;
   InitGeom();
   SetGeomOffset(screen_width / 2, screen_height / 2);
   SetGeomScreen(320);

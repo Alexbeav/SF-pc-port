@@ -177,6 +177,32 @@ The script refuses to overwrite an existing release. Move an old artifact aside
 or choose a new version. See [RELEASING.md](RELEASING.md) for the complete release
 checklist.
 
+## Phase 1 offline baseline
+
+The standardized baseline uses an already verified dependency closure and
+disables vcpkg manifest installation. This prevents the build from downloading
+or replacing dependencies:
+
+```powershell
+pwsh -File tools/build_phase1_baseline.ps1 `
+  -OutputDirectory I:/Builds/sf1-phase1 `
+  -DependencyRoot I:/Dependencies/sf1-vcpkg
+
+pwsh -File tools/write_phase1_build_receipt.ps1 `
+  -BuildDirectory I:/Builds/sf1-phase1 `
+  -DependencyRoot I:/Dependencies/sf1-vcpkg `
+  -OutputPath I:/Builds/sf1-phase1-build-provenance.json
+
+pwsh -File tools/package_windows_release.ps1 `
+  -Version 0.1.0-phase1-baseline.1 `
+  -BuildDirectory I:/Builds/sf1-phase1 `
+  -DependencyRoot I:/Dependencies/sf1-vcpkg `
+  -BuildReceiptPath I:/Builds/sf1-phase1-build-provenance.json
+```
+
+The accepted package reports its exact identity and policy through the
+launcher. See [PHASE1_BASELINE.md](PHASE1_BASELINE.md).
+
 ## Build-directory hygiene
 
 Visual Studio intermediates contain absolute paths. Do not copy or move a

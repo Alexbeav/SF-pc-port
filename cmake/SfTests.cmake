@@ -26,6 +26,8 @@ if(SF_BUILD_TESTS)
         LIBRARIES sf::game)
     sf_add_unit_test(sf_player_input_tests tests/player_input_tests.cpp
         LIBRARIES sf::platform_input)
+    sf_add_unit_test(sf_baseline_policy_tests tests/baseline_policy_tests.cpp
+        LIBRARIES sf::platform_input)
     sf_add_unit_test(sf_audio_output_policy_tests
         tests/audio_output_policy_tests.cpp)
     sf_add_unit_test(sf_r3000_runtime_tests tests/r3000_runtime_tests.cpp

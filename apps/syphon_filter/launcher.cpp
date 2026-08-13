@@ -21,6 +21,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -53,6 +54,8 @@ constexpr int dossier_control_id = 1014;
 constexpr int language_control_id = 1015;
 constexpr int vsync_control_id = 1016;
 constexpr int frame_limit_control_id = 1017;
+constexpr int pgxp_control_id = 1018;
+constexpr int baseline_info_control_id = 1019;
 constexpr int binding_list_control_id = 2001;
 constexpr int change_binding_control_id = 2002;
 constexpr int clear_binding_control_id = 2003;
@@ -299,6 +302,9 @@ void loadSettingsFile(GraphicsSettings &graphics, KeyboardMouseBindings &input,
   graphics.anisotropic_filtering =
       readProfileInteger(path, L"Graphics", L"Anisotropic",
                          graphics.anisotropic_filtering ? 1 : 0) != 0;
+  graphics.pgxp_geometry =
+      readProfileInteger(path, L"Graphics", L"PGXPGeometry",
+                         graphics.pgxp_geometry ? 1 : 0) != 0;
   graphics.vsync = readProfileInteger(path, L"Graphics", L"VSync",
                                       graphics.vsync ? 1 : 0) != 0;
   const auto frame_limit = readProfileInteger(
@@ -363,6 +369,8 @@ void saveSettingsFile(const GraphicsSettings &graphics,
                       graphics.bilinear_filtering ? 1 : 0);
   writeProfileInteger(path, L"Graphics", L"Anisotropic",
                       graphics.anisotropic_filtering ? 1 : 0);
+  writeProfileInteger(path, L"Graphics", L"PGXPGeometry",
+                      graphics.pgxp_geometry ? 1 : 0);
   writeProfileInteger(path, L"Graphics", L"VSync", graphics.vsync ? 1 : 0);
   writeProfileInteger(path, L"Graphics", L"FrameLimit",
                       static_cast<int>(graphics.frame_limit));
@@ -851,6 +859,36 @@ void showStyledNotice(HWND owner, std::wstring title, std::wstring message) {
   DeleteObject(state.background_brush);
   DeleteObject(state.ui_font);
   DeleteObject(state.title_font);
+}
+
+void showBaselineIdentity(HWND owner) {
+  const auto path = executableDirectory() / L"BASELINE_IDENTITY.txt";
+  std::ifstream input{path, std::ios::binary};
+  if (!input) {
+    showStyledNotice(owner, L"BASELINE IDENTITY UNAVAILABLE",
+                     L"BASELINE_IDENTITY.txt is missing. Reinstall the exact "
+                     L"accepted package; this build cannot report its "
+                     L"provenance or policy identity.");
+    return;
+  }
+  input.seekg(0, std::ios::end);
+  const auto length = input.tellg();
+  if (length <= 0 || length > 65536) {
+    showStyledNotice(owner, L"BASELINE IDENTITY INVALID",
+                     L"BASELINE_IDENTITY.txt has an invalid size.");
+    return;
+  }
+  input.seekg(0, std::ios::beg);
+  std::string bytes(static_cast<std::size_t>(length), '\0');
+  input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!input) {
+    showStyledNotice(owner, L"BASELINE IDENTITY INVALID",
+                     L"BASELINE_IDENTITY.txt could not be read completely.");
+    return;
+  }
+  const auto message = widenUtf8(bytes);
+  MessageBoxW(owner, message.c_str(), L"PHASE 1 BASELINE IDENTITY",
+              MB_OK | MB_ICONINFORMATION);
 }
 
 bool isControlsOwnerDrawButton(UINT id) noexcept {
@@ -1824,6 +1862,8 @@ void acceptSettings(HWND window, LauncherState &state) {
       IsDlgButtonChecked(window, bilinear_control_id) == BST_CHECKED;
   state.settings.anisotropic_filtering =
       IsDlgButtonChecked(window, anisotropic_control_id) == BST_CHECKED;
+  state.settings.pgxp_geometry =
+      IsDlgButtonChecked(window, pgxp_control_id) == BST_CHECKED;
   state.settings.vsync =
       IsDlgButtonChecked(window, vsync_control_id) == BST_CHECKED;
   state.settings.fullscreen =
@@ -1906,7 +1946,7 @@ void drawLauncherFrame(HWND window, LauncherState &state) {
 bool isLauncherOwnerDrawButton(UINT id) noexcept {
   return id == controls_control_id || id == launch_control_id ||
          id == cancel_control_id || id == browse_image_control_id ||
-         id == dossier_control_id;
+         id == dossier_control_id || id == baseline_info_control_id;
 }
 
 void drawLauncherButton(const DRAWITEMSTRUCT &item,
@@ -2008,11 +2048,14 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
     createControl(window, L"BUTTON", L"Anisotropic filtering",
                   WS_TABSTOP | BS_AUTOCHECKBOX, 48, 392, 294, 24,
                   anisotropic_control_id, state->ui_font);
-    createControl(window, L"BUTTON", L"Vertical synchronization",
+    createControl(window, L"BUTTON", L"PGXP geometry (optional)",
                   WS_TABSTOP | BS_AUTOCHECKBOX, 48, 418, 294, 24,
+                  pgxp_control_id, state->ui_font);
+    createControl(window, L"BUTTON", L"Vertical synchronization",
+                  WS_TABSTOP | BS_AUTOCHECKBOX, 48, 444, 294, 24,
                   vsync_control_id, state->ui_font);
     createControl(window, L"BUTTON", L"Borderless fullscreen",
-                  WS_TABSTOP | BS_AUTOCHECKBOX, 48, 444, 294, 24,
+                  WS_TABSTOP | BS_AUTOCHECKBOX, 48, 470, 294, 24,
                   fullscreen_control_id, state->ui_font);
 
     createControl(window, L"STATIC", L"MISSION CONTROL", 0, 410, 188, 286, 26,
@@ -2032,6 +2075,9 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
     createControl(window, L"BUTTON", L"INPUT CONFIGURATION",
                   WS_TABSTOP | BS_OWNERDRAW, 414, 408, 294, 38,
                   controls_control_id, state->heading_font);
+    createControl(window, L"BUTTON", L"BASELINE IDENTITY / POLICY",
+                  WS_TABSTOP | BS_OWNERDRAW, 414, 454, 294, 34,
+                  baseline_info_control_id, state->heading_font);
     createControl(window, L"BUTTON", L"DOSSIERS", WS_TABSTOP | BS_OWNERDRAW, 26,
                   514, 140, 42, dossier_control_id, state->heading_font);
     createControl(window, L"BUTTON", L"DEPLOY", WS_TABSTOP | BS_OWNERDRAW, 476,
@@ -2044,6 +2090,9 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
     CheckDlgButton(window, anisotropic_control_id,
                    state->settings.anisotropic_filtering ? BST_CHECKED
                                                          : BST_UNCHECKED);
+    CheckDlgButton(window, pgxp_control_id,
+                   state->settings.pgxp_geometry ? BST_CHECKED
+                                                 : BST_UNCHECKED);
     CheckDlgButton(window, vsync_control_id,
                    state->settings.vsync ? BST_CHECKED : BST_UNCHECKED);
     populateResolutions(*state);
@@ -2103,6 +2152,10 @@ LRESULT CALLBACK launcherWindowProc(HWND window, UINT message, WPARAM w_param,
     }
     if (LOWORD(w_param) == controls_control_id) {
       showControlsWindow(window, state->input);
+      return 0;
+    }
+    if (LOWORD(w_param) == baseline_info_control_id) {
+      showBaselineIdentity(window);
       return 0;
     }
     if (LOWORD(w_param) == dossier_control_id) {
