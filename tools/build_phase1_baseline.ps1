@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $DependencyRoot "vcpkg\status") -Pat
     throw "Preverified dependency closure is incomplete: $DependencyRoot"
 }
 foreach ($relative in @(
-    "x64-windows\include\SDL.h",
+    "x64-windows\include\SDL2\SDL.h",
     "x64-windows\bin\SDL2.dll",
     "x64-windows\bin\OpenAL32.dll",
     "x64-windows\lib\avcodec.lib",
