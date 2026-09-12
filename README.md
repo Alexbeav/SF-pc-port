@@ -120,3 +120,7 @@ their own licenses; see [THIRD_PARTY.md](THIRD_PARTY.md).
 The MIT license applies only to material its contributors had the right to
 license. It grants no rights to *Syphon Filter*, PlayStation, game data,
 characters, artwork or trademarks.
+
+## Development history
+
+Older source and separate candidates are preserved as fixed tags. See [the archive and recovery instructions](docs/BRANCH_ARCHIVE.md).
